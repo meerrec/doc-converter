@@ -258,8 +258,11 @@ export async function deleteTask(taskId) {
 /**
  * Получает полную информацию о задаче.
  *
+ * Форма возвращаемого объекта описана явно: к полям обращается код
+ * на TypeScript, а `Object` не даёт о них никакого представления.
+ *
  * @param {string} taskId - уникальный идентификатор задачи
- * @returns {Promise<Object>} - информация о задаче
+ * @returns {Promise<{taskId: string, status: string, progress: object, result: object|null, error: object|null}>} - информация о задаче
  */
 export async function getTaskInfo(taskId) {
   const [status, progress, result, error] = await Promise.all([

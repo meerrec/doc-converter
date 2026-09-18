@@ -13,6 +13,7 @@
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:worker\"",
     "pretest": "npm run build:server",
     "test": "NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules jest --forceExit",
+    "test:nest": "SERVER_IMPL=nest npm test",
     "test:e2e": "E2E=1 npm run test",
     "lint": "echo 'Linter not configured yet'",
     "health": "curl -s http://localhost:3000/health | jq",

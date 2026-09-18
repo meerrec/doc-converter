@@ -13,6 +13,10 @@ import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { HealthController } from './health/health.controller.js';
+import { ConvertController } from './http/convert.controller.js';
+import { ResultsController } from './http/results.controller.js';
+import { StatusController } from './http/status.controller.js';
+import { ConversionModule } from './conversion/conversion.module.js';
 import { RateLimitGuard } from './common/rate-limit.guard.js';
 import { parseEnv } from './config/env.js';
 
@@ -27,8 +31,15 @@ import { parseEnv } from './config/env.js';
       validate: (raw: Record<string, unknown>) =>
         parseEnv(raw as NodeJS.ProcessEnv),
     }),
+
+    ConversionModule,
   ],
-  controllers: [HealthController],
+  controllers: [
+    HealthController,
+    ConvertController,
+    StatusController,
+    ResultsController,
+  ],
   providers: [
     // Ограничитель навешан один раз на всё приложение. В Express-версии он
     // стоял глобально и повторно на маршруте конвертации, из-за чего один

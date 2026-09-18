@@ -31,9 +31,9 @@ import {
   type ExecutionContext,
   type OnModuleDestroy,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { Request, Response } from 'express';
 import { AppError } from './app-error.js';
-import { RATE_BURST, RATE_PER_SEC } from '../../config/index.js';
 
 /** Состояние ведра для одного адреса. */
 interface Bucket {
@@ -77,12 +77,15 @@ export class RateLimitGuard implements CanActivate, OnModuleDestroy {
   private readonly refillPerMs: number;
   private readonly cleanupTimer: NodeJS.Timeout;
 
-  constructor() {
-    // Значения берутся из config/index.js: там они объявлены с обоснованием,
-    // и читать те же переменные второй раз означало бы завести ещё один
-    // источник правды. После переключения константы переедут в Nest-конфиг
-    this.capacity = RATE_BURST;
-    this.refillPerMs = RATE_PER_SEC / 1000;
+  /**
+   * @param config - конфигурация с параметрами ограничителя
+   */
+  constructor(config: ConfigService) {
+    // Значения читаются при создании приложения, а не при импорте модуля:
+    // тесты выставляют лимиты в beforeAll, и чтение на уровне модуля
+    // происходило бы раньше — настройка терялась бы
+    this.capacity = config.get<number>('RATE_BURST') ?? 20;
+    this.refillPerMs = (config.get<number>('RATE_PER_SEC') ?? 5) / 1000;
 
     // unref: таймер не должен удерживать процесс живым. Прежняя реализация
     // вешала обычный setInterval и не снимала его, из-за чего тесты

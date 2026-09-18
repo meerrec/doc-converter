@@ -120,9 +120,11 @@ export async function resetConversionQueue() {
  * 
  * @param {object} jobData - данные задачи
  * @param {string} jobData.taskId - уникальный идентификатор
+ * @param {string} jobData.inputBuffer - содержимое файла в base64
  * @param {string} jobData.inputFormat - формат входного файла
  * @param {string} jobData.outputFormat - формат выходного файла
  * @param {object} jobData.options - опции конвертации
+ * @param {string} [jobData.requestId] - идентификатор запроса для логов
  * @param {object} [options] - опции добавления
  * @param {number} [options.ttl=IDEMPOTENCY_TTL_SEC] - время жизни в секундах
  * @returns {Promise<{taskId: string, queued: boolean}>}
@@ -154,8 +156,11 @@ export async function addConversionJob(jobData, options = {}) {
 /**
  * Получает информацию о задаче
  * 
+ * Форма результата описана явно: к полям обращается код на TypeScript,
+ * а `object` не даёт о них представления.
+ *
  * @param {string} taskId - идентификатор задачи
- * @returns {Promise<object|null>}
+ * @returns {Promise<{taskId: string, state: string, progress: number|object, result: unknown, error: string|undefined, timestamp: number|undefined}|null>}
  */
 export async function getJobInfo(taskId) {
   const queue = await getConversionQueue();

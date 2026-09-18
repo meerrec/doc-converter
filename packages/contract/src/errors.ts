@@ -14,6 +14,9 @@ export const ERROR_CODES = [
   'unknown_field',
   'field_type_mismatch',
   'exactly_one_source_required',
+  // Отсутствие обязательного поля: сервер формирует код как `${field}_required`
+  'filetype_required',
+  'outputtype_required',
   'input_format_not_allowed',
   'output_format_not_allowed',
   'key_invalid_chars',
@@ -81,6 +84,24 @@ export const ERROR_CODES = [
 
 /** Код ошибки API. */
 export type ErrorCode = (typeof ERROR_CODES)[number];
+
+/** Множество кодов для проверок во время выполнения. */
+const errorCodeSet: ReadonlySet<string> = new Set(ERROR_CODES);
+
+/**
+ * Проверяет, что строка — известный код ошибки.
+ *
+ * Нужно там, где код приходит извне типизированного кода: например, от
+ * zipGuard, который сообщает о нарушении строкой. Вместо приведения типа
+ * (`as ErrorCode`) значение проверяется, а неизвестное заменяется на общий
+ * код — так в ответ клиенту не попадёт что-то, чего нет в контракте.
+ *
+ * @param value - проверяемое значение
+ * @returns true, если это код из контракта
+ */
+export function isErrorCode(value: unknown): value is ErrorCode {
+  return typeof value === 'string' && errorCodeSet.has(value);
+}
 
 /**
  * Тело ответа об ошибке.

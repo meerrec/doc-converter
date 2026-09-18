@@ -14,7 +14,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals';
 import request from 'supertest';
-import { createServer } from '../src/api/server.js';
+import { createServer } from './helpers/server.js';
 import { 
   checkMagicBytes, 
   verifyMagicBytes,

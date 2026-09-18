@@ -128,6 +128,35 @@ export const conversionRequestSchema = z
 export type ConversionRequest = z.infer<typeof conversionRequestSchema>;
 
 /**
+ * Все поля, допустимые в запросе.
+ *
+ * Нужен серверу для проверки «неизвестного поля» до разбора схемой: zod
+ * сообщает о лишних ключах последними, а сервис исторически отвечает
+ * `unknown_field` первым — раньше, чем о недостающих или неверных типах.
+ * Порядок проверок — часть внешнего контракта, поэтому список вынесен явно.
+ */
+export const CONVERSION_REQUEST_FIELDS = [
+  'filetype',
+  'outputtype',
+  'url',
+  'data',
+  'async',
+  'key',
+  'title',
+  'codePage',
+  'delimiter',
+  'region',
+  'password',
+  'documentLayout',
+  'spreadsheetLayout',
+  'documentRenderer',
+  'thumbnail',
+] as const;
+
+/** Обязательные поля запроса. */
+export const CONVERSION_REQUIRED_FIELDS = ['filetype', 'outputtype'] as const;
+
+/**
  * Ответ в асинхронном режиме.
  *
  * `status` не всегда `queued`: если задача с таким ключом уже выполнялась,
