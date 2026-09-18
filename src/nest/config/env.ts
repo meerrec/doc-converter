@@ -1,0 +1,100 @@
+/**
+ * Схема переменных окружения, которыми владеет NestJS-слой.
+ *
+ * Здесь только те переменные, которые **не** покрыты `src/config/index.js`.
+ * Таймауты, лимиты размеров, конкурентность и адрес Valkey остаются там:
+ * доменные модули (`security/`, `queue/`, `storage/`, `worker/`) читают их
+ * напрямую, и второй независимый разбор тех же переменных развёл бы значения
+ * между старым Express-кодом и новым NestJS-кодом. После переключения
+ * (этап 4) константы переезжают сюда, и `config/index.js` исчезает.
+ *
+ * Разбор идёт на старте: при некорректном значении приложение падает
+ * с внятным сообщением, а не отдаёт 500 на первом запросе.
+ */
+
+import { z } from 'zod';
+
+/**
+ * Переменные окружения NestJS-слоя.
+ *
+ * `NODE_ENV` намеренно без значения по умолчанию: сервис различает три режима
+ * сравнением, и незаданная переменная — отдельное состояние (ни CORS, ни CSP),
+ * а не «production» и не «development». Подставлять сюда умолчание значило бы
+ * изменить поведение локального запуска без переменной.
+ */
+export const envSchema = z.object({
+  /** Режим работы: development включает CORS, production — CSP. */
+  NODE_ENV: z.enum(['development', 'test', 'production']).optional(),
+
+  /**
+   * Порт HTTP-сервера.
+   *
+   * Читаются обе переменные: `PORT` — конвенция контейнеров (её задаёт
+   * `docker-compose.yml`), `API_PORT` — историческое имя сервиса, которое
+   * читает `config/index.js`. Раньше учитывался только `API_PORT`, а `PORT`
+   * из compose молча игнорировался — совпадение значений создавало видимость
+   * работы. Приоритет отдан `PORT` как более общему имени.
+   */
+  PORT: z.coerce.number().int().positive().optional(),
+  API_PORT: z.coerce.number().int().positive().optional(),
+
+  /**
+   * Интерфейс, который слушает сервер.
+   *
+   * Раньше переменная объявлялась в `Dockerfile` и `docker-compose.yml`,
+   * но кодом не читалась: сервер всегда слушал все интерфейсы. Значение
+   * по умолчанию сохранено прежним, поэтому поведение не меняется.
+   */
+  HOST: z.string().default('0.0.0.0'),
+
+  /** Путь к файлу аудит-лога. Если не задан — события уходят в stdout. */
+  AUDIT_LOG_PATH: z.string().optional(),
+
+  /** Уровень аудит-лога. */
+  AUDIT_LOG_LEVEL: z.string().default('info'),
+
+  /** Уровень основного логгера. */
+  LOG_LEVEL: z.string().default('info'),
+});
+
+// Версии конвертера здесь намеренно нет: она читается из package.json
+// в `src/config/index.js` (константа CONVERTER_VERSION). Второе объявление
+// той же переменной разошлось бы с первым — что и произошло при первой
+// проверке каркаса, когда /health отдавал одну версию, а заголовок другую.
+
+/** Разобранные переменные окружения NestJS-слоя. */
+export type Env = z.infer<typeof envSchema>;
+
+/**
+ * Разбирает окружение NestJS-слоя.
+ *
+ * @param source - источник переменных (по умолчанию `process.env`)
+ * @returns разобранное окружение
+ * @throws {Error} - если значение переменной некорректно
+ */
+export function parseEnv(source: NodeJS.ProcessEnv = process.env): Env {
+  const result = envSchema.safeParse(source);
+
+  if (!result.success) {
+    const details = result.error.issues
+      .map((issue) => `  ${issue.path.join('.') || '(корень)'}: ${issue.message}`)
+      .join('\n');
+
+    throw new Error(`Некорректное окружение:\n${details}`);
+  }
+
+  return result.data;
+}
+
+/**
+ * Возвращает порт сервера.
+ *
+ * Принимает только порты, а не всё окружение: значения приходят из
+ * `ConfigService`, где они лежат по отдельности.
+ *
+ * @param ports - значения PORT и API_PORT
+ * @returns номер порта
+ */
+export function resolvePort(ports: Pick<Env, 'PORT' | 'API_PORT'>): number {
+  return ports.PORT ?? ports.API_PORT ?? 3000;
+}

@@ -5,6 +5,12 @@
  * NOTE: All comments in Russian as per project requirements.
  */
 
+import { createRequire } from 'node:module';
+
+// Версия берётся из package.json — см. обоснование у CONVERTER_VERSION ниже
+const require = createRequire(import.meta.url);
+const packageJson = require('../../package.json');
+
 // ============================================================================
 // ВРЕМЕННЫЕ ЛИМИТЫ (таймауты) — внешний бюджет на этапы обработки
 // ============================================================================
@@ -215,5 +221,12 @@ export const BULLMQ_STALLED_INTERVAL = Number(
 // РАЗНОЕ
 // ============================================================================
 
-/** Версия конвертера из package.json. */
-export const CONVERTER_VERSION = process.env.npm_package_version || '1.0.0';
+/**
+ * Версия конвертера из package.json.
+ *
+ * Читается из файла, а не из `npm_package_version`: та переменная заполняется
+ * только при запуске через npm/pnpm-скрипт, а при прямом `node src/api/server.js`
+ * (так работает CMD в Dockerfile) в окружении может оказаться значение
+ * от постороннего пакета — процесс унаследует его молча.
+ */
+export const CONVERTER_VERSION = packageJson.version;

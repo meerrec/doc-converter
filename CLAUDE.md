@@ -21,6 +21,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Локальный запуск требует доступного Valkey/Redis (`REDIS_HOST`/`REDIS_PORT`); для полного стека —
 `docker compose up --build` (api + worker + valkey).
 
+### Сервер на NestJS (`src/nest/`)
+
+Сервер переводится с Express на NestJS. Приложение живёт в `src/nest/` и на время
+переезда соседствует с Express-версией в `src/api/` — запросы пока обслуживает она.
+
+```bash
+npm run build:server         # tsc → dist/ (NestJS требует декораторов, сборка обязательна)
+npm run typecheck:server     # tsc --noEmit
+npm run start:nest           # node dist/nest/main.js
+```
+
+NestJS компилируется, а не запускается напрямую: декораторам нужен
+`emitDecoratorMetadata`, с которым нативное стирание типов Node 24 несовместимо.
+`allowJs` включён на время переезда — доменные модули (`security/`, `queue/`,
+`storage/`, `worker/`) пока на JavaScript, и у них два потребителя. После
+переключения на NestJS они переезжают в TypeScript, и `allowJs` снимается.
+
+Ограничитель частоты (`src/nest/common/rate-limit.guard.ts`) реализует ведро
+с токенами: ёмкость `RATE_BURST`, пополнение `RATE_PER_SEC`. Прежняя реализация
+проверяла `count < RATE_PER_SEC || count <= RATE_BURST`, и вторая ветка всегда
+перекрывала первую — `RATE_PER_SEC` не влиял ни на что. Вместе с переездом убрано
+и двойное навешивание ограничителя на маршрут конвертации: раньше один POST
+списывал две единицы бюджета.
+
+Логирование — `pino` и `pino-http` напрямую (`src/nest/common/logger.ts`).
+`nestjs-pino` не подходит: пакет поставляет исходники на TypeScript и требует
+сборщик, а Jest здесь работает без транспиляции. Оба пакета грузятся через
+`createRequire` — их объявления типов не экспортируют вызываемую функцию.
+
+Формат ошибок задаёт `src/nest/common/r7-exception.filter.ts`: Nest по умолчанию
+отвечает `{ statusCode, message, error }`, что несовместимо с контрактом Р7.
+Всё, что не `AppError`, отдаётся как 500 без подробностей — раньше в ответ
+попадали `err.message` и системный `err.code` вроде `ENOENT`.
+
 ### Тесты
 
 ```bash
@@ -34,6 +68,15 @@ NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules npx jest --forceExit -t "sh
 
 `NODE_OPTIONS=--experimental-vm-modules` обязателен — Jest запускается на ESM без транспиляции
 (`transform: {}` в `jest.config.js`). Без него Jest падает на `import`.
+
+Перед прогоном выполняется `pretest` — сборка сервера. Это нужно тестам NestJS:
+Jest не читает TypeScript, поэтому они работают с собранным `dist/`. Заодно
+гарантируется, что типы проверены. После перехода на Vitest (исходники вместо
+сборки) шаг уйдёт.
+
+В `jest.config.js` есть `moduleNameMapper` для `rxjs`: Jest не применяет условие
+`node` из карты экспорта пакета и добирается до сборки `esm5`, которую не умеет
+разбирать. Правка тоже временная — Vitest разрешает модули как Node.
 
 `--forceExit` в тест-скрипте нужен, потому что Jest иначе виснет на открытых хендлах: Express-сервер,
 поднятый в тестах через `createServer()`, `setInterval` в rateLimit, пул fork-процессов. Код возврата
