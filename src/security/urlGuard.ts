@@ -15,7 +15,6 @@ import dns from 'dns/promises';
 import net from 'net';
 import {
   MAX_URL_LENGTH,
-  MAX_REDIRECTS,
   DNS_RESOLVE_TIMEOUT_MS
 } from './limits.js';
 
@@ -23,7 +22,11 @@ import {
  * Ошибки, которые может выбрасывать urlGuard.
  */
 export class UrlGuardError extends Error {
-  constructor(message, code) {
+  // `declare` не создаёт собственное свойство: `code` присваивается в
+  // конструкторе, поэтому порядок ключей остаётся прежним (name, code)
+  declare code: string;
+
+  constructor(message: string, code: string) {
     super(message);
     this.name = 'UrlGuardError';
     this.code = code;
@@ -31,10 +34,18 @@ export class UrlGuardError extends Error {
 }
 
 /**
+ * Диапазон IP-адресов: начало и конец включительно.
+ */
+interface IpRange {
+  start: string;
+  end: string;
+}
+
+/**
  * Приватные IP-диапазоны IPv4 (RFC 1918, RFC 5737, RFC 6598, и др.)
  * Источник: https://en.wikipedia.org/wiki/Private_network
  */
-const PRIVATE_IPV4_RANGES = [
+const PRIVATE_IPV4_RANGES: IpRange[] = [
   // 0.0.0.0/8
   { start: '0.0.0.0', end: '0.255.255.255' },
   // 10.0.0.0/8
@@ -73,7 +84,7 @@ const PRIVATE_IPV4_RANGES = [
  * Приватные IP-диапазоны IPv6
  * Источник: RFC 4291, RFC 4193
  */
-const PRIVATE_IPV6_RANGES = [
+const PRIVATE_IPV6_RANGES: IpRange[] = [
   // ::1/128 (loopback)
   { start: '::1', end: '::1' },
   // fc00::/7 (Unique Local Address)
@@ -87,7 +98,7 @@ const PRIVATE_IPV6_RANGES = [
 /**
  * Все приватные диапазоны (IPv4 + IPv6) — для документации и внешних проверок.
  */
-export const PRIVATE_IP_RANGES = [
+export const PRIVATE_IP_RANGES: IpRange[] = [
   ...PRIVATE_IPV4_RANGES,
   ...PRIVATE_IPV6_RANGES
 ];
@@ -95,10 +106,10 @@ export const PRIVATE_IP_RANGES = [
 /**
  * Публичный алиас для проверки приватности IP-адреса.
  *
- * @param {string} ip - IP-адрес (IPv4 или IPv6)
- * @returns {boolean} - true, если IP приватный
+ * @param ip - IP-адрес (IPv4 или IPv6)
+ * @returns - true, если IP приватный
  */
-export function checkPrivateIp(ip) {
+export function checkPrivateIp(ip: string): boolean {
   return isPrivateIP(ip);
 }
 
@@ -109,18 +120,75 @@ const ALLOWED_SCHEMES = new Set(['http', 'https']);
 
 /**
  * Запрещённые схемы URL.
+ *
+ * Набор справочный: проверка идёт по allowlist `ALLOWED_SCHEMES`, поэтому
+ * список опасных схем нигде не читается — он остаётся документацией того,
+ * что именно отсекается. `MAX_REDIRECTS` из `limits.ts` по той же причине
+ * не используется: редиректы модуль не обходит (см. [security.md]).
  */
-const FORBIDDEN_SCHEMES = new Set([
+export const FORBIDDEN_SCHEMES = new Set([
   'file', 'ftp', 'gopher', 'data', 'javascript', 'mailto', 'tel', 'ssh'
 ]);
 
 /**
+ * Результат проверки URL или хоста.
+ */
+interface UrlCheckResult {
+  isValid: boolean;
+  error?: string;
+  code?: string;
+}
+
+/**
+ * Запись, которую возвращает резолв с опцией `all: true`.
+ */
+interface ResolvedAddress {
+  address: string;
+}
+
+/**
+ * Резолвит хост в список адресов с ограничением по времени.
+ *
+ * Используется `dns.lookup` (системный резолвер, `getaddrinfo`), а не
+ * `dns.resolve`: именно `lookup` применяет `fetch` при подключении, поэтому
+ * проверяются те же адреса, по которым пойдёт запрос. Прежний вызов
+ * `dns.resolve(hostname, { all: true }, { signal })` был неверным — у этой
+ * функции нет ни опции `all`, ни сигнала отмены, — поэтому резолв падал
+ * всегда, и fail-safe блокировал любой хост-домен.
+ *
+ * `dns.lookup` сигнал отмены не принимает, поэтому таймаут реализован гонкой
+ * с таймером: по его истечении резолв считается неудачным (fail-safe ниже).
+ *
+ * @param hostname - имя хоста
+ * @param timeoutMs - предельное время резолва
+ * @returns список адресов хоста
+ * @throws {Error} - если резолв не удался или не уложился в таймаут
+ */
+async function resolveHost(hostname: string, timeoutMs: number): Promise<ResolvedAddress[]> {
+  let timer: NodeJS.Timeout | undefined;
+
+  try {
+    return await Promise.race([
+      dns.lookup(hostname, { all: true }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`DNS resolve timeout after ${timeoutMs}ms`)),
+          timeoutMs
+        );
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Проверяет, является ли IP-адрес приватным.
  *
- * @param {string} ip - IP-адрес (IPv4 или IPv6)
- * @returns {boolean} - true, если IP приватный
+ * @param ip - IP-адрес (IPv4 или IPv6)
+ * @returns - true, если IP приватный
  */
-function isPrivateIP(ip) {
+function isPrivateIP(ip: string): boolean {
   // IPv4
   if (net.isIPv4(ip)) {
     const num = ipToNumber(ip);
@@ -146,11 +214,14 @@ function isPrivateIP(ip) {
     // IPv4-mapped IPv6 (::ffff:a.b.c.d) — проверяем вложенный IPv4
     const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
     if (mapped) {
-      return isPrivateIP(mapped[1]);
+      // Группа 1 при совпадении всегда есть — `?? ''` только для типов
+      return isPrivateIP(mapped[1] ?? '');
     }
 
-    // Проверяем диапазоны по первой группе адреса
-    const firstGroup = normalized.split(':')[0];
+    // Проверяем диапазоны по первой группе адреса.
+    // `?? ''` — только для типов: у непустой IPv6-строки группа есть всегда,
+    // а пустая группа ниже отсекается той же проверкой длины.
+    const firstGroup = normalized.split(':')[0] ?? '';
     if (firstGroup.length === 0) {
       return false;
     }
@@ -184,46 +255,35 @@ function isPrivateIP(ip) {
 /**
  * Преобразует IPv4 в число для сравнения.
  *
- * @param {string} ip - IPv4 адрес
- * @returns {number} - числовое представление
+ * @param ip - IPv4 адрес
+ * @returns - числовое представление
  */
-function ipToNumber(ip) {
-  const parts = ip.split('.').map(part => parseInt(part, 10));
-  return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+function ipToNumber(ip: string): number {
+  const [a = 0, b = 0, c = 0, d = 0] = ip.split('.').map(part => parseInt(part, 10));
+  return (a << 24) | (b << 16) | (c << 8) | d;
 }
 
 /**
  * Резолвит хост и проверяет все A/AAAA записи на приватные диапазоны.
  *
- * @param {string} hostname - хост для проверки
- * @returns {Promise<boolean>} - true, если все IP приватные
+ * @param hostname - хост для проверки
+ * @returns - true, если все IP приватные
  */
-async function resolveAndCheckPrivate(hostname) {
+async function resolveAndCheckPrivate(hostname: string): Promise<boolean> {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), DNS_RESOLVE_TIMEOUT_MS);
-    
-    try {
-      const addresses = await dns.resolve(hostname, { all: true }, {
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeout);
-      
-      for (const addr of addresses) {
-        if (isPrivateIP(addr.address)) {
-          return true; // Найден приватный IP
-        }
+    const addresses = await resolveHost(hostname, DNS_RESOLVE_TIMEOUT_MS);
+
+    for (const addr of addresses) {
+      if (isPrivateIP(addr.address)) {
+        return true; // Найден приватный IP
       }
-      
-      return false; // Все IP публичные
-    } catch (err) {
-      clearTimeout(timeout);
-      // Если DNS не резолвится, считаем URL небезопасным
-      return true; // Fail-safe: блокируем если не можем проверить
     }
-  } catch (err) {
-    return true; // Fail-safe
+
+    return false; // Все IP публичные
+  } catch {
+    // Если DNS не резолвится (или не уложился в таймаут),
+    // считаем URL небезопасным
+    return true; // Fail-safe: блокируем если не можем проверить
   }
 }
 
@@ -233,10 +293,10 @@ async function resolveAndCheckPrivate(hostname) {
  * Публичная обёртка над внутренней проверкой — используется, когда хост
  * нужно проверить отдельно от полной валидации URL.
  *
- * @param {string} hostname - хост для проверки
- * @returns {Promise<{isValid: boolean, error?: string, code?: string}>}
+ * @param hostname - хост для проверки
+ * @returns - результат проверки
  */
-export async function validateDns(hostname) {
+export async function validateDns(hostname: string): Promise<UrlCheckResult> {
   if (!hostname || typeof hostname !== 'string') {
     return {
       isValid: false,
@@ -270,18 +330,18 @@ export async function validateDns(hostname) {
 /**
  * Проверяет URL на безопасность.
  *
- * @param {string} url - URL для проверки
- * @param {Object} [options] - опции проверки
- * @param {boolean} [options.allowPrivate=false] - разрешить приватные IP (для тестов)
- * @returns {Promise<{isValid: boolean, error?: string, code?: string}>} - результат проверки
+ * @param url - URL для проверки
+ * @param options - опции проверки
+ * @param options.allowPrivate - разрешить приватные IP (для тестов), по умолчанию false
+ * @returns - результат проверки
  */
-export async function validateUrl(url, options = {}) {
+export async function validateUrl(url: string, options: { allowPrivate?: boolean } = {}): Promise<UrlCheckResult> {
   const { allowPrivate = false } = options;
-  
+
   // Проверка на пустой URL
   if (!url || typeof url !== 'string') {
-    return { 
-      isValid: false, 
+    return {
+      isValid: false,
       error: 'URL is empty or not a string',
       code: 'url_malformed'
     };
@@ -289,15 +349,15 @@ export async function validateUrl(url, options = {}) {
 
   // Проверка длины URL
   if (url.length > MAX_URL_LENGTH) {
-    return { 
-      isValid: false, 
+    return {
+      isValid: false,
       error: `URL length ${url.length} exceeds maximum ${MAX_URL_LENGTH}`,
       code: 'url_too_long'
     };
   }
 
   // Парсим URL
-  let parsed;
+  let parsed: URL;
   try {
     parsed = new URL(url);
   } catch (err) {
@@ -313,7 +373,7 @@ export async function validateUrl(url, options = {}) {
 
     return {
       isValid: false,
-      error: `Invalid URL: ${err.message}`,
+      error: `Invalid URL: ${(err as Error).message}`,
       code: 'url_malformed'
     };
   }
@@ -323,10 +383,10 @@ export async function validateUrl(url, options = {}) {
 
   // Проверка схемы
   const scheme = parsed.protocol.slice(0, -1).toLowerCase();
-  
+
   if (!ALLOWED_SCHEMES.has(scheme)) {
-    return { 
-      isValid: false, 
+    return {
+      isValid: false,
       error: `Forbidden URL scheme: ${scheme}. Only http/https allowed.`,
       code: 'url_scheme_forbidden'
     };
@@ -334,8 +394,8 @@ export async function validateUrl(url, options = {}) {
 
   // Проверка на credentials в URL
   if (parsed.username || parsed.password) {
-    return { 
-      isValid: false, 
+    return {
+      isValid: false,
       error: 'Credentials in URL are not allowed',
       code: 'url_credentials_forbidden'
     };
@@ -415,10 +475,10 @@ export async function validateUrl(url, options = {}) {
  * Проверяет URL синхронно (без DNS резолва).
  * Используется для быстрого отклонения явно опасных URL.
  *
- * @param {string} url - URL для проверки
- * @returns {{isValid: boolean, error?: string, code?: string}} - результат проверки
+ * @param url - URL для проверки
+ * @returns - результат проверки
  */
-export function quickUrlCheck(url) {
+export function quickUrlCheck(url: string): UrlCheckResult {
   if (!url || typeof url !== 'string') {
     return { isValid: false, error: 'URL is empty', code: 'url_malformed' };
   }
@@ -430,7 +490,7 @@ export function quickUrlCheck(url) {
   try {
     const parsed = new URL(url);
     const scheme = parsed.protocol.slice(0, -1).toLowerCase();
-    
+
     if (!ALLOWED_SCHEMES.has(scheme)) {
       return { isValid: false, error: 'Forbidden scheme', code: 'url_scheme_forbidden' };
     }
@@ -444,7 +504,7 @@ export function quickUrlCheck(url) {
     }
 
     // Быстрая проверка на очевидные приватные IP
-    if (parsed.hostname === 'localhost' || 
+    if (parsed.hostname === 'localhost' ||
         parsed.hostname === '127.0.0.1' ||
         parsed.hostname === '::1') {
       return { isValid: false, error: 'Localhost not allowed', code: 'url_private_ip' };
@@ -453,7 +513,7 @@ export function quickUrlCheck(url) {
     // Проверка на IPv4-mapped IPv6
     if (parsed.hostname.startsWith('::ffff:')) {
       const ipv4 = parsed.hostname.slice(7);
-      if (ipv4 === '127.0.0.1' || ipv4.startsWith('192.168.') || 
+      if (ipv4 === '127.0.0.1' || ipv4.startsWith('192.168.') ||
           ipv4.startsWith('10.') || ipv4.startsWith('172.16.')) {
         return { isValid: false, error: 'Private IP not allowed', code: 'url_private_ip' };
       }
@@ -468,10 +528,10 @@ export function quickUrlCheck(url) {
 /**
  * Проверяет, что URL использует только разрешённые схемы.
  *
- * @param {string} url - URL для проверки
- * @returns {boolean} - true, если схема разрешена
+ * @param url - URL для проверки
+ * @returns - true, если схема разрешена
  */
-export function isAllowedScheme(url) {
+export function isAllowedScheme(url: string): boolean {
   try {
     const parsed = new URL(url);
     const scheme = parsed.protocol.slice(0, -1).toLowerCase();

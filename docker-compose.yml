@@ -2,7 +2,7 @@
 # docker-compose.yml для сервиса конвертации документов
 #
 # Архитектура:
-#   - API сервер (Express) на порту 3000
+#   - API сервер (NestJS) на порту 3000
 #   - Worker процесс для асинхронной обработки
 #   - Valkey как брокер очереди и хранилище идемпотентности
 #
@@ -112,7 +112,7 @@ services:
       - no-new-privileges:true
     pids_limit: 256
     # 3g — паритет с worker. api обслуживает sync-конвертацию через тот же
-    # fork-пул (routes/convert.js -> sandbox.js), и конфигурация пулов
+    # fork-пул (http/convert.controller.ts -> sandbox.js), и конфигурация пулов
     # идентична: FORK_POOL_SIZE=4, MAX_CONCURRENT=4.
     # mem_limit и memswap_limit держать равными (swap off, см. заголовок).
     mem_limit: 3g
@@ -126,7 +126,7 @@ services:
       valkey:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "node", "/app/src/api/health-check.js"]
+      test: ["CMD", "node", "/app/dist/nest/health/health-check.js"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -150,9 +150,9 @@ services:
       # 8080, чтобы не конфликтовать с опубликованным портом API (3000)
       - "8080:8080"
     depends_on:
-      # Без условия service_healthy: healthcheck API сейчас всегда падает
-      # (health-check.js читает несуществующее поле), и условие
-      # заблокировало бы запуск интерфейса
+      # Условие service_healthy здесь не нужно: интерфейс — статика, запросы
+      # nginx проксирует лениво, и здоровье API к моменту первого запроса
+      # не требуется. Healthcheck API при этом рабочий (см. сервис api).
       - api
 
   # ---------------------------------------------------------------------------
@@ -231,8 +231,8 @@ services:
     depends_on:
       valkey:
         condition: service_healthy
-    # Worker запускает отдельный процесс
-    command: ["node", "/app/src/worker/index.js"]
+    # Worker запускает отдельный процесс (собранный: исходники на TypeScript)
+    command: ["node", "/app/dist/worker/index.js"]
 
   # ---------------------------------------------------------------------------
   # Valkey (Redis-compatible)

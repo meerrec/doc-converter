@@ -8,27 +8,29 @@
 rateLimit → validate (схема + allowlist) → urlGuard (SSRF) → magicBytes → zipGuard → sandbox/изоляция
 ```
 
-Все проверки сосредоточены в `src/security/` (плюс middleware `src/api/middleware/validate.js`)
-и покрыты `tests/security.test.js` — 76 тестов, фикстуры для атак генерируются кодом в
+Все проверки сосредоточены в `src/security/` (плюс схема запроса из `packages/contract`)
+и покрыты `tests/security.test.js`, фикстуры для атак генерируются кодом в
 `tests/helpers/attackFixtures.js`.
 
 ## Rate limiting
 
-`src/api/middleware/rateLimit.js` — sliding window на IP-адрес.
+`src/nest/common/rate-limit.guard.ts` — ведро с токенами на IP-адрес.
 
 | Параметр | По умолчанию | Смысл |
 |---|---|---|
 | `RATE_PER_SEC` | `5` | Устойчивая скорость запросов в секунду с одного IP |
-| `RATE_BURST` | `20` | Допустимый кратковременный всплеск |
+| `RATE_BURST` | `20` | Ёмкость ведра — допустимый кратковременный всплеск |
 
-Middleware навешан дважды: глобально в `api/server.js:50` и на маршрут конвертации
-(`api/routes/convert.js:71`).
+Ограничитель навешан **один раз** на всё приложение (`APP_GUARD` в `app.module.ts`).
+Прежняя реализация висела ещё и на маршруте конвертации, из-за чего один POST списывал
+две единицы бюджета, а `RATE_PER_SEC` не влиял ни на что: вторая ветка условия
+(`count <= RATE_BURST`) всегда перекрывала первую.
 
 ## Валидация схемы запроса
 
-`validateBodyMiddleware()` (`src/api/middleware/validate.js:261`) пропускает только
-известные поля — любое лишнее поле даёт `unknown_field`. Это защита от «инъекции»
-неожиданных параметров в конвертер.
+Схема живёт в `packages/contract` (zod) и применяется пайпом
+`src/nest/http/validation.pipe.ts`: пропускаются только известные поля — любое лишнее
+даёт `unknown_field`. Это защита от «инъекции» неожиданных параметров в конвертер.
 
 Порядок проверок: `unknown_field` → `{field}_required` → `field_type_mismatch` →
 `exactly_one_source_required` (XOR `url`/`data`) → allowlist форматов → паттерны полей.
@@ -45,7 +47,7 @@ Middleware навешан дважды: глобально в `api/server.js:50`
 txt, html, htm, csv, pdf, epub`) и 16 выходных (`pdf, pdfa, docx, xlsx, csv, txt, html,
 png, jpg, jpeg, svg, odt, ods, odp, rtf, epub`).
 
-## SSRF-защита (`urlGuard.js`)
+## SSRF-защита (`urlGuard.ts`)
 
 Разрешены только схемы **http** и **https**; `file`, `ftp`, `gopher`, `data`, `javascript`
 и прочие отбрасываются с `url_scheme_forbidden`. URL с логином/паролем — `url_credentials_forbidden`.
@@ -68,12 +70,22 @@ png, jpg, jpeg, svg, odt, ods, odp, rtf, epub`).
 Дополнительно отбрасываются хосты, содержащие подстроки `localhost`, `local`, `internal`,
 `private`, `intranet`.
 
-**Fail-safe по DNS.** Если имя не резолвится, хост считается приватным и блокируется
-(`urlGuard.js:220-227`): недоступность DNS не должна открывать доступ внутрь периметра.
-Резолв ограничен таймаутом `DNS_RESOLVE_TIMEOUT_MS` = 5 с. Ограничение длины URL —
+**DNS-резолв.** Хост-домен резолвится через `dns.lookup(hostname, { all: true })` —
+системный резолвер, то есть ровно тот, которым пользуется `fetch` при подключении;
+проверяются все полученные адреса. Резолв ограничен таймаутом `DNS_RESOLVE_TIMEOUT_MS` = 5 с.
+
+**Fail-safe по DNS.** Если имя не резолвится или резолв не уложился в таймаут, хост
+считается приватным и блокируется (`resolveAndCheckPrivate` в `urlGuard.ts`): недоступность
+DNS не должна открывать доступ внутрь периметра. Ограничение длины URL —
 `MAX_URL_LENGTH` = 2048 символов.
 
-## Проверка сигнатур файлов (`magicBytes.js`)
+> Прежде здесь стоял `dns.resolve(hostname, { all: true }, { signal })` — вызов с аргументами,
+> которых у функции нет (`dnsPromises.resolve(hostname[, rrtype])`). Он падал с
+> `ERR_INVALID_ARG_TYPE`, fail-safe срабатывал всегда, и **любой** хост-домен получал
+> `url_private_ip`: работали только IP-литералы. Исправлено 2026-09-18, поведение закреплено
+> тестами на резолвящийся и на нерезолвящийся домен.
+
+## Проверка сигнатур файлов (`magicBytes.ts`)
 
 Расширению из запроса не доверяем: формат подтверждается сигнатурой в начале файла.
 
@@ -91,7 +103,7 @@ png, jpg, jpeg, svg, odt, ods, odp, rtf, epub`).
 `magic_unsupported_type`, `magic_buffer_too_small`.
 Через API несовпадение отдаётся как **415**.
 
-## Защита ZIP-архивов (`zipGuard.js`)
+## Защита ZIP-архивов (`zipGuard.ts`)
 
 Проверка идёт **без распаковки**: `yauzl` в режиме `lazyEntries` читает только оглавление,
 решения принимаются по заявленным в заголовках размерам. Это защищает от заполнения диска
@@ -114,7 +126,7 @@ png, jpg, jpeg, svg, odt, ods, odp, rtf, epub`).
 Нарушения возвращаются в `ZipGuardResult.violations`; через API (для источника `data`)
 они превращаются в **422** с кодом первого нарушения.
 
-## Защита XML (`xmlGuard.js`)
+## Защита XML (`xmlGuard.ts`)
 
 Эвристическая проверка без полного разбора DOM: ищутся `<!DOCTYPE`, `<!ENTITY`, `SYSTEM`,
 `PUBLIC` (признаки XXE), контролируется глубина вложенности (признак billion laughs) и размер
@@ -126,9 +138,9 @@ png, jpg, jpeg, svg, odt, ods, odp, rtf, epub`).
 | Глубина элементов | 256 | `xml_too_deep` |
 | Запрещённые конструкции | DOCTYPE/ENTITY/SYSTEM/PUBLIC | `xml_forbidden_construct` |
 
-> **Не подключено к конвейеру.** `validateXml` импортируется в `worker/processor.js:41`,
-> но не вызывается; `validateXmlInZip` — заглушка, всегда возвращающая `{isValid: true}`
-> (`xmlGuard.js:239`). Фактически XML внутри офисных документов сейчас не проверяется.
+> **Не подключено к конвейеру.** `validateXml` не вызывается ни одним модулем сервиса
+> (только тестами); `validateXmlInZip` — заглушка, всегда возвращающая `{ isValid: true }`
+> (`xmlGuard.ts`). Фактически XML внутри офисных документов сейчас не проверяется.
 
 ## Изоляция выполнения
 
@@ -145,7 +157,8 @@ png, jpg, jpeg, svg, odt, ods, odp, rtf, epub`).
 - По истечении `JOB_TIMEOUT_MS` = 60 с процесс убивается **`SIGKILL`**. Это принципиально:
   `Promise.race` не останавливает уже запущенный WASM, а `SIGTERM` перехватывается —
   без `SIGKILL` процесс продолжил бы работу в фоне.
-- При обрыве соединения клиентом форк также убивается (`api/routes/convert.js:91-107`).
+- При обрыве соединения клиентом форк также убивается
+  (`src/nest/http/convert.controller.ts`, обработчик `res.on('close')`).
 - Дочерним процессам выдаётся `--disable-wasm-trap-handler --max-old-space-size=1536`.
 
 Дополнительно сама библиотека конвертера в Node-окружении выполняет работу через
@@ -164,7 +177,7 @@ WASM-память не изолируется в пределах потока (
 
 ## Аудит-лог
 
-`src/api/middleware/auditLog.js` — отдельный pino-инстанс, пишущий в `AUDIT_LOG_PATH`
+`src/nest/common/audit-log.ts` — отдельный pino-инстанс, пишущий в `AUDIT_LOG_PATH`
 (в Docker — `/var/log/converter/audit.log`, том `doc-converter-audit-log`).
 Уровень — `AUDIT_LOG_LEVEL` (по умолчанию `info`). Если путь не задан, события уходят в stdout.
 
@@ -203,7 +216,8 @@ WASM-память не изолируется в пределах потока (
   слишком коротком буфере;
 - **SSRF** — `127.0.0.1`, `169.254.169.254` (метаданные облака), `10.0.0.1`, `192.168.1.1`,
   `::1`, `fc00::/7`, `fe80::/10`, а также запрещённые схемы `file://` и `gopher://`,
-  URL с учётными данными, `localhost`;
+  URL с учётными данными, `localhost`; резолв доменов — нерезолвящееся имя блокируется
+  (fail-safe), публичный домен пропускается (тест пропускается там, где нет сети);
 - **ZIP** — бомба, path traversal, запрещённые расширения, дубликаты, глубокая вложенность,
   превышение числа записей, управляющие символы в именах;
 - **XML** — DOCTYPE, ENTITY, XML-бомба (на уровне модуля);
@@ -218,14 +232,17 @@ WASM-память не изолируется в пределах потока (
 
 Честный список того, что в текущей реализации работает не так, как можно ожидать по комментариям:
 
-1. **XML-проверки не активны** — `validateXml` не вызывается, `validateXmlInZip` — заглушка.
-2. **`validateZip` в двух местах вызывается без проверки результата** (`api/routes/convert.js:464`,
-   `worker/processor.js:245`): реагируют только на исключение. Нарушения-лимиты отсекаются
-   лишь в middleware и только для источника `data` — то есть для файла, скачанного по `url`,
-   лимиты архива не применяются.
-3. **`ZipGuardError` не содержит `statusCode`/`errorCode`** (используется поле `code`), поэтому
-   часть нарушений архива в синхронном пути выходит наружу как **500 `internal`**, а не 422.
-4. **Ошибки пересекают границу fork в виде строки** (`worker/fork-worker.js:155` шлёт только
+1. **XML-проверки не активны** — `validateXml` импортирован в `worker/processor.ts`, но не
+   вызывается; `validateXmlInZip` — заглушка.
+2. **`validateZip` в асинхронном пути вызывается без проверки результата**
+   (`worker/processor.ts`): обработчик реагирует только на исключение, поэтому
+   нарушения-лимиты (число записей, коэффициент сжатия, глубина) там не отсекаются.
+   HTTP-путь (`nest/conversion/content-validator.ts`) разбирает результат и отклоняет
+   запрос с 422.
+3. **`ZipGuardError` не содержит `statusCode`/`errorCode`** (используется поле `code`),
+   поэтому повреждённый архив, на котором `validateZip` бросает исключение, выходит наружу
+   как **500 `internal`**, а не 422: фильтр ошибок отдаёт 500 всему, что не `AppError`.
+4. **Ошибки пересекают границу fork в виде строки** (`worker/fork-worker.ts` шлёт только
    `error`), поэтому исходный `errorCode` теряется и синхронный путь почти всегда отвечает
    `conversion_failed` / `internal` со статусом 500.
 5. **`checkMagicBytes` сравнивает префикс**: буфер из 3 байт `PK\x03` уже считается валидным
@@ -236,8 +253,12 @@ WASM-память не изолируется в пределах потока (
 7. **`file_too_large` в ZIP-ветке**: лимит `MAX_FILE_BYTES` для `data` проверяется до
    декодирования архива, но распакованный объём ограничивается отдельными лимитами `zipGuard`.
 8. **Неиспользуемые константы**: `MAX_HEADER_SIZE`, `MAX_JSON_STRING_LENGTH`, `MAX_JSON_FIELDS`,
-   `MAX_JSON_DEPTH`, `MAX_REDIRECTS` из `security/limits.js` не импортируются нигде;
-   `magicBytes.js` дублирует их значения литералами.
-9. **Валидация дублируется**: тело запроса проверяется дважды (`validateBodyMiddleware` и
-   `validateConversionRequest` в роутере), контент — тоже (middleware и `validateInputContent`).
-   Поведение при этом согласовано.
+   `MAX_JSON_DEPTH`, `MAX_REDIRECTS`, `FORBIDDEN_SCHEMES` (в `urlGuard.ts`) не читаются ни одним
+   модулем; `magicBytes.ts` дублирует часть их значений литералами.
+9. **Отказы по схеме, сигнатурам и архиву не попадают в аудит-лог.** В Express-версии
+   `logRejection` вызывался из middleware на каждом отказе; в NestJS-слое отказы бросаются
+   как `AppError` и обрабатываются фильтром (`nest/common/r7-exception.filter.ts`), который
+   в аудит-лог не пишет — там только лог приложения и только для 5xx. В аудит попадают
+   лишь те отказы, которые контроллеры логируют вручную (`sync_disabled`, `key_conflict`,
+   `client_disconnected`, статусы и результаты). Это расхождение переезда, а не замысел:
+   восстановить паритет можно вызовом `logRejection` из фильтра для `AppError`.

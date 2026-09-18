@@ -16,13 +16,24 @@
 import { randomUUID } from 'node:crypto';
 
 /**
+ * Контекст задачи.
+ */
+export interface TaskContext {
+  /** Идентификатор запроса. */
+  requestId?: string | null;
+  /** Идентификатор задачи. */
+  taskId: string;
+  /** Метка времени создания контекста. */
+  timestamp: number;
+}
+
+/**
  * Получает расширение файла для формата
  *
- * @param {string} format - формат
- * @returns {string}
+ * @param format - формат
  */
-export function getFileExtension(format) {
-  const extensions = {
+export function getFileExtension(format: string): string {
+  const extensions: Record<string, string> = {
     pdf: 'pdf',
     pdfa: 'pdf',
     docx: 'docx',
@@ -52,11 +63,13 @@ export function getFileExtension(format) {
 /**
  * Создает контекст задачи
  *
- * @param {string} [requestId] - идентификатор запроса
- * @param {string} [taskId] - идентификатор задачи
- * @returns {object}
+ * @param requestId - идентификатор запроса
+ * @param taskId - идентификатор задачи
  */
-export function createTaskContext(requestId, taskId) {
+export function createTaskContext(
+  requestId?: string | null,
+  taskId?: string
+): TaskContext {
   return {
     requestId,
     taskId: taskId || randomUUID(),

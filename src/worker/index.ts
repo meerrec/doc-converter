@@ -1,24 +1,24 @@
 /**
  * BullMQ Worker процесс
- * 
+ *
  * Отвечает за:
  * - Создание и управление BullMQ Worker
  * - Обработку задач из очереди
  * - Передачу задач в процессор
  * - Обработку ошибок
- * 
+ *
  * Как работает:
  * 1. Создает BullMQ Worker с подключением к Valkey
  * 2. Подписывается на очередь 'conversion'
  * 3. При получении задачи - передает её в processor
  * 4. Обновляет прогресс и статус задачи
  * 5. Обрабатывает ошибки
- * 
+ *
  * Настройки Worker:
  * - concurrency: MAX_CONCURRENT (1 по умолчанию для BullMQ)
  * - lockDuration: BULLMQ_LOCK_DURATION
  * - stalledInterval: BULLMQ_STALLED_INTERVAL
- * 
+ *
  * Примечание:
  * - Worker работает в отдельном процессе
  * - В production запускается как отдельный контейнер
@@ -26,6 +26,10 @@
  */
 
 import { pathToFileURL } from 'node:url';
+import type { EventEmitter } from 'node:events';
+// Worker импортируется под псевдонимом: имя Worker занято локальной
+// переменной в createWorker — так класс грузится лениво (см. комментарий там)
+import type { Job, QueueGetters, Worker as BullWorker } from 'bullmq';
 import { getRedisConnection } from '../queue/connection.js';
 import {
   MAX_CONCURRENT,
@@ -33,6 +37,7 @@ import {
   BULLMQ_STALLED_INTERVAL,
 } from '../config/index.js';
 import { processJob } from './processor.js';
+import type { JobData, JobResult } from './processor.js';
 import { CONVERTER_VERSION } from '../config/index.js';
 
 // ===========================================================================
@@ -45,43 +50,50 @@ const QUEUE_NAME = 'conversion';
 // Worker инстанс
 // ===========================================================================
 
-/** @type {Worker|null} */
-let workerInstance = null;
+/** Инстанс Worker'а. */
+let workerInstance: BullWorker<JobData, JobResult> | null = null;
+
+/**
+ * Информация о Worker'е.
+ */
+export type WorkerInfo = { running: boolean } & Record<string, number | boolean>;
 
 /**
  * Создает и запускает BullMQ Worker
- * 
- * @returns {Promise<Worker>}
  */
-export async function createWorker() {
+export async function createWorker(): Promise<BullWorker<JobData, JobResult>> {
   if (workerInstance) {
     return workerInstance;
   }
-  
+
   // BullMQ грузится лениво: его CJS-сборка тянет ESM-only msgpackr,
   // что ломает статический импорт модуля
   const { Worker } = await import('bullmq');
 
   const redis = await getRedisConnection();
 
-  // Настройки worker
-  const worker = new Worker(
+  // Настройки worker.
+  // Объект собран заранее: guardInterval в типе WorkerOptions текущего BullMQ
+  // отсутствует, а в литерале аргумента лишнее свойство — ошибка компиляции
+  const workerOptions = {
+    connection: redis,
+    // Конкуренция - сколько задач обрабатывать одновременно
+    concurrency: MAX_CONCURRENT,
+    // Настройки блокировки
+    lockDuration: BULLMQ_LOCK_DURATION,
+    stalledInterval: BULLMQ_STALLED_INTERVAL,
+    // Автоматическое продление блокировки
+    guardInterval: 30000,
+  };
+
+  const worker = new Worker<JobData, JobResult>(
     QUEUE_NAME,
     async (job) => {
       return await processJob(job);
     },
-    {
-      connection: redis,
-      // Конкуренция - сколько задач обрабатывать одновременно
-      concurrency: MAX_CONCURRENT,
-      // Настройки блокировки
-      lockDuration: BULLMQ_LOCK_DURATION,
-      stalledInterval: BULLMQ_STALLED_INTERVAL,
-      // Автоматическое продление блокировки
-      guardInterval: 30000,
-    }
+    workerOptions
   );
-  
+
   // Обработчики событий
   worker.on('completed', (job) => {
     // Прогресс здесь обновлять нельзя: задача к этому моменту уже удалена
@@ -90,64 +102,72 @@ export async function createWorker() {
     // Итоговый прогресс пишется в самом обработчике задачи (processor.js).
     console.log(`[WORKER] Job ${job.id} completed`);
   });
-  
+
   worker.on('failed', (job, err) => {
-    console.error(`[WORKER] Job ${job.id} failed: ${err.message}`);
+    // В типе BullMQ job необязателен (задача удалена после stalled-лимита);
+    // приведение сохраняет исходное обращение к job.id
+    const failedJob = job as Job<JobData, JobResult>;
+    console.error(`[WORKER] Job ${failedJob.id} failed: ${err.message}`);
   });
-  
+
   worker.on('stalled', (jobId) => {
     console.warn(`[WORKER] Job ${jobId} stalled`);
   });
-  
+
   worker.on('progress', (job, progress) => {
     console.log(`[WORKER] Job ${job.id} progress: ${progress}%`);
   });
-  
+
   worker.on('error', (err) => {
     // У ошибок соединения ioredis message часто пустой — показываем код
-    console.error('[WORKER] Error:', err.message || err.code || String(err));
+    const connectionError = err as Error & { code?: string };
+    console.error('[WORKER] Error:', connectionError.message || connectionError.code || String(err));
   });
-  
-  worker.on('pause', () => {
+
+  // События 'pause', 'resume' и 'cleaned' в типе Worker не объявлены:
+  // в текущем BullMQ пауза и возобновление называются 'paused'/'resumed',
+  // а 'cleaned' эмитит очередь. Обработчики сохранены как есть, поэтому
+  // регистрируем их через EventEmitter
+  const emitter = worker as EventEmitter;
+
+  emitter.on('pause', () => {
     console.log('[WORKER] Paused');
   });
-  
-  worker.on('resume', () => {
+
+  emitter.on('resume', () => {
     console.log('[WORKER] Resumed');
   });
-  
-  worker.on('cleaned', (jobs, type) => {
+
+  emitter.on('cleaned', (jobs: unknown[], type: string) => {
     console.log(`[WORKER] Cleaned ${jobs.length} ${type} jobs`);
   });
-  
+
   // Обработчик сигналов
   process.on('SIGTERM', async () => {
     console.log('[WORKER] Received SIGTERM, stopping...');
     await worker.close();
     process.exit(0);
   });
-  
+
   process.on('SIGINT', async () => {
     console.log('[WORKER] Received SIGINT, stopping...');
     await worker.close();
     process.exit(0);
   });
-  
+
   workerInstance = worker;
-  
+
   console.log(`[WORKER] BullMQ Worker started for queue '${QUEUE_NAME}'`);
   console.log(`[WORKER] Converter version: ${CONVERTER_VERSION}`);
   console.log(`[WORKER] Concurrency: ${MAX_CONCURRENT}`);
-  
+
   return worker;
 }
 
 /**
  * Останавливает Worker
- * 
- * @returns {Promise<void>}
  */
-export async function stopWorker() {
+export async function stopWorker(): Promise<void> {
   if (workerInstance) {
     await workerInstance.close();
     workerInstance = null;
@@ -157,10 +177,8 @@ export async function stopWorker() {
 
 /**
  * Пауза Worker
- * 
- * @returns {Promise<void>}
  */
-export async function pauseWorker() {
+export async function pauseWorker(): Promise<void> {
   if (workerInstance) {
     await workerInstance.pause();
     console.log('[WORKER] Paused');
@@ -169,10 +187,8 @@ export async function pauseWorker() {
 
 /**
  * Возобновление Worker
- * 
- * @returns {Promise<void>}
  */
-export async function resumeWorker() {
+export async function resumeWorker(): Promise<void> {
   if (workerInstance) {
     await workerInstance.resume();
     console.log('[WORKER] Resumed');
@@ -181,19 +197,20 @@ export async function resumeWorker() {
 
 /**
  * Получает информацию о Worker
- * 
- * @returns {Promise<object>}
  */
-export async function getWorkerInfo() {
+export async function getWorkerInfo(): Promise<WorkerInfo> {
   if (!workerInstance) {
     return { running: false };
   }
-  
-  const counts = await workerInstance.getJobCounts();
-  
+
+  // getJobCounts объявлен в QueueGetters, а Worker его не наследует: в текущем
+  // BullMQ вызов падает с TypeError, в типе Worker метода тоже нет.
+  // Приведение нужно только для компиляции — поведение сохранено как есть
+  const jobCounts = await (workerInstance as unknown as QueueGetters).getJobCounts();
+
   return {
     running: true,
-    ...counts,
+    ...jobCounts,
   };
 }
 
@@ -207,7 +224,7 @@ const isMainModule = process.argv[1] &&
 
 if (isMainModule) {
   createWorker().catch((err) => {
-    console.error('[WORKER] Failed to start:', err.message);
+    console.error('[WORKER] Failed to start:', (err as Error).message);
     process.exit(1);
   });
 }

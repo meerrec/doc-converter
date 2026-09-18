@@ -135,13 +135,14 @@ export class StatusController {
     if (!taskIds) {
       res.status(400).json({
         error: 'invalid_request',
-        message: 'taskIds query parameter is required and must be an array',
+        message: 'taskIds query parameter is required',
       });
       return;
     }
 
-    // Express разбирает повторяющийся параметр в массив; одиночный приходит
-    // строкой — сервер исторически требует именно массив
+    // Повторяющийся параметр Express разбирает в массив, одиночный приходит
+    // строкой. Принимаются обе формы: одиночный идентификатор — осознанное
+    // расширение контракта (400 отдаётся только при отсутствии параметра).
     const ids = Array.isArray(taskIds) ? taskIds : [taskIds];
 
     try {

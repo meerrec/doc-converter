@@ -19,7 +19,7 @@ import { XML_MAX_BYTES, XML_MAX_ELEMENT_DEPTH } from './limits.js';
  * OOXML и ODF спецификации НЕ используют DOCTYPE и ENTITY.
  * Их наличие — явный признак атаки.
  */
-const FORBIDDEN_XML_PATTERNS = [
+const FORBIDDEN_XML_PATTERNS: RegExp[] = [
   /<!DOCTYPE/i,
   /<!ENTITY/i,
   /SYSTEM/i,
@@ -30,7 +30,11 @@ const FORBIDDEN_XML_PATTERNS = [
  * Ошибки, которые может выбрасывать xmlGuard.
  */
 export class XmlGuardError extends Error {
-  constructor(message, code) {
+  // `declare` не создаёт собственное свойство: `code` присваивается в
+  // конструкторе, поэтому порядок ключей остаётся прежним (name, code)
+  declare code: string;
+
+  constructor(message: string, code: string) {
     super(message);
     this.name = 'XmlGuardError';
     this.code = code;
@@ -38,25 +42,59 @@ export class XmlGuardError extends Error {
 }
 
 /**
+ * Нарушение, найденное при проверке XML.
+ */
+interface XmlViolation {
+  code: string;
+  message: string;
+}
+
+/**
+ * Опции проверки XML.
+ */
+interface XmlValidationOptions {
+  /** максимальный размер в байтах (по умолчанию XML_MAX_BYTES). */
+  maxBytes?: number;
+  /** максимальная глубина вложенности (по умолчанию XML_MAX_ELEMENT_DEPTH). */
+  maxDepth?: number;
+}
+
+/**
+ * Результат быстрой проверки XML-контента на опасные конструкции.
+ */
+interface XmlContentCheckResult {
+  isValid: boolean;
+  violation: string | null;
+}
+
+/**
  * Результаты проверки XML.
  */
 export class XmlGuardResult {
+  violations: XmlViolation[];
+
+  elementDepth: number;
+
+  maxDepth: number;
+
+  byteLength: number;
+
   constructor() {
     this.violations = [];
     this.elementDepth = 0;
     this.maxDepth = 0;
     this.byteLength = 0;
   }
-  
-  addViolation(code, message) {
+
+  addViolation(code: string, message: string): void {
     this.violations.push({ code, message });
   }
-  
-  get isValid() {
+
+  get isValid(): boolean {
     return this.violations.length === 0;
   }
-  
-  get firstViolation() {
+
+  get firstViolation(): XmlViolation | null {
     return this.violations[0] || null;
   }
 }
@@ -75,10 +113,10 @@ export const XML_VALIDATION_LIMITS = {
  * Возвращает причину отклонения в виде читаемой строки — удобно для
  * логирования и тестов.
  *
- * @param {string|Buffer} xmlContent - XML-контент
- * @returns {{isValid: boolean, violation: string|null}} - результат проверки
+ * @param xmlContent - XML-контент
+ * @returns - результат проверки
  */
-export function checkXmlContent(xmlContent) {
+export function checkXmlContent(xmlContent: string | Buffer): XmlContentCheckResult {
   const xmlString = Buffer.isBuffer(xmlContent)
     ? xmlContent.toString('utf8')
     : (xmlContent ?? '');
@@ -112,20 +150,20 @@ export function checkXmlContent(xmlContent) {
 /**
  * Проверяет XML-контент на безопасность.
  *
- * @param {string|Buffer} xmlContent - XML-контент
- * @param {Object} [options] - опции проверки
- * @param {number} [options.maxBytes=XML_MAX_BYTES] - максимальный размер в байтах
- * @param {number} [options.maxDepth=XML_MAX_ELEMENT_DEPTH] - максимальная глубина вложенности
- * @returns {Promise<XmlGuardResult>} - результат проверки
+ * @param xmlContent - XML-контент
+ * @param options - опции проверки
+ * @param options.maxBytes - максимальный размер в байтах (по умолчанию XML_MAX_BYTES)
+ * @param options.maxDepth - максимальная глубина вложенности (по умолчанию XML_MAX_ELEMENT_DEPTH)
+ * @returns - результат проверки
  */
-export async function validateXml(xmlContent, options = {}) {
+export async function validateXml(xmlContent: string | Buffer, options: XmlValidationOptions = {}): Promise<XmlGuardResult> {
   const { maxBytes = XML_MAX_BYTES, maxDepth = XML_MAX_ELEMENT_DEPTH } = options;
-  
+
   const result = new XmlGuardResult();
-  
+
   // Преобразуем в строку, если это Buffer
   const xmlString = Buffer.isBuffer(xmlContent) ? xmlContent.toString('utf8') : xmlContent;
-  
+
   // Проверяем размер
   result.byteLength = Buffer.byteLength(xmlString, 'utf8');
   if (result.byteLength > maxBytes) {
@@ -150,7 +188,7 @@ export async function validateXml(xmlContent, options = {}) {
   // Подсчитываем вложенность через stack без полного парсинга
   let currentDepth = 0;
   result.maxDepth = 0;
-  
+
   for (let i = 0; i < xmlString.length; i++) {
     // Ищем открывающие теги <tag>
     if (xmlString[i] === '<') {
@@ -162,10 +200,10 @@ export async function validateXml(xmlContent, options = {}) {
           i++; // пропускаем /
           continue;
         }
-        
+
         // Комментарий <!-- ... -->
-        if (xmlString[i + 1] === '!' && 
-            i + 3 < xmlString.length && 
+        if (xmlString[i + 1] === '!' &&
+            i + 3 < xmlString.length &&
             xmlString[i + 2] === '-' &&
             xmlString[i + 3] === '-') {
           // Пропускаем до конца комментария
@@ -175,13 +213,13 @@ export async function validateXml(xmlContent, options = {}) {
             continue;
           }
         }
-        
+
         // Открывающий тег <tag>
         // Проверяем, что это не <!DOCTYPE или <?xml
         if (xmlString[i + 1] !== '!' && xmlString[i + 1] !== '?') {
           currentDepth++;
           result.maxDepth = Math.max(result.maxDepth, currentDepth);
-          
+
           if (currentDepth > maxDepth) {
             result.addViolation(
               'xml_too_deep',
@@ -192,16 +230,16 @@ export async function validateXml(xmlContent, options = {}) {
         }
       }
     }
-    
+
     // Ищем самозакрывающиеся теги <tag/>
     if (xmlString[i] === '/' && i > 0 && xmlString[i - 1] === '<') {
       // Это самозакрывающийся тег, не меняем глубину
       continue;
     }
   }
-  
+
   result.elementDepth = currentDepth;
-  
+
   return result;
 }
 
@@ -209,22 +247,22 @@ export async function validateXml(xmlContent, options = {}) {
  * Быстрая синхронная проверка XML на запрещённые конструкции.
  * Используется для быстрого отклонения явно опасных XML.
  *
- * @param {string|Buffer} xmlContent - XML-контент
- * @returns {boolean} - true если XML выглядит безопасным
+ * @param xmlContent - XML-контент
+ * @returns - true если XML выглядит безопасным
  */
-export function quickXmlCheck(xmlContent) {
+export function quickXmlCheck(xmlContent: string | Buffer): boolean {
   const xmlString = Buffer.isBuffer(xmlContent) ? xmlContent.toString('utf8') : xmlContent;
-  
+
   // Проверяем на DOCTYPE
   if (/<!DOCTYPE/i.test(xmlString)) {
     return false;
   }
-  
+
   // Проверяем на ENTITY
   if (/<!ENTITY/i.test(xmlString)) {
     return false;
   }
-  
+
   return true;
 }
 
@@ -232,15 +270,15 @@ export function quickXmlCheck(xmlContent) {
  * Извлекает XML-части из ZIP-архива и проверяет их.
  * Используется для проверки OOXML/ODF документов.
  *
- * @param {Buffer} zipBuffer - буфер с ZIP-архивом
- * @param {Object} [options] - опции проверки
- * @returns {Promise<{isValid: boolean, violations: Array}>} - результат проверки
+ * @param _zipBuffer - буфер с ZIP-архивом
+ * @param _options - опции проверки
+ * @returns - результат проверки
  */
-export async function validateXmlInZip(zipBuffer, options = {}) {
+export async function validateXmlInZip(_zipBuffer: Buffer, _options: object = {}): Promise<{ isValid: boolean; violations: unknown[] }> {
   // Для начала просто проверяем сам ZIP
   // Полная реализация потребует parsing ZIP и извлечение XML файлов
   // Это будет сделано в следующей итерации
-  
+
   // Пока что возвращаем positive result для совместимости
   return { isValid: true, violations: [] };
 }

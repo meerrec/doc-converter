@@ -30,15 +30,18 @@ open http://localhost:8080           # веб-интерфейс
 
 - отдаёт статику из `/usr/share/nginx/html` со SPA-fallback на `index.html`;
 - проксирует `/(ConvertService.ashx|status|health|results|storage)` на `api:3000`;
-- `client_max_body_size 50m` — согласовано с лимитом `express.json` на маршруте конвертации;
+- `client_max_body_size 50m` — лимит интерфейса; у API потолок выше
+  (`BODY_LIMIT_BYTES = MAX_BODY_BYTES` = 100 МиБ), поэтому через веб документ крупнее
+  50 МБ не загрузить, хотя напрямую в API он пройдёт;
 - `proxy_read_timeout 60s` — больше `SYNC_TIMEOUT_MS` (30 с);
 - ассеты с хешем в имени кешируются на год, `index.html` — без кеша.
 
 Фронтенд и API оказываются на одном origin, поэтому CORS (который у сервиса включается
-только при `NODE_ENV=development`) не требуется, а CSP из `api/server.js` не мешает загрузке.
+только при `NODE_ENV=development`) не требуется, а CSP из `src/nest/common/http-defaults.ts`
+не мешает загрузке.
 
 Оба сервиса приложения собираются из одного `Dockerfile`; `worker` переопределяет команду
-на `node /app/src/worker/index.js` (`docker-compose.yml:215`) и получает `SYNC_ENABLED=false` —
+на `node /app/dist/worker/index.js` (`docker-compose.yml`) и получает `SYNC_ENABLED=false` —
 синхронный режим обслуживает только `api`.
 
 Порядок запуска задан через `depends_on: condition: service_healthy`: `api` и `worker`
@@ -49,10 +52,18 @@ open http://localhost:8080           # веб-интерфейс
 `Dockerfile` — двухстадийная сборка на `node:24-bookworm-slim`:
 
 1. **builder** — установка шрифтов (`fonts-dejavu-core`, `fonts-liberation`, `fonts-noto-cjk`,
-   `fonts-noto-core`) и инструментов сборки нативных модулей (`python3`, `make`, `g++`),
-   создание непривилегированного пользователя `conv`, установка зависимостей через `pnpm ci`.
-2. **финал** — перенос `/app` целиком вместе с `node_modules`, создание каталогов
-   `/data/storage`, `/var/log/converter`, `/tmp` с правами `750` и владельцем `conv:conv`.
+   `fonts-noto-core`), создание непривилегированного пользователя `conv`, установка
+   зависимостей через `pnpm ci --filter doc-converter...`, сборка контракта
+   (`pnpm --filter @doc-converter/contract build`) и сервера (`npm run build:server`).
+   Инструменты сборки нативных модулей (`python3`, `make`, `g++`) не нужны: нативных
+   зависимостей нет.
+2. **финал** — перенос `/app` целиком вместе с `node_modules` и собранным `dist`,
+   создание каталогов `/data/storage`, `/var/log/converter`, `/tmp` с правами `750`
+   и владельцем `conv:conv`.
+
+> **Сборка обязательна.** `.dockerignore` исключает `dist`, а сервер импортирует контракт
+> и стартует с `dist/nest/main.js`. Без шагов сборки в builder образ соберётся,
+> но упадёт на старте — проверять именно `docker compose build`, а не локальный `npm test`.
 
 Контейнер работает от пользователя `conv` (`USER conv`, продублировано в compose),
 слушает `3000`.
@@ -61,7 +72,7 @@ WASM-движок отдельно не устанавливается: он п�
 `@matbee/libreoffice-converter` (предсобранные `soffice.wasm.gz` и `soffice.data.gz` внутри пакета).
 Шрифты нужны именно ему — от них зависит отрисовка текста в PDF.
 
-`NODE_OPTIONS` в образе (`Dockerfile:88`):
+`NODE_OPTIONS` в образе (`ENV NODE_OPTIONS` в `Dockerfile`):
 
 ```
 --disable-wasm-trap-handler --max-old-space-size=1536 --unhandled-rejections=strict
@@ -97,11 +108,14 @@ ulimits: { nofile: { soft: 4096, hard: 8192 } }
 только проброшенный порт API.
 
 > **Важно.** `internal: true` отключает исходящий трафик во внешнюю сеть для **всех** сервисов
-> сети, включая `api`. Это значит, что конвертация по внешнему `url` (`"url": "https://…"`)
-> в такой конфигурации работать не будет — скачивание файла из интернета заблокировано.
-> Источник должен быть доступен внутри сети (например, соседний контейнер хранилища)
-> либо передаваться в поле `data` (base64). Если нужен внешний `url`, сеть придётся
-> сделать не-`internal` и ограничить SSRF другими средствами.
+> сети, включая `api`, поэтому конвертация по внешнему `url` (`"url": "https://…"`)
+> в такой конфигурации не работает — скачивание из интернета заблокировано.
+>
+> Внутренний адрес тоже не подойдёт: SSRF-защита (`urlGuard`) блокирует приватные
+> диапазоны и имена с подстроками `localhost`/`local`/`internal`/`private`/`intranet`,
+> так что соседний контейнер по `url` не забрать. Практический вывод: **в этой конфигурации
+> источник передаётся полем `data`** (base64), а не ссылкой. Если `url` нужен, придётся
+> снять `internal: true` (и ограничивать SSRF иначе) и использовать публичный хост.
 
 Тома:
 
@@ -117,13 +131,13 @@ ulimits: { nofile: { soft: 4096, hard: 8192 } }
 
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD node /app/src/api/health-check.js
+  CMD node /app/dist/nest/health/health-check.js
 ```
 
-Скрипт проверяет доступность Valkey и наличие пакета конвертера с WASM-ассетами.
-Полная инициализация движка в healthcheck не выполняется: она требует загрузки ~48 МБ
-и слишком дорога для проверки, запускаемой каждые 30 секунд. HTTP-эндпоинт `GET /health`
-(обрабатывается прямо в `src/api/server.js:125`) возвращает:
+Скрипт (`src/nest/health/health-check.ts`) проверяет доступность Valkey и наличие пакета
+конвертера с WASM-ассетами. Полная инициализация движка в healthcheck не выполняется:
+она требует загрузки ~48 МБ и слишком дорога для проверки, запускаемой каждые 30 секунд.
+HTTP-эндпоинт `GET /health` (контроллер `src/nest/health/health.controller.ts`) возвращает:
 
 ```json
 { "status": "ok", "wasm": true, "version": "1.0.0" }
@@ -138,7 +152,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 - **Valkey** — общая точка состояния для идемпотентности и статусов; при нескольких
   репликах `api` именно она обеспечивает уникальность `taskId`.
 
-Память — основной ограничитель. Ориентир из `docker-compose.yml:197`: каждый fork-процесс
+Память — основной ограничитель. Ориентир из `docker-compose.yml`: каждый fork-процесс
 получает `--max-old-space-size=1536`, четыре форка теоретически дают около 6 ГБ heap,
 поэтому выход за `mem_limit` и срабатывание OOM-killer — осознанный предохранитель.
 При увеличении `FORK_POOL_SIZE`/`MAX_CONCURRENT` пропорционально поднимайте `mem_limit`.
@@ -166,9 +180,16 @@ proxy_read_timeout 60s;   # > SYNC_TIMEOUT_MS
 
 ```bash
 pnpm install
+npm run build:contract  # контракт — рантайм-зависимость сервера
+npm run build:server    # dist/nest/main.js и dist/worker/index.js
 export REDIS_HOST=localhost REDIS_PORT=6379
 npm run dev             # api + worker через concurrently, NODE_ENV=development
 ```
+
+Сервер запускается только из собранного `dist`: декораторам NestJS нужен
+`emitDecoratorMetadata`, с которым нативное стирание типов Node 24 несовместимо.
+Скрипты `dev`/`start` сборку не выполняют — её нужно сделать до запуска (тесты собирают
+`dist` сами через `pretest`).
 
 Для локального запуска нужен доступный Valkey/Redis. `NODE_ENV=development` включает CORS
 со значением `*`.
@@ -214,6 +235,6 @@ docker compose exec valkey valkey-cli ping
 |---|---|
 | `503`/`500` при синхронной конвертации | Все слоты семафора заняты: либо задачи идут дольше `JOB_TIMEOUT_MS`, либо упал fork-процесс |
 | `504 sync_timeout` | Запрос не уложился в `SYNC_TIMEOUT_MS` — проверьте таймаут балансировщика и размер документа |
-| Контейнер `unhealthy`, но API отвечает | Ложное срабатывание `health-check.js` (см. выше) |
+| Контейнер `unhealthy`, но API отвечает | Healthcheck проверяет не HTTP, а доступность Valkey и наличие пакета конвертера — смотрите его вывод (`docker inspect --format '{{json .State.Health}}' doc-converter-api`) |
 | `Не удалось подключиться к Valkey/Redis` | `valkey` не поднялся или неверные `REDIS_HOST`/`REDIS_PORT` |
 | Конвертация по `url` не работает | Сеть compose помечена `internal: true` |

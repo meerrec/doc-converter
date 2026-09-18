@@ -26,8 +26,45 @@
 
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import type {
+  InputFormat,
+  LibreOfficeWasmOptions,
+  OutputFormat,
+} from '@matbee/libreoffice-converter';
 
 const require = createRequire(import.meta.url);
+
+/**
+ * Опции конвертации, которые читает воркер.
+ *
+ * Опции приходят из родительского процесса как есть (в формате Р7-Офис),
+ * поэтому у объекта есть и другие ключи — они движком не используются.
+ */
+interface ConvertOptions {
+  /** Пароль защищённого документа. */
+  password?: string;
+  /** Прочие опции, которые движок игнорирует. */
+  [key: string]: unknown;
+}
+
+/**
+ * Сообщение от родительского процесса.
+ *
+ * Поля необязательны: состав сообщения проверяется обработчиком, а не типом —
+ * родитель и дочерний процесс общаются через IPC.
+ */
+interface ParentMessage {
+  /** Тип сообщения. */
+  type?: string;
+  /** Входные данные конвертации. */
+  inputBuffer?: Uint8Array | number[];
+  /** Формат входного файла. */
+  inputFormat?: string;
+  /** Формат выходного файла. */
+  outputFormat?: string;
+  /** Опции конвертации. */
+  options?: ConvertOptions;
+}
 
 /**
  * Модуль WASM-конвертера загружается лениво.
@@ -36,11 +73,11 @@ const require = createRequire(import.meta.url);
  * поэтому ошибку загрузки нужно отдать понятным сообщением, а не падением
  * процесса при импорте.
  *
- * @returns {Promise<Object>} - модуль @matbee/libreoffice-converter
+ * @returns модуль @matbee/libreoffice-converter
  */
-let converterModule = null;
+let converterModule: typeof import('@matbee/libreoffice-converter') | null = null;
 
-async function loadConverter() {
+async function loadConverter(): Promise<typeof import('@matbee/libreoffice-converter')> {
   if (!converterModule) {
     converterModule = await import('@matbee/libreoffice-converter');
   }
@@ -54,9 +91,9 @@ async function loadConverter() {
  * Библиотека по умолчанию ищет ассеты по '/wasm/' — абсолютному пути,
  * которого в проекте нет, поэтому путь нужно задавать явно.
  *
- * @returns {string} - путь к каталогу wasm
+ * @returns путь к каталогу wasm
  */
-function resolveWasmPath() {
+function resolveWasmPath(): string {
   const packageJsonPath = require.resolve('@matbee/libreoffice-converter/package.json');
   return path.join(path.dirname(packageJsonPath), 'wasm');
 }
@@ -64,9 +101,9 @@ function resolveWasmPath() {
 /**
  * Опции инициализации WASM-движка.
  *
- * @returns {Object} - опции для @matbee/libreoffice-converter
+ * @returns опции для @matbee/libreoffice-converter
  */
-function buildConverterOptions() {
+function buildConverterOptions(): LibreOfficeWasmOptions {
   return {
     wasmPath: resolveWasmPath(),
     // Путь внутри виртуальной ФС WASM (не хоста!): /instdir доступен
@@ -79,9 +116,9 @@ function buildConverterOptions() {
 /**
  * Обработчик сообщений от родительского процесса.
  *
- * @param {Object} message - сообщение
+ * @param message - сообщение
  */
-async function handleMessage(message) {
+async function handleMessage(message: ParentMessage): Promise<void> {
   try {
     switch (message.type) {
       case 'convert':
@@ -92,20 +129,20 @@ async function handleMessage(message) {
         sendError(`Unknown message type: ${message.type}`);
     }
   } catch (err) {
-    sendError(`Unhandled error: ${err.message}`);
+    sendError(`Unhandled error: ${(err as Error).message}`);
   }
 }
 
 /**
  * Обрабатывает сообщение о конвертации.
  *
- * @param {Object} message - сообщение
- * @param {Array<number>|Uint8Array} message.inputBuffer - входные данные
- * @param {string} message.inputFormat - формат входного файла
- * @param {string} message.outputFormat - формат выходного файла
- * @param {Object} [message.options] - опции конвертации
+ * @param message - сообщение
+ * @param message.inputBuffer - входные данные
+ * @param message.inputFormat - формат входного файла
+ * @param message.outputFormat - формат выходного файла
+ * @param message.options - опции конвертации
  */
-async function handleConvert(message) {
+async function handleConvert(message: ParentMessage): Promise<void> {
   const { inputBuffer, inputFormat, outputFormat, options = {} } = message;
 
   if (!inputBuffer || !outputFormat) {
@@ -119,8 +156,8 @@ async function handleConvert(message) {
     const result = await converter.convertDocument(
       Buffer.from(inputBuffer),
       {
-        outputFormat,
-        inputFormat,
+        outputFormat: outputFormat as OutputFormat,
+        inputFormat: inputFormat as InputFormat,
         password: options.password,
       },
       buildConverterOptions()
@@ -128,16 +165,16 @@ async function handleConvert(message) {
 
     sendSuccess(result.data);
   } catch (err) {
-    sendError(`Conversion failed: ${err.message}`);
+    sendError(`Conversion failed: ${(err as Error).message}`);
   }
 }
 
 /**
  * Отправляет успешный результат.
  *
- * @param {Uint8Array|Buffer} data - результат конвертации
+ * @param data - результат конвертации
  */
-function sendSuccess(data) {
+function sendSuccess(data: Uint8Array | Buffer): void {
   if (process.send) {
     process.send({
       result: Array.from(data)
@@ -148,9 +185,9 @@ function sendSuccess(data) {
 /**
  * Отправляет ошибку.
  *
- * @param {string} error - сообщение об ошибке
+ * @param error - сообщение об ошибке
  */
-function sendError(error) {
+function sendError(error: string): void {
   if (process.send) {
     process.send({ error });
   }

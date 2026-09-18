@@ -4,12 +4,9 @@
   // NestJS требует декораторов и метаданных о типах параметров, поэтому здесь
   // неприменимо нативное стирание типов Node 24 — нужен шаг сборки `tsc`.
   //
-  // `allowJs` включён на время переезда: доменные модули (security/, queue/,
-  // storage/, worker/) пока остаются на JavaScript, и их импортирует как
-  // существующее Express-приложение, так и новое NestJS-приложение. Переводить
-  // их в TypeScript раньше нельзя — у них два потребителя с разными правилами
-  // импорта (`./x.js` против `./x.ts`). Когда Express-слой будет удалён,
-  // `allowJs` снимается вместе с переименованием файлов.
+  // `allowJs` снят вместе с завершением переезда: весь `src/` — TypeScript,
+  // JavaScript остался только в тестах (`tests/`, они вне этого конфига)
+  // и в конфигурационных файлах корня.
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022"],
@@ -19,11 +16,6 @@
     // Декораторы NestJS
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
-
-    // Переездный режим: JS-модули компилируются наравне с TS и попадают в dist,
-    // чтобы скомпилированный NestJS-код мог их импортировать
-    "allowJs": true,
-    "checkJs": false,
 
     "strict": true,
     "noUnusedLocals": true,
@@ -40,6 +32,6 @@
     "sourceMap": true,
     "declaration": false
   },
-  "include": ["src/**/*.ts", "src/**/*.js"],
+  "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist", "tests"]
 }

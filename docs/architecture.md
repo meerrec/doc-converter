@@ -6,7 +6,7 @@
 
 | Каталог | Роль |
 |---|---|
-| `src/` | Сервер: API (Express) и воркер очереди. Корневой пакет `doc-converter` |
+| `src/` | Сервер: API (NestJS) и воркер очереди. Корневой пакет `doc-converter` |
 | `packages/contract/` | **Контракт API**: zod-схемы и выведенные из них типы. Общий для сервера и веба |
 | `web/` | Интерфейс: Vite + React + TypeScript |
 | `tests/` | Тесты сервера (Jest + supertest) |
@@ -14,10 +14,11 @@
 `packages/contract` — единственный источник правды по формам запросов и ответов,
 спискам форматов, кодировкам и кодам ошибок. Схемы написаны на zod, поэтому из одной
 схемы выводятся и тип для TypeScript, и рантайм-проверка: разойтись между сервером
-и клиентом они не могут. Веб уже потребляет контракт целиком; сервер переходит
-на него по мере переноса на NestJS.
+и клиентом они не могут. Контракт потребляют и веб, и сервер.
 
-Порядок сборки: контракт собирается **до** веба (`pnpm --filter @doc-converter/contract build`).
+Порядок сборки: контракт собирается **до** сервера и веба
+(`pnpm --filter @doc-converter/contract build`) — он подключается как workspace-пакет
+и резолвится в собранный `dist`.
 
 ## Пути выполнения
 
@@ -30,8 +31,8 @@
 | Роль | Немедленный ответ с результатом | Очередь, устойчивость к пикам нагрузки |
 | Изоляция | `child_process.fork` (изоляция ОС) | та же: `child_process.fork` |
 | Ограничение параллелизма | Семафор `MAX_CONCURRENT` + пул `FORK_POOL_SIZE` | `concurrency: MAX_CONCURRENT` в BullMQ + свой семафор воркера |
-| Точка входа | `api/routes/convert.js` → `worker/sandbox.js` | `queue/conversionQueue.js` → `worker/index.js` → `worker/processor.js` → `worker/sandbox.js` |
-| Движок | `worker/fork-worker.js` → `@matbee/libreoffice-converter` | тот же |
+| Точка входа | `nest/http/convert.controller.ts` → `worker/sandbox.ts` | `queue/conversionQueue.ts` → `worker/index.ts` → `worker/processor.ts` → `worker/sandbox.ts` |
+| Движок | `worker/fork-worker.ts` → `@matbee/libreoffice-converter` | тот же |
 
 **Конвертация в обоих режимах идёт через один и тот же fork-пул.** Разница только в том,
 кто её запускает: синхронный путь — прямо из обработчика запроса, асинхронный — из
@@ -47,18 +48,18 @@
 
 ```
 POST /ConvertService.ashx
-  → api/routes/convert.js          валидация схемы, SSRF, magic bytes, zip guard
-  → worker/sandbox.js              семафор MAX_CONCURRENT + таймаут SYNC_QUEUE_WAIT_MS
-  → worker/fork-pool.js            пул child_process.fork
-  → worker/fork-worker.js          конвертация в дочернем процессе
+  → nest/http/convert.controller.ts  схема, SSRF, magic bytes, zip guard, запись результата
+  → worker/sandbox.ts                семафор MAX_CONCURRENT + таймаут SYNC_QUEUE_WAIT_MS
+  → worker/fork-pool.ts              пул child_process.fork
+  → worker/fork-worker.ts            конвертация в дочернем процессе
   → @matbee/libreoffice-converter
 ```
 
 ### Пошагово
 
-1. **Семафор** (`sandbox.js:176`). Синглтон `Semaphore(MAX_CONCURRENT)` = 4 слота.
+1. **Семафор** (`sandbox.ts`, класс `Semaphore`). Синглтон `Semaphore(MAX_CONCURRENT)` = 4 слота.
    Синхронный запрос ждёт слот не дольше `SYNC_QUEUE_WAIT_MS` (5 с).
-2. **Пул** (`fork-pool.js:120`). `runTask()` берёт свободный процесс из пула, при
+2. **Пул** (`fork-pool.ts`). `runTask()` берёт свободный процесс из пула, при
    необходимости лениво форкает новые (до `FORK_POOL_SIZE`).
    Процессы создаются с `execArgv: ['--disable-wasm-trap-handler', '--max-old-space-size=1536']`
    и `serialization: 'advanced'` — последнее важно, иначе `Buffer` поехал бы JSON-массивом.
@@ -74,7 +75,7 @@ POST /ConvertService.ashx
    Слушать `req.on('close')` нельзя — у запроса это событие приходит и при штатном
    завершении (тело получено), из-за чего сервер считал клиента ушедшим и не отдавал
    готовый результат.
-6. **Общий бюджет.** Параллельно в роутере тикает таймер `SYNC_TIMEOUT_MS` (30 с), по которому
+6. **Общий бюджет.** Параллельно в контроллере тикает таймер `SYNC_TIMEOUT_MS` (30 с), по которому
    клиент получает `504 sync_timeout`.
 
 Обмен идёт через `process.send` / `process.on('message')` — это `child_process.fork`,
@@ -82,34 +83,32 @@ POST /ConvertService.ashx
 
 ### Что важно знать про этот путь
 
-- Дочерний процесс вызывает библиотеку **напрямую** (`fork-worker.js:119`), минуя
-  `worker/converter.js` и `worker/optionsMapper.js`. Значит здесь нет ни проверки совместимости
+- Дочерний процесс вызывает библиотеку **напрямую** (`fork-worker.ts`), минуя
+  `worker/converter.ts` и `worker/optionsMapper.ts`. Значит здесь нет ни проверки совместимости
   форматов, ни маппинга опций Р7 — из `options` используется только `password`.
 - Ошибки пересекают границу процесса **строкой**: `errorCode` и `statusCode` теряются,
   поэтому наружу почти всегда уходит `500` с кодом `internal` или `conversion_failed`.
-- `runTask` либо резолвится `{ success: true, result }`, либо реджектится. Ветки
-  `if (!result.success)` в `sandbox.js:287` и `convert.js:296` недостижимы.
 
 ## Асинхронный путь
 
 ```
 POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
-  → queue/conversionQueue.js       BullMQ (грузится лениво через await import)
-  → worker/index.js                BullMQ Worker
-  → worker/processor.js            подготовка, валидация, сохранение результата
-  → worker/sandbox.js              семафор + бюджет времени
-  → worker/fork-pool.js            пул child_process.fork (тот же, что в sync)
-  → worker/fork-worker.js          конвертация в дочернем процессе
+  → queue/conversionQueue.ts       BullMQ (грузится лениво через await import)
+  → worker/index.ts                BullMQ Worker
+  → worker/processor.ts            подготовка, валидация, сохранение результата
+  → worker/sandbox.ts              семафор + бюджет времени
+  → worker/fork-pool.ts            пул child_process.fork (тот же, что в sync)
+  → worker/fork-worker.ts          конвертация в дочернем процессе
   → @matbee/libreoffice-converter
 ```
 
 ### Пошагово
 
-1. **Постановка в очередь** (`api/routes/convert.js:234`). `addConversionJob` кладёт
+1. **Постановка в очередь** (`nest/http/convert.controller.ts`). `addConversionJob` кладёт
    `{ taskId, inputBuffer (base64), inputFormat, outputFormat, options, requestId }`
    с `jobId = taskId`. Ответ клиенту — `202` с `taskId`.
-2. **Воркер** (`worker/index.js:68`). `new Worker('conversion', processJob, { concurrency: MAX_CONCURRENT, lockDuration: BULLMQ_LOCK_DURATION, stalledInterval: BULLMQ_STALLED_INTERVAL })`.
-3. **Обработка** (`worker/processor.js:87`): проверка `job.data` → декодирование base64 →
+2. **Воркер** (`worker/index.ts`). `new Worker('conversion', processJob, { concurrency: MAX_CONCURRENT, lockDuration: BULLMQ_LOCK_DURATION, stalledInterval: BULLMQ_STALLED_INTERVAL })`.
+3. **Обработка** (`worker/processor.ts`): проверка `job.data` → декодирование base64 →
    `checkMagicBytes` → `validateZip` для офисных форматов → маппинг опций →
    `convertWithLimits` (fork-пул) → `saveFile` → запись статуса и результата в Valkey.
    Прогресс пишется через `job.updateProgress(10 / 20 / 30 / 90 / 100)`.
@@ -121,7 +120,7 @@ POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
 
 - `async: true` в docker-compose обслуживает отдельный контейнер `worker`
   (у него `SYNC_ENABLED=false`).
-- Очередь называется `conversion`; имя продублировано константой в `worker/index.js:42`.
+- Очередь называется `conversion`; имя продублировано константой в `worker/index.ts`.
 - `bullmq` загружается ленивым `await import()`: его CJS-сборка тянет ESM-only `msgpackr`,
   и статический импорт сломал бы запуск API-сервера.
 - **Прогресс нельзя обновлять в обработчике `completed`.** Задача к этому моменту уже
@@ -129,14 +128,14 @@ POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
   с «Missing key for job», роняя процесс воркера. Итоговый прогресс пишется в `processor.js`.
 - **Опции Р7 поддерживаются частично.** Библиотека принимает `outputFormat`, `inputFormat`,
   `password`, `pdf` и `image` — всё остальное (`CharSet`, `FieldDelimiter`, `PageSize`,
-  `Margins` и прочее, что формирует `optionsMapper.js`) она игнорирует. Практический эффект
+  `Margins` и прочее, что формирует `optionsMapper.ts`) она игнорирует. Практический эффект
   сейчас даёт только пароль документа.
 
 ## Состояние
 
 ### Valkey/Redis
 
-Клиент — `ioredis` (`queue/connection.js`), префикс ключей — `task:`.
+Клиент — `ioredis` (`queue/connection.ts`), префикс ключей — `task:`.
 
 | Ключ | Тип | TTL | Назначение |
 |---|---|---|---|
@@ -153,7 +152,7 @@ POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
 
 ### Файловое хранилище
 
-`storage/fileStorage.js` пишет результат атомарно: `.tmp` → `rename` → `chmod 0o444`.
+`storage/fileStorage.ts` пишет результат атомарно: `.tmp` → `rename` → `chmod 0o444`.
 Запись идёт в `STORAGE_PATH`. Автоматической очистки нет: механизм удалён вместе с
 мёртвой `cleanupStorage()`, TTL у файлов отсутствует.
 
@@ -161,9 +160,9 @@ POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
 
 ### Совместимость форматов
 
-Матрицы попарной совместимости нет. Проверяются только allowlist'ы из
-`api/middleware/validate.js`: входной формат — по `ALLOWED_INPUT_FORMATS`, выходной —
-по `ALLOWED_OUTPUT_FORMATS`. Всё, что прошло allowlist, передаётся WASM-библиотеке;
+Матрицы попарной совместимости нет. Проверяются только allowlist'ы из контракта
+(`packages/contract`): входной формат — по `INPUT_FORMATS`, выходной — по `OUTPUT_FORMATS`;
+применяет их `nest/http/validation.pipe.ts`. Всё, что прошло allowlist, передаётся WASM-библиотеке;
 поддерживает ли она конкретную пару, заранее не проверяется — неподдерживаемая пара
 приводит к ошибке конвертации.
 
@@ -215,53 +214,62 @@ rateLimit → validate (схема + allowlist) → urlGuard (SSRF) → magicByt
 
 | Файл | Роль |
 |---|---|
-| `src/config/index.js` | Все таймауты и лимиты с обоснованиями |
-| `src/api/server.js` | Сборка Express: middleware, маршруты, заголовки, обработчик ошибок |
-| `src/api/routes/convert.js` | `POST /ConvertService.ashx`: валидация, идемпотентность, выбор режима |
-| `src/api/routes/status.js` | `GET /status/:taskId` и пакетный `GET /status` |
-| `src/api/routes/results.js` | `GET /results/:fileName` — отдача готовых файлов (смонтирован также на `/storage/results`) |
-| `src/api/middleware/validate.js` | Схема запроса, allowlist форматов, проверка контента |
-| `src/api/middleware/rateLimit.js` | Sliding window на IP (in-memory) |
-| `src/api/middleware/auditLog.js` | Аудит-логгер на pino |
-| `src/api/middleware/requestId.js` | `X-Request-Id` и `req.requestId` |
-| `src/api/middleware/timeouts.js` | Таймауты тела и обработки (`bodyTimeoutMiddleware` не работает — см. ниже) |
-| `src/security/limits.js` | Лимиты zip/xml/url — дополняют config |
-| `src/security/magicBytes.js` | Сигнатуры форматов |
-| `src/security/zipGuard.js` | Проверка архивов без распаковки |
-| `src/security/xmlGuard.js` | Эвристики против XXE и XML-бомб |
-| `src/security/urlGuard.js` | SSRF-защита |
-| `src/queue/connection.js` | Подключение к Valkey |
-| `src/queue/conversionQueue.js` | Очередь BullMQ |
-| `src/queue/idempotency.js` | Ключи, статусы, прогресс, результаты в Valkey |
-| `src/storage/fileStorage.js` | Атомарная запись результатов |
-| `src/worker/sandbox.js` | Семафор и бюджет времени синхронного пути |
-| `src/worker/fork-pool.js` | Пул fork-процессов |
-| `src/worker/fork-worker.js` | Дочерний процесс: вызов WASM |
-| `src/worker/index.js` | BullMQ Worker |
-| `src/worker/processor.js` | Обработчик задачи очереди |
-| `src/worker/converter.js` | Справочник форматов: расширения файлов, контекст задачи |
-| `src/worker/optionsMapper.js` | Маппинг опций Р7 → LibreOffice |
+| `src/config/index.ts` | Все таймауты и лимиты с обоснованиями |
+| `src/nest/main.ts` | Точка входа API (`node dist/nest/main.js`) |
+| `src/nest/bootstrap.ts` | Сборка приложения: логгер, заголовки, обработчик тела, слушающий сокет |
+| `src/nest/app.module.ts` | Корневой модуль: разбор окружения, контроллеры, глобальный ограничитель |
+| `src/nest/http/convert.controller.ts` | `POST /ConvertService.ashx`: валидация, идемпотентность, выбор режима |
+| `src/nest/http/status.controller.ts` | `GET /status/:taskId` и пакетный `GET /status` |
+| `src/nest/http/results.controller.ts` | `GET /results/:fileName` — отдача готовых файлов (смонтирован также на `/storage/results`) |
+| `src/nest/http/validation.pipe.ts` | Схема запроса из контракта, allowlist форматов и полей |
+| `src/nest/conversion/conversion.service.ts` | Конвейер: источник → проверка содержимого → fork-пул → результат |
+| `src/nest/conversion/content-validator.ts` | Сигнатуры формата и проверка ZIP-контейнеров |
+| `src/nest/conversion/url-source.ts` | Загрузка файла по ссылке (SSRF, Content-Type, лимит размера) |
+| `src/nest/common/rate-limit.guard.ts` | Ведро с токенами на IP (in-memory) |
+| `src/nest/common/audit-log.ts` | Аудит-логгер на pino |
+| `src/nest/common/r7-exception.filter.ts` | Формат ошибок контракта Р7 |
+| `src/nest/common/http-defaults.ts` | Заголовки безопасности, CORS, лимит тела |
+| `src/nest/config/env.ts` | Разбор переменных окружения NestJS-слоя |
+| `src/security/limits.ts` | Лимиты zip/xml/url — дополняют config |
+| `src/security/magicBytes.ts` | Сигнатуры форматов |
+| `src/security/zipGuard.ts` | Проверка архивов без распаковки |
+| `src/security/xmlGuard.ts` | Эвристики против XXE и XML-бомб |
+| `src/security/urlGuard.ts` | SSRF-защита |
+| `src/queue/connection.ts` | Подключение к Valkey |
+| `src/queue/conversionQueue.ts` | Очередь BullMQ |
+| `src/queue/idempotency.ts` | Ключи, статусы, прогресс, результаты в Valkey |
+| `src/storage/fileStorage.ts` | Атомарная запись результатов |
+| `src/worker/sandbox.ts` | Семафор и бюджет времени синхронного пути |
+| `src/worker/fork-pool.ts` | Пул fork-процессов |
+| `src/worker/fork-worker.ts` | Дочерний процесс: вызов WASM |
+| `src/worker/index.ts` | BullMQ Worker |
+| `src/worker/processor.ts` | Обработчик задачи очереди |
+| `src/worker/converter.ts` | Справочник форматов: расширения файлов, контекст задачи |
+| `src/worker/optionsMapper.ts` | Маппинг опций Р7 → LibreOffice |
 
-`src/index.js` и вложенные `index.js` — плоские реэкспорты; точками входа они не являются.
+`src/index.ts` и вложенные `index.ts` — плоские реэкспорты; точками входа они не являются.
 `default`-экспорты через `export *` не реэкспортируются.
+
+Домен (`config/`, `security/`, `queue/`, `storage/`, `worker/`) не зависит от NestJS:
+`worker/sandbox.ts` вызывается и из HTTP-слоя, и из воркера очереди, а
+`nest/common/audit-log.ts` — единственное место, куда домен импортирует из `nest/`.
 
 ## Как добавить новый формат
 
-Формат добавляется **в четырёх местах** (это сквозное соглашение проекта):
+Формат добавляется **в три места** (это сквозное соглашение проекта):
 
-1. `api/middleware/validate.js` — в `ALLOWED_INPUT_FORMATS` и/или `ALLOWED_OUTPUT_FORMATS`.
-2. `security/magicBytes.js` — сигнатура в таблице `SIGNATURES` (если формат бинарный).
-3. `worker/converter.js` — расширение в карте `getFileExtension` (соответствие
-   формата результата расширению файла).
-4. `web/src/config.ts` — в `INPUT_FORMATS` / `OUTPUT_FORMATS` и, если нужно,
-   в `OUTPUT_FORMAT_LABELS`.
+1. `packages/contract/src/formats.ts` — в `INPUT_FORMATS` и/или `OUTPUT_FORMATS`
+   (и в `FILE_EXTENSIONS`, если расширение файла не совпадает с именем формата).
+   Отсюда список берут и сервер, и веб.
+2. `security/magicBytes.ts` — сигнатура в таблице `SIGNATURES` (если формат бинарный):
+   в контракте сигнатур нет, это серверный справочник.
+3. `web/src/config.ts` — в `OUTPUT_FORMAT_LABELS`, если нужно человекочитаемое имя.
 
-Если формат — ZIP-контейнер, добавьте его в список `zipFormats` в
-`api/middleware/validate.js:392` и `worker/processor.js:244`.
-Если у формата есть специфичные опции — в `mapFormatSpecificOptions` (`optionsMapper.js:369`).
-
-Планируемый перевод на общий пакет контракта (`packages/contract`) сократит это
-до одного места: allowlist, сигнатуры и расширения будут выводиться из одной схемы.
+Если формат — ZIP-контейнер, добавьте его в `ZIP_CONTAINER_FORMATS` контракта
+(это нужно HTTP-пути: `nest/conversion/content-validator.ts` берёт набор оттуда)
+**и** в захардкоженный список в `worker/processor.ts` — асинхронный путь до контракта
+ещё не переведён (см. «Известные расхождения»).
+Если у формата есть специфичные опции — в `mapFormatSpecificOptions` (`optionsMapper.ts`).
 
 ## Известные расхождения и мёртвый код
 
@@ -270,38 +278,47 @@ rateLimit → validate (схема + allowlist) → urlGuard (SSRF) → magicByt
 
 **Функциональные:**
 
-1. `xmlGuard` не подключён: `validateXml` импортирован в `processor.js:41`, но не вызывается.
-2. `validateZip` в `convert.js:473` и `processor.js:245` вызывается **без проверки результата** —
-   реагируют только на исключение, поэтому нарушения-лимиты там не отсекаются.
-3. `bodyTimeoutMiddleware` не работает: он подключён после `express.json()`
-   (`server.js:54-60`), когда тело уже разобрано, и сразу выходит по раннему условию.
-4. `/health` объявлен прямо в `server.js:126` с `const wasmReady = true; // TODO` —
-   проверка готовности WASM не выполняется, ответ всегда `ok`.
+1. `validateXml` не вызывается ни одним модулем сервиса (только тестами): XML-проверки
+   в конвейере не участвуют.
+2. `validateZip` в асинхронном пути (`worker/processor.ts`) вызывается **без проверки
+   результата** — обработчик реагирует только на исключение, поэтому нарушения-лимиты
+   (число записей, коэффициент сжатия, глубина вложенности) там не отсекаются.
+   HTTP-путь разбирает результат и отклоняет запрос с 422
+   (`nest/conversion/content-validator.ts`).
+3. Таймаут тела запроса (`408 body_timeout`) не реализован: код ошибки есть в контракте
+   и в фильтре (`nest/common/r7-exception.filter.ts`), но приём тела ограничен только
+   размером (`BODY_LIMIT_BYTES`). Middleware таймаутов удалён вместе с Express-слоем.
+4. `GET /health` всегда отдаёт `wasm: true` — готовность движка не проверяется
+   (`nest/health/health.controller.ts`); её роль играет docker healthcheck.
+5. Отказы по схеме, сигнатурам и архиву не попадают в аудит-лог: они бросаются как
+   `AppError` и обрабатываются фильтром, который в аудит не пишет. Подробности и способ
+   восстановить паритет — в [security.md](security.md#известные-ограничения).
 
 **Гонки и дефекты:**
 
-5. В `fork-pool.js` на таймауте сначала вызывается `cleanup()`, который помечает процесс
+6. В `fork-pool.ts` на таймауте сначала вызывается `cleanup()`, который помечает процесс
    свободным, и только потом `kill('SIGKILL')` — убитый процесс возвращается в пул,
    и следующая задача упадёт на `child.send`.
-6. `checkKeyConflict` (`idempotency.js:351`) в обеих ветках возвращает `{ conflict: false }`.
-7. `MAX_TASK_ID_LENGTH = 64` в `reserveTaskId`, тогда как схема допускает `key` до 128 символов:
+7. `checkKeyConflict` (`queue/idempotency.ts`) в ветке без метаданных возвращает
+   `{ conflict: false }` в обоих случаях, а вычисленный статус не используется.
+8. `MAX_TASK_ID_LENGTH = 64` в `reserveTaskId`, тогда как схема допускает `key` до 128 символов:
    ключ длиной 65–128 проходит валидацию, но роняет `reserveTaskId` обычным `Error` → `500`.
+9. `ZipGuardError` несёт поле `code`, а не `errorCode`/`statusCode`, поэтому повреждённый
+   архив отдаётся наружу как 500 `internal`, а не 422.
 
 **Несоответствия имён и значений:**
 
-8. `STORAGE_WRITE_TIMEOUT_MS` в `.env.example` против `STORE_WRITE_TIMEOUT_MS` в коде.
-9. `PORT`/`HOST` из окружения не читаются: порт задаётся только через `API_PORT`.
-10. `REDIS_PASSWORD`, `REDIS_DB`, `REDIS_CONNECTION_STRING` объявлены, но не используются —
+10. `STORAGE_WRITE_TIMEOUT_MS` в `.env.example` против `STORE_WRITE_TIMEOUT_MS` в коде.
+11. `REDIS_PASSWORD`, `REDIS_DB`, `REDIS_CONNECTION_STRING` объявлены, но не используются —
     подключение идёт без авторизации и всегда в БД 0.
-11. TTL статуса задачи различается: 30 с из API против 3600 с из воркера.
-12. Три формата `fileUrl`: `/results/{id}.{ext}` (`fileStorage.js`), `/storage/results/{file}`
-    (`convert.js:331`) и примеры в JSDoc. Синхронный путь файл не сохраняет вообще.
-13. `RATE_PER_SEC` фактически не ограничивает: `allowed` определяется burst-веткой (20 > 5),
-    а счётчик инкрементируется после проверки.
+12. TTL статуса задачи различается: 30 с из API (`SYNC_TIMEOUT_MS / 1000`) против 3600 с
+    из воркера (`IDEMPOTENCY_TTL_SEC`).
+13. `getFileExtension` в `worker/converter.ts` дословно повторяет `FILE_EXTENSIONS`
+    из контракта — две копии одной карты форматов.
 14. Экспортируются, но не используются вне своего модуля (часть — только внутри него):
     `getSandboxStats`, `executeInSandbox`, `convertWithWasmSandbox`, `getTaskSemaphore`,
-    `resetTaskSemaphore` (`sandbox.js`); `createDefaultOptions`, `mergeOptionsWithDefaults`
-    (`optionsMapper.js`); `listResults`, `getResultSize` (`fileStorage.js`).
+    `resetTaskSemaphore` (`sandbox.ts`); `createDefaultOptions`, `mergeOptionsWithDefaults`
+    (`optionsMapper.ts`); `listResults`, `getResultSize` (`fileStorage.ts`).
 
 **Устранено при расчистке мёртвого кода:**
 
@@ -312,12 +329,25 @@ rateLimit → validate (схема + allowlist) → urlGuard (SSRF) → magicByt
 `cleanupStorage`, `UnsupportedOptionError`, `validateR7Options`, `cleanupCompletedJobs`
 и `cleanupStalledJobs`. Вместе с `isolated-vm` из образа ушёл toolchain `python3/make/g++`.
 
+При удалении Express-слоя (`src/api/`, этап 4) ушли: `validateBodyMiddleware`,
+`rateLimit` (sliding window), `requestId` и `timeouts` как Express-middleware,
+роутеры `convert.js`/`status.js`/`results.js` и сборка приложения в `server.js`.
+Заодно устранены два расхождения, которые там жили: `RATE_PER_SEC` не ограничивал
+ничего (burst-ветка перекрывала его всегда), а `fileUrl` синхронного пути отличался
+от асинхронного — теперь результат синхронного запроса пишется тем же `writeResult`.
+
 ## Тесты
 
-`npm test` — 76 тестов в `tests/security.test.js`, все фикстуры генерируются кодом
-(`tests/helpers/attackFixtures.js`). Покрыты сигнатуры файлов, SSRF, ZIP- и XML-атаки,
-схема запроса и сквозные HTTP-проверки через supertest. Не покрыты rate limiting и
-изоляция отдельной задачи.
+`npm test` — четыре набора: `tests/security.test.js` (основной, 76 тестов),
+`tests/nest.test.js`, `tests/results.test.js`, `tests/status.test.js`. Фикстуры-атаки
+генерируются кодом (`tests/helpers/attackFixtures.js`). Покрыты сигнатуры файлов, SSRF,
+ZIP- и XML-атаки, схема запроса, отдача результатов и сквозные HTTP-проверки через
+supertest. Не покрыты ограничитель частоты (в тестах лимиты подняты) и изоляция
+отдельной задачи.
+
+Тесты работают с собранным `dist/` — и сервер, и домен: Jest не читает TypeScript без
+транспиляции. Сборку перед прогоном делает `pretest`; прямой вызов `npx jest` её
+не выполняет и может прогнать набор против устаревшего `dist/`.
 
 `E2E=1` (`npm run test:e2e`) не переключает ничего: переменная `E2E` не читается ни одним
 модулем — запускается тот же набор.

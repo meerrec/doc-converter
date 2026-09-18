@@ -1,22 +1,22 @@
 /**
  * Маппинг опций Р7-Офис в опции LibreOffice
- * 
+ *
  * Отвечает за:
  * - Преобразование опций из форматов Р7-Офис в формат LibreOffice
  * - Валидацию опций
  * - Установку дефолтных значений
- * 
+ *
  * Как работает:
  * 1. Получает опции из запроса Р7-Офис
  * 2. Валидирует их
  * 3. Преобразует в формат, понятный LibreOffice WASM
  * 4. Возвращает объект с опциями для конвертации
- * 
+ *
  * Примечание:
  * - @matbee/libreoffice-converter имеет свои опции
  * - Р7-Офис имеет свои форматы опций
  * - Нужно преобразовать одно в другое
- * 
+ *
  * Поддерживаемые опции Р7-Офис:
  * - documentLayout: drawPlaceHolders, drawFormHighlight, isPrint
  * - spreadsheetLayout: pageSize, margins, fitToWidth, fitToHeight, orientation
@@ -34,6 +34,68 @@ import {
 } from '../config/index.js';
 
 // ===========================================================================
+// Типы опций
+// ===========================================================================
+
+/**
+ * Опции documentLayout в формате Р7-Офис.
+ *
+ * Объявлены типом-алиасом, а не интерфейсом: алиас получает неявную
+ * сигнатуру индекса, поэтому объект опций можно передать туда, где ожидается
+ * `Record<string, unknown>` (например, в fork-пул).
+ */
+export type DocumentLayoutOptions = {
+  drawPlaceHolders?: boolean;
+  drawFormHighlight?: boolean;
+  isPrint?: boolean;
+};
+
+/**
+ * Опции spreadsheetLayout в формате Р7-Офис.
+ */
+export type SpreadsheetLayoutOptions = {
+  pageSize?: { width?: string; height?: string };
+  margins?: {
+    left?: string;
+    right?: string;
+    top?: string;
+    bottom?: string;
+  };
+  fitToWidth?: number;
+  fitToHeight?: number;
+  orientation?: string;
+};
+
+/**
+ * Опции documentRenderer в формате Р7-Офис.
+ */
+export type DocumentRendererOptions = {
+  textAssociation?: boolean;
+};
+
+/**
+ * Опции конвертации в формате Р7-Офис.
+ */
+export type R7Options = {
+  codePage?: number;
+  delimiter?: number;
+  region?: string;
+  documentLayout?: DocumentLayoutOptions;
+  spreadsheetLayout?: SpreadsheetLayoutOptions;
+  documentRenderer?: DocumentRendererOptions;
+  password?: string;
+  // thumbnail не обрабатывается в MVP
+};
+
+/**
+ * Опции конвертации в формате LibreOffice WASM.
+ *
+ * Ключи — имена опций движка (CharSet, FieldDelimiter, PageSize и т.д.),
+ * часть из них библиотека игнорирует (см. docs/architecture.md).
+ */
+export type LibreOfficeOptions = Record<string, unknown>;
+
+// ===========================================================================
 // Ошибки
 // ===========================================================================
 
@@ -41,7 +103,22 @@ import {
  * Некорректное значение опции
  */
 export class InvalidOptionValueError extends Error {
-  constructor(optionName, value, allowedValues) {
+  /** Имя опции. */
+  optionName: string;
+  /** Переданное значение. */
+  value: unknown;
+  /** Допустимые значения. */
+  allowedValues: readonly number[];
+  /** HTTP-код для ответа API. */
+  statusCode: number;
+  /** Код ошибки API. */
+  errorCode: string;
+
+  constructor(
+    optionName: string,
+    value: unknown,
+    allowedValues: readonly number[]
+  ) {
     super(`Invalid value for option '${optionName}': ${value}. Allowed: ${allowedValues.join(', ')}`);
     this.name = 'InvalidOptionValueError';
     this.optionName = optionName;
@@ -58,29 +135,28 @@ export class InvalidOptionValueError extends Error {
 
 /**
  * Маппинг codePage в кодировку для LibreOffice
- * 
- * @param {number} codePage - кодовая страница
- * @returns {string}
+ *
+ * @param codePage - кодовая страница
  */
-function mapCodePage(codePage) {
-  const codePageMap = {
+function mapCodePage(codePage: number): string {
+  const codePageMap: Record<number, string> = {
     // UTF-8
     65001: 'UTF-8',
-    
+
     // Windows
     1251: 'windows-1251',
     1252: 'windows-1252',
-    
+
     // DOS
     866: 'IBM866',
-    
+
     // KOI8
     20866: 'KOI8-R',
-    
+
     // ISO
     28595: 'ISO-8859-5',
   };
-  
+
   return codePageMap[codePage] || 'UTF-8';
 }
 
@@ -90,18 +166,17 @@ function mapCodePage(codePage) {
 
 /**
  * Маппинг delimiter в символ для LibreOffice
- * 
- * @param {number} delimiter - разделитель
- * @returns {string}
+ *
+ * @param delimiter - разделитель
  */
-function mapDelimiter(delimiter) {
-  const delimiterMap = {
+function mapDelimiter(delimiter: number): string {
+  const delimiterMap: Record<number, string> = {
     1: '\t', // Tab
     2: ';',   // Semicolon
     3: ' ',   // Space
     4: ',',   // Comma
   };
-  
+
   return delimiterMap[delimiter] || ',';
 }
 
@@ -111,25 +186,24 @@ function mapDelimiter(delimiter) {
 
 /**
  * Маппинг region в локаль для LibreOffice
- * 
- * @param {string} region - регион
- * @returns {string}
+ *
+ * @param region - регион
  */
-function mapRegion(region) {
+function mapRegion(region: string): string {
   // LibreOffice использует стандартные локали
   // Пример: ru-RU, en-US, de-DE
-  
+
   if (!region) {
     return 'en-US';
   }
-  
+
   // Если уже в правильном формате
   if (/^[a-z]{2}(-[a-z]{2})?$/i.test(region)) {
     return region.toLowerCase();
   }
-  
+
   // Простой маппинг
-  const regionMap = {
+  const regionMap: Record<string, string> = {
     'ru': 'ru-RU',
     'en': 'en-US',
     'de': 'de-DE',
@@ -142,7 +216,7 @@ function mapRegion(region) {
     'zh': 'zh-CN',
     'ja': 'ja-JP',
   };
-  
+
   const lowerRegion = region.toLowerCase();
   return regionMap[lowerRegion] || 'en-US';
 }
@@ -153,21 +227,22 @@ function mapRegion(region) {
 
 /**
  * Маппинг documentLayout в опции LibreOffice
- * 
- * @param {object} layout - опции documentLayout
- * @returns {object}
+ *
+ * @param layout - опции documentLayout
  */
-function mapDocumentLayout(layout) {
+function mapDocumentLayout(layout: DocumentLayoutOptions): LibreOfficeOptions {
   if (!layout) {
     return {};
   }
-  
+
   const {
     drawPlaceHolders = false,
     drawFormHighlight = false,
-    isPrint = false,
+    // Значение читается, но не используется — подчёркивание снимает
+    // предупреждение о неиспользуемой переменной
+    isPrint: _isPrint = false,
   } = layout;
-  
+
   return {
     // Эти опции влияют на отображение документа
     DrawPlaceholders: drawPlaceHolders,
@@ -182,15 +257,14 @@ function mapDocumentLayout(layout) {
 
 /**
  * Маппинг spreadsheetLayout в опции LibreOffice
- * 
- * @param {object} layout - опции spreadsheetLayout
- * @returns {object}
+ *
+ * @param layout - опции spreadsheetLayout
  */
-function mapSpreadsheetLayout(layout) {
+function mapSpreadsheetLayout(layout: SpreadsheetLayoutOptions): LibreOfficeOptions {
   if (!layout) {
     return {};
   }
-  
+
   const {
     pageSize,
     margins,
@@ -198,9 +272,9 @@ function mapSpreadsheetLayout(layout) {
     fitToHeight = 0,
     orientation,
   } = layout;
-  
-  const result = {};
-  
+
+  const result: LibreOfficeOptions = {};
+
   // Размер страницы
   if (pageSize) {
     result.PageSize = {
@@ -208,7 +282,7 @@ function mapSpreadsheetLayout(layout) {
       Height: pageSize.height || '29.7cm',
     };
   }
-  
+
   // Отступы
   if (margins) {
     result.Margins = {
@@ -218,21 +292,21 @@ function mapSpreadsheetLayout(layout) {
       Bottom: margins.bottom || '2cm',
     };
   }
-  
+
   // Масштабирование
   if (fitToWidth > 0) {
     result.FitToWidth = fitToWidth;
   }
-  
+
   if (fitToHeight > 0) {
     result.FitToHeight = fitToHeight;
   }
-  
+
   // Ориентация
   if (orientation) {
     result.Orientation = orientation.toLowerCase();
   }
-  
+
   return result;
 }
 
@@ -242,17 +316,16 @@ function mapSpreadsheetLayout(layout) {
 
 /**
  * Маппинг documentRenderer в опции LibreOffice
- * 
- * @param {object} renderer - опции documentRenderer
- * @returns {object}
+ *
+ * @param renderer - опции documentRenderer
  */
-function mapDocumentRenderer(renderer) {
+function mapDocumentRenderer(renderer: DocumentRendererOptions): LibreOfficeOptions {
   if (!renderer) {
     return {};
   }
-  
+
   const { textAssociation = false } = renderer;
-  
+
   return {
     TextAssociation: textAssociation,
   };
@@ -264,17 +337,16 @@ function mapDocumentRenderer(renderer) {
 
 /**
  * Преобразует опции Р7-Офис в опции LibreOffice
- * 
- * @param {string} inputFormat - формат входного файла
- * @param {string} outputFormat - формат выходного файла
- * @param {object} r7Options - опции Р7-Офис
- * @returns {object}
+ *
+ * @param inputFormat - формат входного файла
+ * @param outputFormat - формат выходного файла
+ * @param r7Options - опции Р7-Офис
  */
 export function mapR7OptionsToLibreOffice(
-  inputFormat,
-  outputFormat,
-  r7Options = {}
-) {
+  inputFormat: string,
+  outputFormat: string,
+  r7Options: R7Options = {}
+): LibreOfficeOptions {
   const {
     codePage,
     delimiter,
@@ -285,9 +357,9 @@ export function mapR7OptionsToLibreOffice(
     password,
     // thumbnail не обрабатывается в MVP
   } = r7Options;
-  
-  const options = {};
-  
+
+  const options: LibreOfficeOptions = {};
+
   // codePage
   if (codePage !== undefined) {
     if (!SUPPORTED_CODE_PAGES.includes(codePage)) {
@@ -295,7 +367,7 @@ export function mapR7OptionsToLibreOffice(
     }
     options.CharSet = mapCodePage(codePage);
   }
-  
+
   // delimiter
   if (delimiter !== undefined) {
     if (!SUPPORTED_DELIMITERS.includes(delimiter)) {
@@ -303,32 +375,32 @@ export function mapR7OptionsToLibreOffice(
     }
     options.FieldDelimiter = mapDelimiter(delimiter);
   }
-  
+
   // region
   if (region !== undefined) {
     options.Locale = mapRegion(region);
   }
-  
+
   // documentLayout
   if (documentLayout !== undefined) {
     Object.assign(options, mapDocumentLayout(documentLayout));
   }
-  
+
   // spreadsheetLayout
   if (spreadsheetLayout !== undefined) {
     Object.assign(options, mapSpreadsheetLayout(spreadsheetLayout));
   }
-  
+
   // documentRenderer
   if (documentRenderer !== undefined) {
     Object.assign(options, mapDocumentRenderer(documentRenderer));
   }
-  
+
   // password
   if (password !== undefined && password !== null) {
     options.Password = password;
   }
-  
+
   // Специфичные опции для форматов
   const formatSpecificOptions = mapFormatSpecificOptions(
     inputFormat,
@@ -336,7 +408,7 @@ export function mapR7OptionsToLibreOffice(
     r7Options
   );
   Object.assign(options, formatSpecificOptions);
-  
+
   return options;
 }
 
@@ -346,48 +418,51 @@ export function mapR7OptionsToLibreOffice(
 
 /**
  * Маппинг специфичных опций для форматов
- * 
- * @param {string} inputFormat - формат входного файла
- * @param {string} outputFormat - формат выходного файла
- * @param {object} r7Options - опции Р7-Офис
- * @returns {object}
+ *
+ * @param inputFormat - формат входного файла
+ * @param outputFormat - формат выходного файла
+ * @param r7Options - опции Р7-Офис
  */
-function mapFormatSpecificOptions(inputFormat, outputFormat, r7Options) {
-  const options = {};
-  
+function mapFormatSpecificOptions(
+  inputFormat: string,
+  outputFormat: string,
+  r7Options: R7Options
+): LibreOfficeOptions {
+  const options: LibreOfficeOptions = {};
+
   // Для XLSX -> PDF
   if (inputFormat === 'xlsx' && outputFormat === 'pdf') {
     // singlePageSheets - одна страница на лист
     options.SinglePageSheets = true;
-    
+
     // exportNotes - экспортировать примечания
     options.ExportNotes = true;
-    
+
     // exportHiddenSheets - экспортировать скрытые листы
     options.ExportHiddenSheets = false;
   }
-  
+
   // Для DOCX -> PDF
   if (inputFormat === 'docx' && outputFormat === 'pdf') {
     // exportBookmarks - экспортировать закладки
     options.ExportBookmarks = true;
-    
+
     // exportBookmarkText - экспортировать текст закладок
     options.ExportBookmarkText = true;
-    
+
     // exportHeadings - экспортировать заголовки
     options.ExportHeadings = true;
   }
-  
+
   // Для PPTX -> PDF
   if (inputFormat === 'pptx' && outputFormat === 'pdf') {
     // exportNotes - экспортировать примечания
     options.ExportNotes = true;
-    
+
     // exportHiddenSlides - экспортировать скрытые слайды
     options.ExportHiddenSlides = false;
   }
-  
+
   // Для текстовых форматов
   if (['txt', 'csv', 'html', 'htm'].includes(inputFormat)) {
     // Устанавливаем кодировку
@@ -395,7 +470,7 @@ function mapFormatSpecificOptions(inputFormat, outputFormat, r7Options) {
       options.InputCharSet = mapCodePage(r7Options.codePage);
     }
   }
-  
+
   return options;
 }
 
@@ -405,31 +480,32 @@ function mapFormatSpecificOptions(inputFormat, outputFormat, r7Options) {
 
 /**
  * Создает дефолтные опции для конвертации
- * 
- * @param {string} inputFormat - формат входного файла
- * @param {string} outputFormat - формат выходного файла
- * @returns {object}
+ *
+ * @param inputFormat - формат входного файла
+ * @param outputFormat - формат выходного файла
  */
-export function createDefaultOptions(inputFormat, outputFormat) {
+export function createDefaultOptions(
+  inputFormat: string,
+  outputFormat: string
+): LibreOfficeOptions {
   return mapR7OptionsToLibreOffice(inputFormat, outputFormat, {});
 }
 
 /**
  * Объединяет опции с дефолтными
- * 
- * @param {string} inputFormat - формат входного файла
- * @param {string} outputFormat - формат выходного файла
- * @param {object} r7Options - опции Р7-Офис
- * @returns {object}
+ *
+ * @param inputFormat - формат входного файла
+ * @param outputFormat - формат выходного файла
+ * @param r7Options - опции Р7-Офис
  */
 export function mergeOptionsWithDefaults(
-  inputFormat,
-  outputFormat,
-  r7Options = {}
-) {
+  inputFormat: string,
+  outputFormat: string,
+  r7Options: R7Options = {}
+): LibreOfficeOptions {
   const defaults = createDefaultOptions(inputFormat, outputFormat);
   const mapped = mapR7OptionsToLibreOffice(inputFormat, outputFormat, r7Options);
-  
+
   return {
     ...defaults,
     ...mapped,

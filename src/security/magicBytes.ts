@@ -19,7 +19,7 @@
  * Сигнатуры поддерживаемых форматов.
  * Ключ — объявленный filetype, значение — ожидаемая сигнатура (hex или строка).
  */
-const SIGNATURES = {
+const SIGNATURES: Record<string, Buffer[] | null> = {
   // --- ZIP-based форматы (OOXML / ODF) ---
   // DOCX, XLSX, PPTX, ODT, ODS, ODP, EPUB используют ZIP-контейнер
   // Сигнатура: 50 4B 03 04 (local file header) или 50 4B 05 06 (empty archive)
@@ -30,30 +30,30 @@ const SIGNATURES = {
   ods: [Buffer.from('PK\x03\x04', 'binary'), Buffer.from('PK\x05\x06', 'binary')],
   odp: [Buffer.from('PK\x03\x04', 'binary'), Buffer.from('PK\x05\x06', 'binary')],
   epub: [Buffer.from('PK\x03\x04', 'binary'), Buffer.from('PK\x05\x06', 'binary')],
-  
+
   // --- OLE Compound File формат (старые Office форматы) ---
   // DOC, XLS, PPT используют OLE Compound File Binary Format (CFB)
   // Сигнатура: D0 CF 11 E0 A1 B1 1A E1
   doc: [Buffer.from([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])],
   xls: [Buffer.from([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])],
   ppt: [Buffer.from([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])],
-  
+
   // --- PDF ---
   // Сигнатура: 25 50 44 46 (%PDF)
   pdf: [Buffer.from('%PDF', 'ascii')],
-  
+
   // --- RTF ---
   // Сигнатура: 7B 5C 72 74 66 ({\rtf)
   // Достаточно 5 байт — версия RTF идёт следом и может отличаться
   rtf: [Buffer.from('{\\rtf', 'ascii')],
-  
+
   // --- Изображения ---
   // PNG: 89 50 4E 47 0D 0A 1A 0A
   png: [Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])],
   // JPEG: FF D8 FF
   jpg: [Buffer.from([0xFF, 0xD8, 0xFF])],
   jpeg: [Buffer.from([0xFF, 0xD8, 0xFF])],
-  
+
   // --- Текстовые форматы ---
   // Для текстовых форматов проверяем ОТСУТСТВИЕ NUL-байтов в первых 8 KiB
   // (они не должны там встречаться)
@@ -82,17 +82,33 @@ const MIN_CHECK_BYTES = 3;
 export const MAGIC_SIGNATURES = SIGNATURES;
 
 /**
+ * Ошибка проверки сигнатуры: код для HTTP-маппинга и текст сообщения.
+ */
+interface MagicCheckError {
+  errorCode: string;
+  message: string;
+}
+
+/**
+ * Результат проверки сигнатуры файла.
+ */
+interface MagicCheckResult {
+  valid: boolean;
+  error?: MagicCheckError;
+}
+
+/**
  * Сравнивает начало буфера с сигнатурой.
  *
  * Буфер может быть короче сигнатуры (например, в тестах передают только
  * первые байты файла) — тогда сравнивается столько байт, сколько есть,
  * но не меньше MIN_CHECK_BYTES.
  *
- * @param {Buffer} buffer — данные файла
- * @param {Buffer} signature — ожидаемая сигнатура
- * @returns {boolean} — true, если начало буфера совпадает с сигнатурой
+ * @param buffer — данные файла
+ * @param signature — ожидаемая сигнатура
+ * @returns — true, если начало буфера совпадает с сигнатурой
  */
-function matchesSignature(buffer, signature) {
+function matchesSignature(buffer: Buffer, signature: Buffer): boolean {
   if (buffer.length < MIN_CHECK_BYTES) {
     return false;
   }
@@ -104,22 +120,22 @@ function matchesSignature(buffer, signature) {
 /**
  * Проверяет, что переданный буфер соответствует объявленному формату.
  *
- * @param {Buffer} buffer — данные файла
- * @param {string} declaredType — объявленный filetype
- * @returns {boolean} — true, если сигнатура совпадает
+ * @param buffer — данные файла
+ * @param declaredType — объявленный filetype
+ * @returns — true, если сигнатура совпадает
  */
-export function verifyMagicBytes(buffer, declaredType) {
+export function verifyMagicBytes(buffer: Buffer, declaredType: string): boolean {
   return checkMagicBytes(buffer, declaredType).valid;
 }
 
 /**
  * Проверяет сигнатуру файла и возвращает подробный результат.
  *
- * @param {Buffer} buffer — данные файла
- * @param {string} declaredType — объявленный filetype
- * @returns {{valid: boolean, error?: {errorCode: string, message: string}}}
+ * @param buffer — данные файла
+ * @param declaredType — объявленный filetype
+ * @returns — результат проверки
  */
-export function checkMagicBytes(buffer, declaredType) {
+export function checkMagicBytes(buffer: Buffer, declaredType: string): MagicCheckResult {
   if (!buffer || buffer.length === 0) {
     return {
       valid: false,
@@ -202,10 +218,10 @@ export function checkMagicBytes(buffer, declaredType) {
  * ZIP-контейнер не позволяет отличить DOCX от XLSX без разбора содержимого,
  * поэтому возвращается первый подходящий формат семейства.
  *
- * @param {Buffer} buffer — данные файла
- * @returns {string|null} — обнаруженный формат или null
+ * @param buffer — данные файла
+ * @returns — обнаруженный формат или null
  */
-export function getFormatFromMagic(buffer) {
+export function getFormatFromMagic(buffer: Buffer): string | null {
   const detected = detectFileTypeByMagicBytes(buffer);
 
   switch (detected) {
@@ -232,20 +248,20 @@ export function getFormatFromMagic(buffer) {
  * Проверяет текстовый формат на наличие NUL-байтов.
  * Текстовые форматы не должны содержать NUL-байты (0x00).
  *
- * @param {Buffer} buffer — данные файла
- * @returns {boolean} — true, если это текстовый файл (нет NUL в первых 8 KiB)
+ * @param buffer — данные файла
+ * @returns — true, если это текстовый файл (нет NUL в первых 8 KiB)
  */
-export function verifyTextFormat(buffer) {
+export function verifyTextFormat(buffer: Buffer): boolean {
   const checkSize = Math.min(buffer.length, 8192); // 8 KiB
   const checkBuffer = buffer.slice(0, checkSize);
-  
+
   // Ищем NUL-байт в проверяемом буфере
   for (let i = 0; i < checkBuffer.length; i++) {
     if (checkBuffer[i] === 0x00) {
       return false; // Найден NUL — это бинарный файл, а не текст
     }
   }
-  
+
   return true; // NUL не найден — это текстовый файл
 }
 
@@ -253,16 +269,16 @@ export function verifyTextFormat(buffer) {
  * Определяет формат файла по magic bytes.
  * Используется для автоматического определения формата, если он не объявлен.
  *
- * @param {Buffer} buffer — данные файла
- * @returns {string|null} — обнаруженный формат или null
+ * @param buffer — данные файла
+ * @returns — обнаруженный формат или null
  */
-export function detectFileTypeByMagicBytes(buffer) {
+export function detectFileTypeByMagicBytes(buffer: Buffer): string | null {
   if (!buffer || buffer.length < 4) {
     return null;
   }
 
   const checkBuffer = buffer.slice(0, CHECK_SIZE);
-  
+
   // Проверяем ZIP-сигнатуру (PK)
   if (checkBuffer[0] === 0x50 && checkBuffer[1] === 0x4B) {
     // Это ZIP-архив — может быть DOCX, XLSX, PPTX, ODT, ODS, ODP, EPUB
@@ -309,9 +325,9 @@ export const SUPPORTED_FORMATS = Object.keys(SIGNATURES);
 /**
  * Проверяет, поддерживается ли формат.
  *
- * @param {string} fileType — формат файла
- * @returns {boolean} — true, если формат поддерживается
+ * @param fileType — формат файла
+ * @returns — true, если формат поддерживается
  */
-export function isSupportedFormat(fileType) {
+export function isSupportedFormat(fileType: string): boolean {
   return SUPPORTED_FORMATS.includes(fileType.toLowerCase());
 }

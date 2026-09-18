@@ -1,7 +1,7 @@
 /**
  *Centralized configuration for doc-converter service.
  * All timeouts, limits, and environment variables are defined here.
- * 
+ *
  * NOTE: All comments in Russian as per project requirements.
  */
 
@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 
 // Версия берётся из package.json — см. обоснование у CONVERTER_VERSION ниже
 const require = createRequire(import.meta.url);
-const packageJson = require('../../package.json');
+const packageJson = require('../../package.json') as { version: string };
 
 // ============================================================================
 // ВРЕМЕННЫЕ ЛИМИТЫ (таймауты) — внешний бюджет на этапы обработки
@@ -179,7 +179,7 @@ export const IDEMPOTENCY_TTL_SEC = Number(
  * Разрешённые значения codePage.
  * Обоснование: набор кодировок, поддерживаемых LibreOffice для CSV/текста.
  */
-export const SUPPORTED_CODE_PAGES = [
+export const SUPPORTED_CODE_PAGES: readonly number[] = [
   65001, // UTF-8
   1251,  // Windows Cyrillic
   1252,  // Windows Latin-1
@@ -193,7 +193,7 @@ export const SUPPORTED_CODE_PAGES = [
  * Обоснование: 1 — запятая, 2 — точка с запятой, 3 — двоеточие, 4 — табуляция
  * (нумерация Р7-Офис).
  */
-export const SUPPORTED_DELIMITERS = [1, 2, 3, 4];
+export const SUPPORTED_DELIMITERS: readonly number[] = [1, 2, 3, 4];
 
 // ============================================================================
 // НАСТРОЙКИ BULLMQ
@@ -225,8 +225,8 @@ export const BULLMQ_STALLED_INTERVAL = Number(
  * Версия конвертера из package.json.
  *
  * Читается из файла, а не из `npm_package_version`: та переменная заполняется
- * только при запуске через npm/pnpm-скрипт, а при прямом `node src/api/server.js`
+ * только при запуске через npm/pnpm-скрипт, а при прямом `node dist/nest/main.js`
  * (так работает CMD в Dockerfile) в окружении может оказаться значение
  * от постороннего пакета — процесс унаследует его молча.
  */
-export const CONVERTER_VERSION = packageJson.version;
+export const CONVERTER_VERSION: string = packageJson.version;

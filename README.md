@@ -18,7 +18,7 @@
 | **Синхронный режим** | `async: false` — конвертация в рамках HTTP-запроса, ответ содержит готовый `fileUrl` |
 | **Асинхронный режим** | `async: true` — задача ставится в очередь BullMQ, ответ `202` с `taskId` |
 | **Идемпотентность** | Поле `key` резервируется в Valkey через `SET NX EX`; повторный запрос с тем же ключом не запускает вторую конвертацию |
-| **Два источника** | `url` (файл скачивается сервисом) или `data` (base64 в теле запроса) — ровно одно из двух |
+| **Два источника** | `url` (файл скачивается сервисом, только публичный http/https-хост) или `data` (base64 в теле запроса) — ровно одно из двух. В конфигурации compose внешняя сеть закрыта, поэтому там работает только `data` |
 | **Опции Р7-Офис** | `codePage`, `delimiter`, `region`, `documentLayout`, `spreadsheetLayout`, `documentRenderer`, `password` |
 | **Защита** | rate limit, SSRF-guard, проверка сигнатур файлов, zip-guard, изоляция выполнения |
 
@@ -37,8 +37,10 @@ open http://localhost:8080           # веб-интерфейс
 
 ```bash
 pnpm install
-npm run dev          # api + worker через concurrently
-npm run health       # curl http://localhost:3000/health | jq
+npm run build:contract   # контракт — рантайм-зависимость сервера
+npm run build:server     # dist/ — сервер запускается только из сборки
+npm run dev              # api + worker через concurrently
+npm run health           # curl http://localhost:3000/health | jq
 ```
 
 ## Веб-интерфейс
@@ -136,10 +138,10 @@ curl http://localhost:3000/status/task-456
 
 ```
 POST /ConvertService.ashx
-  → api/routes/convert.js     валидация схемы, SSRF, magic bytes, zip guard
-  → worker/sandbox.js         семафор MAX_CONCURRENT + таймаут SYNC_QUEUE_WAIT_MS
-  → worker/fork-pool.js       пул child_process.fork
-  → worker/fork-worker.js     конвертация в дочернем процессе
+  → nest/http/convert.controller.ts  схема, SSRF, magic bytes, zip guard, запись результата
+  → worker/sandbox.ts                семафор MAX_CONCURRENT + таймаут SYNC_QUEUE_WAIT_MS
+  → worker/fork-pool.ts              пул child_process.fork
+  → worker/fork-worker.ts            конвертация в дочернем процессе
   → @matbee/libreoffice-converter
 ```
 
@@ -147,11 +149,11 @@ POST /ConvertService.ashx
 
 ```
 POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
-  → queue/conversionQueue.js  BullMQ
-  → worker/index.js           BullMQ Worker
-  → worker/processor.js       подготовка, валидация, сохранение результата
-  → worker/sandbox.js         тот же fork-пул
-  → worker/fork-worker.js     конвертация в дочернем процессе
+  → queue/conversionQueue.ts  BullMQ
+  → worker/index.ts           BullMQ Worker
+  → worker/processor.ts       подготовка, валидация, сохранение результата
+  → worker/sandbox.ts         тот же fork-пул
+  → worker/fork-worker.ts     конвертация в дочернем процессе
 ```
 
 Оба режима используют один механизм конвертации — fork-пул с изоляцией на уровне ОС
@@ -161,7 +163,10 @@ POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
 ## Команды
 
 ```bash
-pnpm install                 # или npm ci (Dockerfile использует npm ci)
+pnpm install                 # Dockerfile ставит зависимости через pnpm ci
+
+npm run build:contract       # контракт: обязателен до сборки сервера и веба
+npm run build:server         # tsc → dist/ (сервер запускается только из сборки)
 
 npm run dev                  # API + worker вместе (NODE_ENV=development, включает CORS)
 npm run dev:api              # только API
@@ -185,7 +190,7 @@ NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules npx jest --forceExit -t "sh
 `NODE_OPTIONS=--experimental-vm-modules` обязателен: Jest запускается на ESM без транспиляции
 (`transform: {}` в `jest.config.js`) и без него падает на `import`.
 
-`--forceExit` нужен потому, что Jest иначе виснет на открытых хендлах — Express-сервер,
+`--forceExit` нужен потому, что Jest иначе виснет на открытых хендлах — HTTP-сервер,
 поднятый в тестах через `createServer()`, `setInterval` в rate limit и пул fork-процессов.
 
 Фикстур-атаки не лежат в `tests/fixtures/` — они генерируются кодом в

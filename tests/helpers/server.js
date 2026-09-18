@@ -1,26 +1,17 @@
 /**
- * Выбор реализации сервера для тестов.
+ * Запуск сервера для тестов.
  *
- * Во время переезда на NestJS в репозитории живут две реализации: Express
- * (`src/api/server.js`) и NestJS (`dist/nest/bootstrap.js`). Обе
- * экспортируют `createServer()` с одинаковой сигнатурой, поэтому один и тот
- * же набор тестов прогоняется против любой из них — переключается только
- * эта прослойка, тексты и ожидания тестов не меняются.
- *
- * Реализация выбирается переменной окружения `SERVER_IMPL`:
- *   (не задана)  — Express, текущая рабочая
- *   nest         — NestJS, требует собранного `dist`
+ * Сервер собирается из `dist/`: Jest не читает TypeScript без транспиляции,
+ * а конфигурация проекта её намеренно не включает (ESM без `transform`).
+ * Сборку перед прогоном выполняет `pretest` (`npm run build:server`).
  *
  * Импорт динамический, а не статический: тесты выставляют переменные
  * окружения (STORAGE_PATH, RATE_*) до обращения к серверу, а `config/index.js`
  * читает их при импорте модуля.
  */
 
-/** Выбранная реализация. */
-export const implementation = process.env.SERVER_IMPL === 'nest' ? 'nest' : 'express';
-
 /**
- * Создаёт и запускает сервер выбранной реализации.
+ * Создаёт и запускает сервер.
  *
  * @returns объект с приложением и слушающим сервером
  */
@@ -32,13 +23,7 @@ export async function createServer() {
   process.env.API_PORT ??= '0';
   process.env.PORT ??= '0';
 
-  if (implementation === 'nest') {
-    const { createServer: createNestServer } = await import('../../dist/nest/bootstrap.js');
+  const { createServer: createNestServer } = await import('../../dist/nest/bootstrap.js');
 
-    return createNestServer();
-  }
-
-  const { createServer: createExpressServer } = await import('../../src/api/server.js');
-
-  return createExpressServer();
+  return createNestServer();
 }

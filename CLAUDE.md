@@ -16,34 +16,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Команды
 
 Скрипты запуска — в `package.json` (`dev`, `dev:api`, `dev:worker`, `start`, `health`).
-Неочевидное: `dev*` выставляют `NODE_ENV=development`, что включает CORS-заголовки в `api/server.js`.
+Неочевидное: `dev*` выставляют `NODE_ENV=development`, что включает CORS-заголовки
+(`src/nest/common/http-defaults.ts`). Скрипты запускают **собранный** код из `dist/`,
+поэтому перед первым `npm run dev` нужна сборка (`npm run build:contract && npm run build:server`).
 
 Локальный запуск требует доступного Valkey/Redis (`REDIS_HOST`/`REDIS_PORT`); для полного стека —
 `docker compose up --build` (api + worker + valkey).
 
 ### Сервер на NestJS (`src/nest/`)
 
-Сервер переводится с Express на NestJS. Приложение живёт в `src/nest/` и на время
-переезда соседствует с Express-версией в `src/api/` — запросы пока обслуживает она.
+Сервер работает на NestJS; Express-слоя в репозитории больше нет. Пакет `express`
+остался только как HTTP-адаптер Nest (`@nestjs/platform-express`) — своих
+middleware и роутеров на нём нет.
 
 ```bash
 npm run build:server         # tsc → dist/ (NestJS требует декораторов, сборка обязательна)
 npm run typecheck:server     # tsc --noEmit
-npm run start:nest           # node dist/nest/main.js
+npm run start:api            # node dist/nest/main.js
 ```
 
 NestJS компилируется, а не запускается напрямую: декораторам нужен
 `emitDecoratorMetadata`, с которым нативное стирание типов Node 24 несовместимо.
-`allowJs` включён на время переезда — доменные модули (`security/`, `queue/`,
-`storage/`, `worker/`) пока на JavaScript, и у них два потребителя. После
-переключения на NestJS они переезжают в TypeScript, и `allowJs` снимается.
+Домен (`config/`, `security/`, `queue/`, `storage/`, `worker/`) — тоже TypeScript,
+в `dist/` попадает целиком; `allowJs` из `tsconfig.json` снят.
+
+`src/config/index.ts` остаётся единственным источником таймаутов и лимитов: его
+читают и домен, и Nest-слой. Nest дополнительно разбирает своё подмножество
+переменных через `src/nest/config/env.ts` (`NODE_ENV`, `PORT`, `HOST`, `LOG_LEVEL`,
+`RATE_*`) — не при импорте модуля, а при создании приложения.
 
 Ограничитель частоты (`src/nest/common/rate-limit.guard.ts`) реализует ведро
 с токенами: ёмкость `RATE_BURST`, пополнение `RATE_PER_SEC`. Прежняя реализация
-проверяла `count < RATE_PER_SEC || count <= RATE_BURST`, и вторая ветка всегда
-перекрывала первую — `RATE_PER_SEC` не влиял ни на что. Вместе с переездом убрано
-и двойное навешивание ограничителя на маршрут конвертации: раньше один POST
+(Express) проверяла `count < RATE_PER_SEC || count <= RATE_BURST`, и вторая ветка
+всегда перекрывала первую — `RATE_PER_SEC` не влиял ни на что. Вместе с переездом
+убрано и двойное навешивание ограничителя на маршрут конвертации: раньше один POST
 списывал две единицы бюджета.
+
+Аудит-логгер живёт в `src/nest/common/audit-log.ts`, хотя вызывается и из домена
+(`worker/sandbox.ts`): логгер создаётся на уровне модуля и работает вне
+Nest-контекста, поэтому DI здесь не подходит.
 
 Логирование — `pino` и `pino-http` напрямую (`src/nest/common/logger.ts`).
 `nestjs-pino` не подходит: пакет поставляет исходники на TypeScript и требует
@@ -69,18 +80,21 @@ NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules npx jest --forceExit -t "sh
 `NODE_OPTIONS=--experimental-vm-modules` обязателен — Jest запускается на ESM без транспиляции
 (`transform: {}` в `jest.config.js`). Без него Jest падает на `import`.
 
-Перед прогоном выполняется `pretest` — сборка сервера. Это нужно тестам NestJS:
-Jest не читает TypeScript, поэтому они работают с собранным `dist/`. Заодно
-гарантируется, что типы проверены. После перехода на Vitest (исходники вместо
+Перед прогоном выполняется `pretest` — сборка сервера. Это нужно всем тестам:
+Jest не читает TypeScript, поэтому и сервер, и домен они берут из собранного `dist/`.
+Заодно гарантируется, что типы проверены. После перехода на Vitest (исходники вместо
 сборки) шаг уйдёт.
+
+Прямой вызов `npx jest` сборку не выполняет — можно незаметно прогнать набор против
+устаревшего `dist/`.
 
 В `jest.config.js` есть `moduleNameMapper` для `rxjs`: Jest не применяет условие
 `node` из карты экспорта пакета и добирается до сборки `esm5`, которую не умеет
 разбирать. Правка тоже временная — Vitest разрешает модули как Node.
 
-`--forceExit` в тест-скрипте нужен, потому что Jest иначе виснет на открытых хендлах: Express-сервер,
-поднятый в тестах через `createServer()`, `setInterval` в rateLimit, пул fork-процессов. Код возврата
-при этом остаётся корректным — при падении тестов Jest отдаёт 1.
+`--forceExit` в тест-скрипте нужен, потому что Jest иначе виснет на открытых хендлах: HTTP-сервер,
+поднятый в тестах через `createServer()`, `setInterval` в ограничителе частоты, пул fork-процессов.
+Код возврата при этом остаётся корректным — при падении тестов Jest отдаёт 1.
 
 `lint` — заглушка (`echo 'Linter not configured yet'`); линтер в проекте не настроен.
 
@@ -100,11 +114,10 @@ pnpm --filter doc-converter-web build           # → web/dist
 pnpm --filter @doc-converter/contract build     # контракт: обязателен до сборки web
 ```
 
-Интерфейс работает только через асинхронный режим (`async: true`): синхронный путь
-не сохраняет файл результата, поэтому скачать его было бы нельзя. Статусы опрашиваются
-одной пачкой через `GET /status?taskIds=…`, отправка идёт через ограничитель
-параллелизма (`web/src/lib/limiter.ts`) — на маршруте конвертации rate limit
-навешан дважды, один POST стоит две единицы бюджета.
+Интерфейс работает только через асинхронный режим (`async: true`): пакетная отправка
+не должна ждать конвертацию в HTTP-запросе, а результат забирается по `fileUrl` из статуса.
+Статусы опрашиваются одной пачкой через `GET /status?taskIds=…`, отправка идёт через
+ограничитель параллелизма (`web/src/lib/limiter.ts`), чтобы не упираться в `RATE_PER_SEC`.
 
 В production статику раздаёт nginx (`web/nginx.conf`, сервис `web` в compose) и он же
 проксирует API на `api:3000` — фронт и API на одном origin, поэтому CORS не нужен.
@@ -120,10 +133,10 @@ pnpm --filter @doc-converter/contract build     # контракт: обязат
 
 ```
 POST /ConvertService.ashx
-  → api/routes/convert.js          валидация схемы, SSRF, magic bytes, zip guard
-  → worker/sandbox.js              семафор MAX_CONCURRENT + таймаут SYNC_QUEUE_WAIT_MS
-  → worker/fork-pool.js            пул child_process.fork
-  → worker/fork-worker.js          конвертация в дочернем процессе
+  → nest/http/convert.controller.ts  схема, SSRF, magic bytes, zip guard, запись результата
+  → worker/sandbox.ts                семафор MAX_CONCURRENT + таймаут SYNC_QUEUE_WAIT_MS
+  → worker/fork-pool.ts              пул child_process.fork
+  → worker/fork-worker.ts            конвертация в дочернем процессе
   → @matbee/libreoffice-converter
 ```
 
@@ -137,11 +150,11 @@ POST /ConvertService.ashx
 
 ```
 POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
-  → queue/conversionQueue.js       BullMQ (грузится лениво через await import)
-  → worker/index.js                BullMQ Worker
-  → worker/processor.js            подготовка, валидация, сохранение результата
-  → worker/sandbox.js              тот же fork-пул, что и в sync
-  → worker/fork-worker.js          конвертация в дочернем процессе
+  → queue/conversionQueue.ts       BullMQ (грузится лениво через await import)
+  → worker/index.ts                BullMQ Worker
+  → worker/processor.ts            подготовка, валидация, сохранение результата
+  → worker/sandbox.ts              тот же fork-пул, что и в sync
+  → worker/fork-worker.ts          конвертация в дочернем процессе
 ```
 
 **Конвертация в обоих режимах идёт через один fork-пул.** Разница только в инициаторе:
@@ -153,7 +166,7 @@ sync запускает её из обработчика запроса, async �
 удалены — не возвращай их. Вместе с ними из образа ушёл toolchain `python3/make/g++`.
 
 Опции Р7 библиотека понимает частично: работают `outputFormat`, `inputFormat`, `password`,
-`pdf`, `image`; остальное (`CharSet`, `FieldDelimiter`, `PageSize` и пр. из `optionsMapper.js`)
+`pdf`, `image`; остальное (`CharSet`, `FieldDelimiter`, `PageSize` и пр. из `optionsMapper.ts`)
 игнорируется.
 
 ### Слои безопасности (в порядке прохождения)
@@ -164,29 +177,31 @@ sync запускает её из обработчика запроса, async �
 
 ### Отдача результатов
 
-`api/routes/results.js` (`GET /results/:fileName`) — единственное место, откуда клиент
-получает готовый файл. Имя разбирается на taskId и расширение, путь собирается от
-`STORAGE_PATH` (файлы лежат плоско), расширение сверяется с allowlist выходных форматов.
-Роутер смонтирован дважды — на `/results` и `/storage/results`, потому что синхронный
-и асинхронный пути формируют разные `fileUrl`.
+`src/nest/http/results.controller.ts` (`GET /results/:fileName`) — единственное место,
+откуда клиент получает готовый файл. Имя разбирается на taskId и расширение, путь
+собирается от `STORAGE_PATH` (файлы лежат плоско), расширение сверяется с allowlist
+выходных форматов. Контроллер смонтирован дважды — на `/results` и `/storage/results`:
+оба пути формируют одинаковый `fileUrl` (`/results/{id}.{ext}`, `writeResult`), но
+историческая форма ссылки обязана работать, потому что клиент использует её дословно.
 
 ### Состояние
 
 - **Valkey/Redis** (ioredis) — идемпотентность по `key` (`task:{id}:owner` через `SET NX EX`), статусы,
-  прогресс, результаты, метаданные. Всё в `queue/idempotency.js`.
+  прогресс, результаты, метаданные. Всё в `queue/idempotency.ts`.
 - **Файловая система** — результаты конвертации в `STORAGE_PATH`, атомарная запись
-  (`.tmp` → `rename` → `chmod 0o444`). `storage/fileStorage.js`.
+  (`.tmp` → `rename` → `chmod 0o444`). `storage/fileStorage.ts`.
 
 ## Конфигурация
 
-Все таймауты и лимиты — в **`src/config/index.js`**. Не хардкодь числа в модулях — добавляй константу
+Все таймауты и лимиты — в **`src/config/index.ts`**. Не хардкодь числа в модулях — добавляй константу
 в config вместе с комментарием-обоснованием.
 
 Два исключения, о которых легко забыть:
 
-- `src/security/limits.js` — отдельный набор лимитов для zip/xml/url (не дублирует config, а дополняет).
-- Прямые чтения `process.env` вне config: `api/middleware/auditLog.js` (`AUDIT_LOG_PATH`,
-  `AUDIT_LOG_LEVEL`), `api/server.js` (`NODE_ENV`, `MAX_BODY_BYTES`).
+- `src/security/limits.ts` — отдельный набор лимитов для zip/xml/url (не дублирует config, а дополняет).
+- Прямые чтения `process.env` вне config: `nest/common/audit-log.ts` (`AUDIT_LOG_PATH`,
+  `AUDIT_LOG_LEVEL`), `worker/fork-worker.ts` (`LO_CONVERTER_VERBOSE`). NestJS-слой читает
+  своё подмножество через `nest/config/env.ts`.
 
 `.env.example` — источник истины по переменным окружения, включая те, что пока не читаются кодом.
 
@@ -196,14 +211,13 @@ sync запускает её из обработчика запроса, async �
 ## Соглашения
 
 - Формат ошибок API — единый: `{ error: <код>, message, taskId? }`, где код — snake_case
-  (`magic_mismatch`, `url_private_ip`, `field_type_mismatch`, …). Исключения несут `statusCode`
-  и `errorCode` как свойства — обработчик ошибок в `server.js` маппит их в HTTP-ответ.
+  (`magic_mismatch`, `url_private_ip`, `field_type_mismatch`, …). Домен бросает `AppError`
+  с `statusCode` и кодом; в HTTP-ответ их маппит `nest/common/r7-exception.filter.ts`.
 - Контракт API живёт в `packages/contract`: zod-схемы и выведенные из них типы.
-  Веб уже берёт оттуда типы, списки форматов, кодировки и коды ошибок. Сервер
-  переходит на контракт по мере переноса на NestJS — **до завершения переноса**
-  списки форматов приходится править и там, и в серверных копиях: allowlist
-  в `api/middleware/validate.js`, сигнатуры в `security/magicBytes.js`, карта
-  расширений в `worker/converter.js` (`getFileExtension`).
+  Списки форматов, кодировки, коды ошибок и схему запроса сервер берёт оттуда —
+  своих копий у него больше нет. Остаются два серверных справочника, которые
+  приходится править вместе с контрактом: сигнатуры в `security/magicBytes.ts`
+  и карта расширений в `worker/converter.ts` (`getFileExtension`).
 - `vm2` не использовать никогда.
 - Нативных модулей в зависимостях нет — образ собирается без компилятора. Если появится
   новый, помни: он потребует toolchain в стадии builder `Dockerfile`.

@@ -9,23 +9,18 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { STORAGE_PATH } from '../config/index.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 /**
  * Обеспечивает существование директории.
  *
- * @param {string} dirPath - путь к директории
- * @returns {Promise<void>}
+ * @param dirPath - путь к директории
  */
-async function ensureDirectory(dirPath) {
+async function ensureDirectory(dirPath: string): Promise<void> {
   try {
     await fs.access(dirPath);
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       await fs.mkdir(dirPath, { recursive: true });
     } else {
       throw err;
@@ -36,11 +31,11 @@ async function ensureDirectory(dirPath) {
 /**
  * Получает путь к файлу результата.
  *
- * @param {string} taskId - идентификатор задачи
- * @param {string} extension - расширение файла (без точки)
- * @returns {string} - полный путь к файлу
+ * @param taskId - идентификатор задачи
+ * @param extension - расширение файла (без точки)
+ * @returns полный путь к файлу
  */
-function getResultPath(taskId, extension) {
+function getResultPath(taskId: string, extension: string): string {
   const ext = extension.startsWith('.') ? extension : `.${extension}`;
   return path.join(STORAGE_PATH, `${taskId}${ext}`);
 }
@@ -49,13 +44,17 @@ function getResultPath(taskId, extension) {
  * Записывает результат конвертации в хранилище.
  * Использует атомарную запись через временный файл.
  *
- * @param {string} taskId - идентификатор задачи
- * @param {Buffer} buffer - данные файла
- * @param {string} extension - расширение файла (без точки)
- * @returns {Promise<{filePath: string, fileUrl: string}>} - путь к файлу
+ * @param taskId - идентификатор задачи
+ * @param buffer - данные файла
+ * @param extension - расширение файла (без точки)
+ * @returns путь к файлу
  * @throws {Error} - если запись не удалась
  */
-export async function writeResult(taskId, buffer, extension) {
+export async function writeResult(
+  taskId: string,
+  buffer: Buffer,
+  extension: string
+): Promise<{ filePath: string; fileUrl: string }> {
   // Обеспечиваем существование директории
   await ensureDirectory(STORAGE_PATH);
   
@@ -85,7 +84,7 @@ export async function writeResult(taskId, buffer, extension) {
       // Игнорируем ошибку удаления временного файла
     }
     
-    throw new Error(`Не удалось записать результат: ${err.message}`);
+    throw new Error(`Не удалось записать результат: ${(err as Error).message}`);
   }
 }
 
@@ -95,12 +94,16 @@ export async function writeResult(taskId, buffer, extension) {
  * Обёртка над writeResult с порядком аргументов (buffer, taskId, extension),
  * который ожидает обработчик очереди, и размером в результате.
  *
- * @param {Buffer} buffer - данные файла
- * @param {string} taskId - идентификатор задачи
- * @param {string} extension - расширение файла (без точки)
- * @returns {Promise<{filePath: string, fileUrl: string, size: number}>}
+ * @param buffer - данные файла
+ * @param taskId - идентификатор задачи
+ * @param extension - расширение файла (без точки)
+ * @returns путь к файлу, URL и размер
  */
-export async function saveFile(buffer, taskId, extension) {
+export async function saveFile(
+  buffer: Buffer,
+  taskId: string,
+  extension: string
+): Promise<{ filePath: string; fileUrl: string; size: number }> {
   const { filePath, fileUrl } = await writeResult(taskId, buffer, extension);
 
   return {
@@ -113,11 +116,11 @@ export async function saveFile(buffer, taskId, extension) {
 /**
  * Формирует URL результата.
  *
- * @param {string} taskId - идентификатор задачи
- * @param {string} extension - расширение файла (без точки)
- * @returns {string} - URL результата
+ * @param taskId - идентификатор задачи
+ * @param extension - расширение файла (без точки)
+ * @returns URL результата
  */
-export function generateFileUrl(taskId, extension) {
+export function generateFileUrl(taskId: string, extension: string): string {
   const ext = extension.startsWith('.') ? extension.slice(1) : extension;
   return `/results/${taskId}.${ext}`;
 }
@@ -125,18 +128,18 @@ export function generateFileUrl(taskId, extension) {
 /**
  * Чтение результата из хранилища.
  *
- * @param {string} taskId - идентификатор задачи
- * @param {string} extension - расширение файла (без точки)
- * @returns {Promise<Buffer>} - данные файла
+ * @param taskId - идентификатор задачи
+ * @param extension - расширение файла (без точки)
+ * @returns данные файла
  * @throws {Error} - если файл не найден
  */
-export async function readResult(taskId, extension) {
+export async function readResult(taskId: string, extension: string): Promise<Buffer> {
   const filePath = getResultPath(taskId, extension);
   
   try {
     return await fs.readFile(filePath);
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       throw new Error(`Файл результата не найден: ${taskId}.${extension}`);
     }
     throw err;
@@ -146,18 +149,18 @@ export async function readResult(taskId, extension) {
 /**
  * Проверяет существование результата.
  *
- * @param {string} taskId - идентификатор задачи
- * @param {string} extension - расширение файла (без точки)
- * @returns {Promise<boolean>} - true, если файл существует
+ * @param taskId - идентификатор задачи
+ * @param extension - расширение файла (без точки)
+ * @returns true, если файл существует
  */
-export async function resultExists(taskId, extension) {
+export async function resultExists(taskId: string, extension: string): Promise<boolean> {
   const filePath = getResultPath(taskId, extension);
   
   try {
     await fs.access(filePath);
     return true;
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       return false;
     }
     throw err;
@@ -167,18 +170,18 @@ export async function resultExists(taskId, extension) {
 /**
  * Удаляет результат из хранилища.
  *
- * @param {string} taskId - идентификатор задачи
- * @param {string} extension - расширение файла (без точки)
- * @returns {Promise<boolean>} - true, если файл был удалён
+ * @param taskId - идентификатор задачи
+ * @param extension - расширение файла (без точки)
+ * @returns true, если файл был удалён
  */
-export async function deleteResult(taskId, extension) {
+export async function deleteResult(taskId: string, extension: string): Promise<boolean> {
   const filePath = getResultPath(taskId, extension);
   
   try {
     await fs.unlink(filePath);
     return true;
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       return false;
     }
     throw err;
@@ -188,18 +191,18 @@ export async function deleteResult(taskId, extension) {
 /**
  * Получает размер файла результата.
  *
- * @param {string} taskId - идентификатор задачи
- * @param {string} extension - расширение файла (без точки)
- * @returns {Promise<number>} - размер файла в байтах
+ * @param taskId - идентификатор задачи
+ * @param extension - расширение файла (без точки)
+ * @returns размер файла в байтах
  */
-export async function getResultSize(taskId, extension) {
+export async function getResultSize(taskId: string, extension: string): Promise<number> {
   const filePath = getResultPath(taskId, extension);
   
   try {
     const stats = await fs.stat(filePath);
     return stats.size;
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       return 0;
     }
     throw err;
@@ -210,9 +213,9 @@ export async function getResultSize(taskId, extension) {
  * Получает список всех файлов результатов.
  * Используется для cleanup.
  *
- * @returns {Promise<string[]>} - список путей к файлам
+ * @returns список путей к файлам
  */
-export async function listResults() {
+export async function listResults(): Promise<string[]> {
   try {
     const files = await fs.readdir(STORAGE_PATH);
     return files
@@ -220,7 +223,7 @@ export async function listResults() {
                      file.endsWith('.xlsx') || file.endsWith('.txt'))
       .map(file => path.join(STORAGE_PATH, file));
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       return [];
     }
     throw err;

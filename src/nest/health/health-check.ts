@@ -1,10 +1,13 @@
 /**
- * Скрипт для проверки здоровья сервиса
- * Используется Docker healthcheck
+ * Скрипт проверки здоровья сервиса.
+ *
+ * Используется Docker healthcheck (`HEALTHCHECK` в Dockerfile и сервис `api`
+ * в docker-compose.yml) — запускается как обычный процесс и завершается
+ * кодом 0 или 1, а не поднимает сервер.
  *
  * Проверяет:
- * - Подключение к Valkey
- * - Наличие пакета конвертера (WASM-ассеты внутри образа)
+ * - подключение к Valkey
+ * - наличие пакета конвертера (WASM-ассеты внутри образа)
  *
  * Полная проверка WASM здесь намеренно не выполняется: она требует загрузки
  * ~48 МБ ассетов и инициализации движка, что слишком дорого для проверки,
@@ -12,11 +15,14 @@
  */
 
 import { createRequire } from 'node:module';
-import { checkRedisHealth } from '../queue/connection.js';
+import { checkRedisHealth } from '../../queue/connection.js';
 
 const require = createRequire(import.meta.url);
 
-async function runHealthCheck() {
+/**
+ * Выполняет проверки и завершает процесс соответствующим кодом.
+ */
+async function runHealthCheck(): Promise<void> {
   try {
     // Проверяем Redis.
     // checkRedisHealth возвращает объект { healthy, error }, а не boolean
@@ -34,13 +40,13 @@ async function runHealthCheck() {
       console.error('Конвертер недоступен: пакет @matbee/libreoffice-converter не найден');
       process.exit(1);
     }
-    
+
     console.log('Health check passed');
     process.exit(0);
   } catch (err) {
-    console.error('Health check failed:', err.message);
+    console.error('Health check failed:', (err as Error).message);
     process.exit(1);
   }
 }
 
-runHealthCheck();
+void runHealthCheck();

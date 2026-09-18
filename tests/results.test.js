@@ -3,9 +3,11 @@
  *
  * Покрывает:
  * 1. Отдачу существующего файла и корректные заголовки
- * 2. Алиас /storage/results (форма синхронного пути)
- * 3. 404 для отсутствующего результата
- * 4. Защиту от path traversal и недопустимых имён
+ * 2. Ссылку, которую формирует writeResult (`/results/{taskId}.{ext}`) — по ней
+ *    клиент и запрашивает результат, полученный в синхронном режиме
+ * 3. Алиас /storage/results (историческая форма ссылки)
+ * 4. 404 для отсутствующего результата
+ * 5. Защиту от path traversal и недопустимых имён
  *
  * Все комментарии на русском языке.
  */
@@ -27,10 +29,15 @@ process.env.RATE_PER_SEC = '100';
 process.env.RATE_BURST = '100';
 
 const { createServer } = await import('./helpers/server.js');
-const { writeResult } = await import('../src/storage/fileStorage.js');
+// Домен — TypeScript, а Jest работает без транспиляции: и сервер, и модуль
+// хранилища берутся из собранного dist (сборку делает pretest)
+const { writeResult } = await import('../dist/storage/fileStorage.js');
 
 let server;
 let app;
+
+/** Описание записанного результата: путь и ссылка, которые вернул writeResult. */
+let written;
 
 /** Идентификатор задачи, для которой подготовлен файл результата. */
 const TASK_ID = 'test-task-0001';
@@ -44,7 +51,7 @@ beforeAll(async () => {
   server = serverModule.server;
 
   // Готовим результат так же, как это делает воркер очереди
-  await writeResult(TASK_ID, PDF_BODY, 'pdf');
+  written = await writeResult(TASK_ID, PDF_BODY, 'pdf');
 });
 
 afterAll(async () => {
@@ -67,6 +74,17 @@ describe('Отдача результатов', () => {
     expect(response.headers['content-type']).toContain('application/pdf');
     expect(response.headers['content-disposition']).toContain('attachment');
     expect(response.headers['content-disposition']).toContain(`${TASK_ID}.pdf`);
+    expect(response.body.length).toBe(PDF_BODY.length);
+  });
+
+  it('возвращает fileUrl вида /results/{taskId}.{ext} и отдаёт по нему файл', async () => {
+    // Ссылку формирует writeResult; клиент использует её дословно, поэтому
+    // проверяется не только формат, но и то, что по ней действительно отдаётся файл
+    expect(written.fileUrl).toBe(`/results/${TASK_ID}.pdf`);
+
+    const response = await request(app).get(written.fileUrl);
+
+    expect(response.status).toBe(200);
     expect(response.body.length).toBe(PDF_BODY.length);
   });
 

@@ -18,7 +18,7 @@
 |---|---|---|---|
 | `filetype` | string | **да** | Формат входного файла. Allowlist: `doc`, `docx`, `xls`, `xlsx`, `ppt`, `pptx`, `odt`, `ods`, `odp`, `rtf`, `txt`, `html`, `htm`, `csv`, `pdf`, `epub` |
 | `outputtype` | string | **да** | Формат результата. Allowlist: `pdf`, `pdfa`, `docx`, `xlsx`, `csv`, `txt`, `html`, `png`, `jpg`, `jpeg`, `svg`, `odt`, `ods`, `odp`, `rtf`, `epub` |
-| `url` | string | XOR | Ссылка на файл. Ровно одно из `url`/`data` |
+| `url` | string | XOR | Ссылка на файл (только http/https, публичный хост). Ровно одно из `url`/`data` |
 | `data` | string | XOR | Содержимое файла в base64. Ровно одно из `url`/`data` |
 | `async` | boolean | нет | `false` (по умолчанию) — конвертация в рамках запроса; `true` — постановка в очередь |
 | `key` | string | нет | Идентификатор задачи для идемпотентности. `^[A-Za-z0-9._-]{1,128}$`. Если не указан — генерируется UUID |
@@ -43,7 +43,7 @@ curl -X POST http://localhost:3000/ConvertService.ashx \
         "async": false,
         "filetype": "docx",
         "outputtype": "pdf",
-        "url": "http://storage.internal/files/report.docx",
+        "url": "http://files.example.com/report.docx",
         "key": "task-123"
       }'
 ```
@@ -53,7 +53,7 @@ curl -X POST http://localhost:3000/ConvertService.ashx \
 ```json
 {
   "status": "success",
-  "fileUrl": "/storage/results/task-123.pdf",
+  "fileUrl": "/results/task-123.pdf",
   "fileType": "pdf",
   "taskId": "task-123"
 }
@@ -64,9 +64,9 @@ curl -X POST http://localhost:3000/ConvertService.ashx \
 Бюджет времени: `SYNC_TIMEOUT_MS` (30 с). Если конвертация не уложилась — `504` с кодом
 `sync_timeout`. Ожидание слота в семафоре ограничено `SYNC_QUEUE_WAIT_MS` (5 с).
 
-> **Ограничение реализации.** В синхронном режиме файл результата **не записывается** в
-> хранилище: `api/routes/convert.js:326-331` формирует `fileUrl` без вызова `saveFile`.
-> Реально сохраняет результат только асинхронный путь (`worker/processor.js`).
+Результат синхронного запроса сохраняется в хранилище тем же `writeResult`
+(`src/storage/fileStorage.ts`), что и в асинхронном пути, — скачать его можно по `fileUrl`
+из ответа. Прежняя Express-версия синхронного пути файл не записывала.
 
 ### Асинхронный режим
 
@@ -137,10 +137,11 @@ curl http://localhost:3000/status/task-456
 
 ## GET /status
 
-Пакетная проверка: параметр `taskIds` передаётся повторно.
+Пакетная проверка: параметр `taskIds` передаётся повторно, по одному значению на задачу.
 
 ```bash
 curl 'http://localhost:3000/status?taskIds=task-1&taskIds=task-2'
+curl 'http://localhost:3000/status?taskIds=task-1'    # то же, но для одной задачи
 ```
 
 ```json
@@ -152,7 +153,9 @@ curl 'http://localhost:3000/status?taskIds=task-1&taskIds=task-2'
 }
 ```
 
-Отсутствующий или не-массив `taskIds` — `400` с кодом `invalid_request`.
+Одиночный `taskIds` (без повторов) принимается наравне с массивом — это осознанное
+расширение контракта, закреплённое `tests/status.test.js`. `400` с кодом `invalid_request`
+возвращается только тогда, когда параметра нет вовсе.
 
 ## GET /results/:fileName
 
@@ -172,8 +175,10 @@ curl -OJ 'http://localhost:3000/results/6f1e4c2a-....pdf?name=Отчёт.pdf'
 Ответ — файл с заголовками `Content-Type` по расширению, `Content-Length` и
 `Content-Disposition: attachment`.
 
-Тот же обработчик смонтирован по пути `/storage/results/...` — это форма ссылки,
-которую формирует синхронный путь.
+Тот же обработчик смонтирован и по пути `/storage/results/...` — алиас сохранён для
+совместимости: раньше синхронный и асинхронный пути формировали разные `fileUrl`, и клиент
+использует значение из ответа дословно. Сейчас ссылки формируются одинаково
+(`/results/...`), но обе формы продолжают работать.
 
 | HTTP | Код | Условие |
 |---|---|---|
@@ -199,8 +204,9 @@ curl http://localhost:3000/health
 }
 ```
 
-Обрабатывается прямо в `api/server.js:125`. Флаг `wasm` сейчас возвращается константой
-(`wasmReady = true`), реальная проверка движка не выполняется.
+Обрабатывается контроллером `src/nest/health/health.controller.ts`. Флаг `wasm` сейчас
+возвращается константой (`wasmReady = true`), реальная проверка движка не выполняется —
+её роль играет docker healthcheck (см. [deployment.md](deployment.md#healthcheck)).
 
 ## Заголовки
 
@@ -249,40 +255,46 @@ curl http://localhost:3000/health
 | `500` | `conversion_failed`, `internal`, `job_processing_failed`, `output_too_small` | Сбой конвертации |
 | `501` | `sync_disabled` | `async: false` при выключенном синхронном режиме |
 | `504` | `sync_timeout` | Синхронный запрос не уложился в бюджет времени |
-| `408` | `body_timeout` | Тело запроса не пришло за `REQUEST_BODY_TIMEOUT_MS` (на практике не срабатывает — см. ограничения) |
+| `408` | `body_timeout` | Тело запроса не пришло за `REQUEST_BODY_TIMEOUT_MS` (на практике не срабатывает — см. ограничения). Статус отдаёт фильтр ошибок для исключений Nest с кодом 408 |
 
 Отдельно у `/status` свои коды: `invalid_request` (400, не передан `taskIds`),
 `task_not_found` (404), `status_check_failed` (500), `batch_status_check_failed` (500).
 
 ### Ограничение частоты
 
-Лимит — скользящее окно на IP: `RATE_PER_SEC` (5) и `RATE_BURST` (20). На практике
-действует именно burst-порог, поэтому рассчитывайте на ~20 запросов в секунду с одного
-адреса. При превышении — `429`:
+Лимит — ведро с токенами на IP: ёмкость `RATE_BURST` (20), пополнение `RATE_PER_SEC` (5)
+в секунду. Всплеск до 20 запросов проходит сразу, дальше устойчивая скорость — 5 запросов
+в секунду. При превышении — `429`:
 
 ```json
 { "error": "rate_limited", "message": "Too many requests. Try again in 2 seconds." }
 ```
 
 Состояние счётчиков хранится в памяти процесса, поэтому при нескольких репликах API
-каждая считает лимит независимо. Кроме того, middleware навешан дважды — глобально и на
-маршрут конвертации, — так что для `POST /ConvertService.ashx` счётчик растёт за запрос вдвое.
+каждая считает лимит независимо.
 
 ## Ограничения
 
-- Размер тела запроса — 100 МиБ (`MAX_BODY_BYTES`), но на маршруте конвертации
-  body-parser дополнительно ограничен 50 МБ (`api/routes/convert.js:80`). Практический
-  предел base64-полезной нагрузки — около 37 МиБ исходного файла.
+- Размер тела запроса — 100 МиБ: лимит единый (`BODY_LIMIT_BYTES = MAX_BODY_BYTES`
+  в `src/nest/common/http-defaults.ts`), отдельного лимита на маршруте конвертации нет.
+  Практический предел base64-полезной нагрузки — около 75 МиБ исходного файла
+  (base64 добавляет треть).
 - При загрузке по `url` проверяется `Content-Type` (allowlist из шести значений),
   `Content-Length` и фактический размер; редиректы не ограничиваются.
+- Хост из `url` проверяется дважды: по списку подозрительных подстрок (`localhost`, `local`,
+  `internal`, `private`, `intranet`) и по адресам, в которые он резолвится. Имя вида
+  `storage.internal` будет отклонено подстрокой, даже если указывает на публичный адрес, —
+  внутренние источники передавайте по IP или через поле `data`.
 - Формат ответа для `thumbnail` не реализован: поле принимается, но в опции конвертера не попадает.
 - Код `output_too_small` возвращается, если результат короче `MIN_OUTPUT_BYTES` (32 байта) —
   это признак неудачной конвертации.
 - **`key` длиннее 64 символов**: схема запроса допускает до 128 символов, но
   `reserveTaskId` отвергает идентификаторы длиннее 64 (`MAX_TASK_ID_LENGTH`). Такой запрос
   вернёт `500 internal`, а не `400`. Держитесь в пределах 64 символов.
-- `fileUrl` в синхронном и асинхронном режимах формируется по-разному
-  (`/storage/results/…` против `/results/…`), и статической отдачи файлов у сервиса нет —
-  URL нужно преобразовывать в путь самостоятельно.
+- `fileUrl` в обоих режимах формируется одинаково — `/results/{taskId}.{ext}`
+  (`writeResult` в `src/storage/fileStorage.ts`); прежний префикс `/storage/results/…`
+  продолжает обслуживаться как алиас.
 - Таймаут тела запроса (`408 body_timeout`) объявлен, но фактически не срабатывает:
-  middleware подключён после `express.json()` и сразу выходит.
+  в NestJS-слое разбор тела ограничен только размером (`BODY_LIMIT_BYTES`), а таймаут
+  приёма тела жил в Express-middleware, который удалён вместе с Express-слоем. Код ошибки
+  остался в контракте и в фильтре (`src/nest/common/r7-exception.filter.ts`).

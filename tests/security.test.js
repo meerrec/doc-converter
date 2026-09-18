@@ -15,29 +15,32 @@
 import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals';
 import request from 'supertest';
 import { createServer } from './helpers/server.js';
+
+// Домен — TypeScript, а Jest работает без транспиляции: модули безопасности
+// берутся из собранного dist (сборку перед прогоном делает pretest).
 import { 
   checkMagicBytes, 
   verifyMagicBytes,
   getFormatFromMagic,
   MAGIC_SIGNATURES 
-} from '../src/security/magicBytes.js';
+} from '../dist/security/magicBytes.js';
 import { 
   validateUrl, 
   validateDns,
   checkPrivateIp,
   PRIVATE_IP_RANGES 
-} from '../src/security/urlGuard.js';
+} from '../dist/security/urlGuard.js';
 import {
   validateZip,
   quickZipCheck,
   checkZipEntryName,
   ZIP_VALIDATION_LIMITS
-} from '../src/security/zipGuard.js';
+} from '../dist/security/zipGuard.js';
 import {
   validateXml,
   checkXmlContent,
   XML_VALIDATION_LIMITS
-} from '../src/security/xmlGuard.js';
+} from '../dist/security/xmlGuard.js';
 import {
   buildZipBomb,
   buildZipTraversal,
@@ -283,6 +286,33 @@ describe('URL Guard (SSRF protection)', () => {
 
     it('should accept URL with public IP', async () => {
       const result = await validateUrl(`http://${PUBLIC_IP}/file.docx`);
+      expect(result.isValid).toBe(true);
+    });
+
+    it('should reject hostname of an unresolvable domain (fail-safe)', async () => {
+      // Имя заведомо не резолвится: несуществующий домен в зоне .example
+      const result = await validateUrl('http://nonexistent-host-abcxyz-12345.example/x');
+
+      expect(result.isValid).toBe(false);
+      expect(result.code).toBe('url_private_ip');
+    });
+
+    it('should accept URL with resolvable public hostname', async () => {
+      // Единственная проверка, зависящая от внешнего DNS. Там, где сети нет,
+      // она пропускается: резолв вернул бы ошибку, и fail-safe заблокировал бы
+      // хост — это проверено тестом выше, а не здесь.
+      const dns = await import('node:dns/promises');
+      const resolvable = await dns
+        .lookup('example.com', { all: true })
+        .then((addresses) => addresses.length > 0)
+        .catch(() => false);
+
+      if (!resolvable) {
+        return;
+      }
+
+      const result = await validateUrl('http://example.com/file.docx');
+
       expect(result.isValid).toBe(true);
     });
   });

@@ -1,6 +1,6 @@
 # Конфигурация
 
-Все таймауты, лимиты и адреса собраны в одном модуле — **`src/config/index.js`**.
+Все таймауты, лимиты и адреса собраны в одном модуле — **`src/config/index.ts`**.
 Числа не хардкодятся в остальных модулях: каждая константа объявлена в config вместе
 с комментарием-обоснованием, и при изменении лимита обоснование обновляется там же.
 
@@ -11,31 +11,34 @@
 ## Как это устроено
 
 ```
-process.env → src/config/index.js (константы с дефолтами) → модули сервиса
+process.env → src/config/index.ts (константы с дефолтами) → модули сервиса
 ```
 
-Три места читают `process.env` напрямую, минуя config:
+Два места читают `process.env` напрямую, минуя config:
 
 | Файл | Переменные | Почему напрямую |
 |---|---|---|
-| `src/api/middleware/auditLog.js:28,36` | `AUDIT_LOG_PATH`, `AUDIT_LOG_LEVEL` | Логгер создаётся на уровне модуля, до импорта конфигурации |
-| `src/api/server.js:54,62,95` | `MAX_BODY_BYTES`, `NODE_ENV` | `NODE_ENV` управляет CORS/CSP, `MAX_BODY_BYTES` — лимитом body-parser Express |
-| `src/worker/fork-worker.js:75` | `LO_CONVERTER_VERBOSE` | Отладочный флаг самого WASM-конвертера (`verbose: true`) |
+| `src/nest/common/audit-log.ts` | `AUDIT_LOG_PATH`, `AUDIT_LOG_LEVEL` | Логгер создаётся на уровне модуля, до импорта конфигурации |
+| `src/worker/fork-worker.ts` | `LO_CONVERTER_VERBOSE` | Отладочный флаг самого WASM-конвертера (`verbose: true`) |
+
+Отдельно стоит NestJS-слой: `src/nest/config/env.ts` разбирает `NODE_ENV`, `PORT`,
+`API_PORT`, `HOST`, `LOG_LEVEL` и `RATE_*` через `ConfigService` — не при импорте модуля,
+а при создании приложения (это важно тестам, которые выставляют окружение в `beforeAll`).
 
 ## Таймауты
 
 | Переменная | По умолчанию | Где применяется | Обоснование |
 |---|---|---|---|
-| `REQUEST_BODY_TIMEOUT_MS` | `15000` | `api/middleware/timeouts.js` | Балансировщик (nginx) обычно имеет `proxy_read_timeout` 60 с. 15 с гарантируют, что сервис вернёт клиенту 408, а не оборванное соединение |
-| `FETCH_TIMEOUT_MS` | `30000` | `api/routes/convert.js:197` | Разумный лимит на загрузку файла из внутреннего storage; при превышении — 504 |
-| `VALIDATION_TIMEOUT_MS` | `10000` | `api/routes/convert.js:222` | Проверка метаданных архива не должна занимать больше 10 с даже для больших файлов; при превышении — 422 `validation_timeout` |
-| `SYNC_QUEUE_WAIT_MS` | `5000` | `worker/sandbox.js` | Если все слоты семафора заняты, клиент получает 503 с `Retry-After: 2` |
-| `JOB_TIMEOUT_MS` | `60000` | `worker/sandbox.js`, `worker/fork-pool.js` | Эмпирический лимит на конвертацию одного документа. При превышении fork-процесс убивается `SIGKILL`, задача получает статус `failed` |
-| `SYNC_TIMEOUT_MS` | `30000` | `api/routes/convert.js:229,266` | Общий бюджет синхронного запроса. **Обязан быть меньше таймаута балансировщика**, иначе клиент получит оборванное соединение вместо 504 |
+| `REQUEST_BODY_TIMEOUT_MS` | `15000` | не применяется | Балансировщик (nginx) обычно имеет `proxy_read_timeout` 60 с. 15 с гарантировали бы 408 вместо оборванного соединения — но таймаут тела жил в Express-middleware, который не работает (`body_timeout` в [api.md](api.md#ограничения)) |
+| `FETCH_TIMEOUT_MS` | `30000` | `nest/conversion/url-source.ts` | Разумный лимит на загрузку файла по ссылке; при превышении — `AbortController` и 500 `internal` |
+| `VALIDATION_TIMEOUT_MS` | `10000` | не применяется | Проверка метаданных архива не должна занимать больше 10 с даже для больших файлов. В NestJS-слое проверка идёт без таймаута — константа осталась от Express-версии |
+| `SYNC_QUEUE_WAIT_MS` | `5000` | `worker/sandbox.ts` | Если все слоты семафора заняты, клиент получает 503 с `Retry-After: 2` |
+| `JOB_TIMEOUT_MS` | `60000` | `worker/sandbox.ts`, `worker/fork-pool.ts` | Эмпирический лимит на конвертацию одного документа. При превышении fork-процесс убивается `SIGKILL`, задача получает статус `failed` |
+| `SYNC_TIMEOUT_MS` | `30000` | `nest/http/convert.controller.ts` | Общий бюджет синхронного запроса. **Обязан быть меньше таймаута балансировщика**, иначе клиент получит оборванное соединение вместо 504. Из него же выводится TTL статуса, который пишет API: `SYNC_TIMEOUT_MS / 1000` |
 | `STORE_WRITE_TIMEOUT_MS` | `5000` | не применяется | 5 с достаточно для записи файла на локальный volume. Константа `STORAGE_WRITE_TIMEOUT_MS` объявлена в config, но ни один модуль её не использует |
 
 > **Ловушка имени.** В `.env.example` переменная называется `STORAGE_WRITE_TIMEOUT_MS`,
-> а код читает `STORE_WRITE_TIMEOUT_MS` ([`src/config/index.js:58`](../src/config/index.js)).
+> а код читает `STORE_WRITE_TIMEOUT_MS` ([`src/config/index.ts`](../src/config/index.ts)).
 > Значение из `.env` не подхватится — при необходимости задавать таймаут используйте
 > имя `STORE_WRITE_TIMEOUT_MS`.
 
@@ -43,11 +46,11 @@ process.env → src/config/index.js (константы с дефолтами) �
 
 | Переменная | По умолчанию | Обоснование |
 |---|---|---|
-| `MAX_BODY_BYTES` | `104857600` (100 MiB) | Отраслевой стандарт для документ-конвертеров. Используется и как лимит body-parser в `api/server.js:54`, и как граница для base64-данных |
-| `MAX_FILE_BYTES` | `104857600` (100 MiB) | Совпадает с `MAX_BODY_BYTES` для консистентности; проверяется в `security/zipGuard` и при загрузке по URL |
-| `MIN_OUTPUT_BYTES` | `32` | Минимальный осмысленный PDF: заголовок `%PDF-…` плюс структура. Результат короче считается признаком сбоя конвертации |
+| `MAX_BODY_BYTES` | `104857600` (100 MiB) | Отраслевой стандарт для документ-конвертеров. Единственный лимит тела: `BODY_LIMIT_BYTES = MAX_BODY_BYTES` в `nest/common/http-defaults.ts` |
+| `MAX_FILE_BYTES` | `104857600` (100 MiB) | Совпадает с `MAX_BODY_BYTES` для консистентности; проверяется в `security/zipGuard.ts` и при загрузке по URL |
+| `MIN_OUTPUT_BYTES` | `32` | Минимальный осмысленный PDF: заголовок `%PDF-…` плюс структура. Константа осталась от Express-версии и сейчас не читается ни одним модулем |
 
-Размеры входных файлов дополнительно ограничены в `src/security/limits.js` — это отдельный
+Размеры входных файлов дополнительно ограничены в `src/security/limits.ts` — это отдельный
 набор лимитов для zip/xml/url, который не дублирует config, а дополняет его
 (см. [security.md](security.md)).
 
@@ -60,13 +63,13 @@ process.env → src/config/index.js (константы с дефолтами) �
 | `NODE_OPTIONS` | `--disable-wasm-trap-handler --max-old-space-size=1536` | Без `--disable-wasm-trap-handler` WASM не запустится при `ulimit -v` ниже ~10 ГБ; `--max-old-space-size=1536` — резерв под WASM + heap Node.js |
 
 Потолок памяти задаётся извне: контейнером (`mem_limit` в `docker-compose.yml`) и
-`fork-pool.js`, который передаёт каждому форку свой `--max-old-space-size`. Отдельных
+`fork-pool.ts`, который передаёт каждому форку свой `--max-old-space-size`. Отдельных
 констант на изолят (`ISOLATE_MEMORY_MB`) и на `worker_threads` (`WORKER_MEMORY_MB`)
 больше нет — оба механизма удалены вместе с переходом на fork-пул.
 
 `NODE_OPTIONS` читается самим Node.js при старте процесса, а не кодом сервиса,
-поэтому в контейнерах переменная задаётся в `Dockerfile:88` и в `docker-compose.yml`.
-Экспорт из `config/index.js` — справочный: ни один модуль его не импортирует.
+поэтому в контейнерах переменная задаётся в `Dockerfile` и в `docker-compose.yml`.
+Экспорт из `config/index.ts` — справочный: ни один модуль его не импортирует.
 
 ## Rate limiting
 
@@ -75,21 +78,22 @@ process.env → src/config/index.js (константы с дефолтами) �
 | `RATE_PER_SEC` | `5` | Запросов в секунду на один IP |
 | `RATE_BURST` | `20` | Допустимый кратковременный всплеск |
 
-Алгоритм — sliding window на IP; подробности в [security.md](security.md#rate-limiting).
+Алгоритм — ведро с токенами на IP; подробности в [security.md](security.md#rate-limiting).
 
 ## Хранилища и порты
 
 | Переменная | По умолчанию в коде | Обоснование |
 |---|---|---|
-| `API_PORT` | `3000` | Порт HTTP-сервера |
+| `API_PORT` | `3000` | Порт HTTP-сервера — историческое имя сервиса (`config/index.ts`) |
+| `PORT` | — | Порт HTTP-сервера; **приоритетнее** `API_PORT`. Значение `0` означает «любой свободный порт» — так поступают тесты |
+| `HOST` | `0.0.0.0` | Интерфейс, который слушает сервер |
 | `REDIS_HOST` | `localhost` | Хост Valkey/Redis. В Docker Compose — имя сервиса `valkey` |
 | `REDIS_PORT` | `6379` | Порт Valkey/Redis |
 | `STORAGE_PATH` | `/data/storage/results` | Каталог результатов конвертации |
 
-> **Ловушка имени.** `.env.example` и `docker-compose.yml` задают `PORT=3000`, но код
-> читает `API_PORT`. Переменная `PORT` не влияет ни на что — порт меняется только через `API_PORT`.
-> Аналогично `STORAGE_PATH=/data/storage` из `.env.example` перекрывает дефолт
-> `/data/storage/results` из кода, если переменная действительно задана в окружении.
+> **Ловушка значения.** `STORAGE_PATH=/data/storage` из `.env.example` и `docker-compose.yml`
+> перекрывает дефолт `/data/storage/results` из кода: в контейнере результаты лежат
+> в самом `/data/storage`, а не в подкаталоге `results`. Файлы хранятся плоско.
 
 ## Идемпотентность и очередь
 
@@ -120,8 +124,13 @@ process.env → src/config/index.js (константы с дефолтами) �
 | `SUPPORTED_CODE_PAGES` | `65001` (UTF-8), `1251`, `1252`, `866`, `20866` (KOI8-R), `28595` (ISO-8859-5) | Набор кодировок, поддерживаемых LibreOffice для CSV и текста |
 | `SUPPORTED_DELIMITERS` | `1` — запятая, `2` — точка с запятой, `3` — двоеточие, `4` — табуляция | Нумерация Р7-Офис |
 
-Те же значения продублированы как `ALLOWED_CODE_PAGES` и `ALLOWED_DELIMITERS` в
-`src/api/middleware/validate.js` — именно они применяются при валидации запроса.
+Те же значения продублированы в zod-схеме контракта (`packages/contract`) как
+`ALLOWED_CODE_PAGES` и `ALLOWED_DELIMITERS` — именно они применяются при валидации
+запроса. `SUPPORTED_*` из config читает `worker/optionsMapper.ts`, когда собирает
+опции для LibreOffice.
+
+Списки форматов (вход/выход) заданы только контрактом — сервер берёт их из
+`packages/contract`, а не из своей копии.
 
 ## Переменные, которые код не читает
 
@@ -130,9 +139,6 @@ process.env → src/config/index.js (константы с дефолтами) �
 
 | Переменная | Комментарий |
 |---|---|
-| `PORT` | Порт задаётся через `API_PORT` |
-| `HOST` | Сервер слушает все интерфейсы (`app.listen(API_PORT)` без хоста) |
-| `LOG_LEVEL` | Уровень задаётся через `AUDIT_LOG_LEVEL` |
 | `REDIS_DB`, `REDIS_PASSWORD`, `REDIS_CONNECTION_STRING` | Подключение строится только из `REDIS_HOST` и `REDIS_PORT`; БД и пароль не передаются |
 | `WASM_PATH` | Путь к WASM-библиотеке не настраивается — пакет `@matbee/libreoffice-converter` резолвится из `node_modules` |
 | `BULLMQ_MAX_STALLED_COUNT` | Счётчик попыток для зависших задач не задаётся |

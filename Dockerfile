@@ -50,9 +50,23 @@ COPY web/package.json ./web/
 # Ставим зависимости только серверной части (включая devDependencies для
 # сборки). Фильтр отсекает React и Vite из web — в образе api/worker они
 # не нужны и заметно увеличивают размер.
-RUN npx pnpm ci --filter doc-converter
+#
+# Многоточие в фильтре добавляет зависимости пакета: контракт
+# (@doc-converter/contract) — участник workspace, который сервер импортирует
+# в рантайме, поэтому в образе должны быть и его исходники, и его инструменты
+# сборки.
+RUN npx pnpm ci --filter doc-converter...
 
 COPY . .
+
+# Сборка: контракт — первым, сервер — вторым.
+#
+# `.dockerignore` исключает `dist`, поэтому в образе нет ни собранного
+# контракта, ни собранного сервера: без этих шагов контейнер соберётся,
+# но упадёт на старте (сервер импортирует @doc-converter/contract, а точка
+# входа — dist/nest/main.js). Порядок тот же, что в web/Dockerfile.
+RUN npx pnpm --filter @doc-converter/contract build
+RUN npm run build:server
 
 # =============================================================================
 # Финальный образ
@@ -114,8 +128,8 @@ EXPOSE 3000
 
 # Здоровье
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD node /app/src/api/health-check.js || exit 1
+    CMD node /app/dist/nest/health/health-check.js || exit 1
 
 # Команда запуска
 # В production запускаем API и worker через node (concurrently не нужен в Docker)
-CMD ["node", "/app/src/api/server.js"]
+CMD ["node", "/app/dist/nest/main.js"]

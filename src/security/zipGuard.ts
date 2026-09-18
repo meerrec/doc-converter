@@ -26,7 +26,7 @@ import {
  * Запрещённые расширения файлов в архиве.
  * Эти файлы не должны встречаться в OOXML/ODF документах и могут быть зловредными.
  */
-const FORBIDDEN_EXTENSIONS = new Set([
+const FORBIDDEN_EXTENSIONS = new Set<string>([
   '.exe', '.dll', '.so', '.dylib',
   '.bat', '.cmd', '.ps1', '.sh',
   '.js', '.vbs', '.wsf', '.jar',
@@ -56,7 +56,11 @@ const ABSOLUTE_PATH_REGEX = /^\//;
  * Ошибки, которые может выбрасывать zipGuard.
  */
 export class ZipGuardError extends Error {
-  constructor(message, code) {
+  // `declare` не создаёт собственное свойство: `code` присваивается в
+  // конструкторе, поэтому порядок ключей остаётся прежним (name, code)
+  declare code: string;
+
+  constructor(message: string, code: string) {
     super(message);
     this.name = 'ZipGuardError';
     this.code = code;
@@ -64,9 +68,60 @@ export class ZipGuardError extends Error {
 }
 
 /**
+ * Описание записи ZIP-архива, попавшей в результат проверки.
+ */
+interface ZipEntryInfo {
+  fileName: string;
+  uncompressedLength: number;
+  compressedLength: number;
+}
+
+/**
+ * Нарушение, найденное в ZIP-архиве.
+ */
+interface ZipViolation {
+  code: string;
+  message: string;
+  entryName: string | null;
+}
+
+/**
+ * Опции проверки ZIP-архива.
+ *
+ * Поддерживаются оба набора имён: короткие (maxEntrySize/maxTotalSize)
+ * и совпадающие с ZIP_VALIDATION_LIMITS (maxEntryUncompressedBytes/maxTotalUncompressedBytes).
+ */
+interface ZipValidationOptions {
+  /** Максимальное количество записей (по умолчанию ZIP_MAX_ENTRIES). */
+  maxEntries?: number;
+  /** Короткое имя для лимита размера одной записи. */
+  maxEntrySize?: number;
+  /** Короткое имя для лимита общего размера. */
+  maxTotalSize?: number;
+  /** Максимальный коэффициент сжатия (по умолчанию ZIP_MAX_COMPRESSION_RATIO). */
+  maxCompressionRatio?: number;
+  /** Максимальная глубина пути (по умолчанию ZIP_MAX_PATH_DEPTH). */
+  maxPathDepth?: number;
+  /** max размер одной записи (по умолчанию ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES). */
+  maxEntryUncompressedBytes?: number;
+  /** max общий размер (по умолчанию ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES). */
+  maxTotalUncompressedBytes?: number;
+}
+
+/**
  * Результаты проверки ZIP-архива.
  */
 export class ZipGuardResult {
+  entries: ZipEntryInfo[];
+
+  totalUncompressedBytes: number;
+
+  entryCount: number;
+
+  maxCompressionRatio: number;
+
+  violations: ZipViolation[];
+
   constructor() {
     this.entries = [];
     this.totalUncompressedBytes = 0;
@@ -74,16 +129,16 @@ export class ZipGuardResult {
     this.maxCompressionRatio = 0;
     this.violations = [];
   }
-  
-  addViolation(code, message, entryName = null) {
+
+  addViolation(code: string, message: string, entryName: string | null = null): void {
     this.violations.push({ code, message, entryName });
   }
-  
-  get isValid() {
+
+  get isValid(): boolean {
     return this.violations.length === 0;
   }
-  
-  get firstViolation() {
+
+  get firstViolation(): ZipViolation | null {
     return this.violations[0] || null;
   }
 }
@@ -102,11 +157,11 @@ export const ZIP_VALIDATION_LIMITS = {
 /**
  * Проверяет имя файла в ZIP-архиве на безопасность.
  *
- * @param {string} fileName - имя файла из архива
- * @param {number} [maxPathDepth=ZIP_MAX_PATH_DEPTH] - максимальная глубина пути
- * @returns {string|null} - код ошибки или null если безопасно
+ * @param fileName - имя файла из архива
+ * @param maxPathDepth - максимальная глубина пути (по умолчанию ZIP_MAX_PATH_DEPTH)
+ * @returns - код ошибки или null если безопасно
  */
-function validateEntryName(fileName, maxPathDepth = ZIP_MAX_PATH_DEPTH) {
+function validateEntryName(fileName: string, maxPathDepth: number = ZIP_MAX_PATH_DEPTH): string | null {
   // Проверка на пустое имя
   if (!fileName || fileName.length === 0) {
     return 'archive_empty_entry_name';
@@ -152,27 +207,27 @@ function validateEntryName(fileName, maxPathDepth = ZIP_MAX_PATH_DEPTH) {
 /**
  * Проверяет имя записи ZIP-архива на безопасность (boolean-версия).
  *
- * @param {string} fileName - имя файла из архива
- * @returns {boolean} - true, если имя безопасно
+ * @param fileName - имя файла из архива
+ * @returns - true, если имя безопасно
  */
-export function checkZipEntryName(fileName) {
+export function checkZipEntryName(fileName: string): boolean {
   return validateEntryName(fileName) === null;
 }
 
 /**
  * Проверяет ZIP-архив на безопасность.
  *
- * @param {Buffer} buffer - буфер с данными ZIP-архива
- * @param {Object} [options] - опции проверки
- * @param {number} [options.maxEntries=ZIP_MAX_ENTRIES] - максимальное количество записей
- * @param {number} [options.maxEntryUncompressedBytes=ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES] - max размер одной записи
- * @param {number} [options.maxTotalUncompressedBytes=ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES] - max общий размер
- * @param {number} [options.maxCompressionRatio=ZIP_MAX_COMPRESSION_RATIO] - max коэффициент сжатия
- * @param {number} [options.maxPathDepth=ZIP_MAX_PATH_DEPTH] - max глубина пути
- * @returns {Promise<ZipGuardResult>} - результат проверки
+ * @param buffer - буфер с данными ZIP-архива
+ * @param options - опции проверки
+ * @param options.maxEntries - максимальное количество записей (по умолчанию ZIP_MAX_ENTRIES)
+ * @param options.maxEntryUncompressedBytes - max размер одной записи (по умолчанию ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES)
+ * @param options.maxTotalUncompressedBytes - max общий размер (по умолчанию ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES)
+ * @param options.maxCompressionRatio - max коэффициент сжатия (по умолчанию ZIP_MAX_COMPRESSION_RATIO)
+ * @param options.maxPathDepth - max глубина пути (по умолчанию ZIP_MAX_PATH_DEPTH)
+ * @returns - результат проверки
  * @throws {ZipGuardError} - если архив не может быть прочитан
  */
-export async function validateZip(buffer, options = {}) {
+export async function validateZip(buffer: Buffer, options: ZipValidationOptions = {}): Promise<ZipGuardResult> {
   const {
     maxEntries = ZIP_MAX_ENTRIES,
     maxEntrySize = ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES,
@@ -188,21 +243,21 @@ export async function validateZip(buffer, options = {}) {
 
   const result = new ZipGuardResult();
 
-  return new Promise((resolve, reject) => {
+  return new Promise<ZipGuardResult>((resolve, reject) => {
     let totalUncompressedBytes = 0;
     let entryCount = 0;
     let hasEntries = false;
-    const seenNames = new Set();
+    const seenNames = new Set<string>();
     let settled = false;
 
     /**
      * Завершает проверку и резолвит результат.
      *
-     * @param {Object} [opts] - опции
-     * @param {boolean} [opts.skipEmptyCheck=false] - не считать архив пустым
+     * @param opts - опции
+     * @param opts.skipEmptyCheck - не считать архив пустым
      *   (используется, когда чтение прервано на небезопасном имени)
      */
-    const finish = (opts = {}) => {
+    const finish = (opts: { skipEmptyCheck?: boolean } = {}): void => {
       if (settled) return;
       settled = true;
 
@@ -228,10 +283,10 @@ export async function validateZip(buffer, options = {}) {
     /**
      * Завершает проверку ошибкой.
      *
-     * @param {string} message - сообщение
-     * @param {string} code - код ошибки
+     * @param message - сообщение
+     * @param code - код ошибки
      */
-    const fail = (message, code) => {
+    const fail = (message: string, code: string): void => {
       if (settled) return;
       settled = true;
       reject(new ZipGuardError(message, code));
@@ -254,7 +309,7 @@ export async function validateZip(buffer, options = {}) {
          * readEntry(), поэтому его нужно вызывать после каждой обработанной
          * записи — иначе поток чтения останавливается и 'end' не наступает.
          */
-        const continueReading = () => {
+        const continueReading = (): void => {
           if (settled) return;
 
           // Лимит записей превышен — дальше читать нет смысла
@@ -271,7 +326,7 @@ export async function validateZip(buffer, options = {}) {
           zipFile.readEntry();
         };
 
-        zipFile.on('entry', (entry) => {
+        zipFile.on('entry', (entry: yauzl.Entry) => {
           hasEntries = true;
           entryCount++;
           totalUncompressedBytes += entry.uncompressedSize;
@@ -337,7 +392,7 @@ export async function validateZip(buffer, options = {}) {
 
         zipFile.on('end', finish);
 
-        zipFile.on('error', (readErr) => {
+        zipFile.on('error', (readErr: Error) => {
           const readMessage = readErr.message || '';
 
           // yauzl сам отвергает небезопасные имена (zip-slip, абсолютные пути).
@@ -354,7 +409,7 @@ export async function validateZip(buffer, options = {}) {
         zipFile.readEntry();
       });
     } catch (err) {
-      fail(`Исключение при проверке ZIP: ${err.message}`, 'archive_corrupt');
+      fail(`Исключение при проверке ZIP: ${(err as Error).message}`, 'archive_corrupt');
     }
   });
 }
@@ -363,10 +418,10 @@ export async function validateZip(buffer, options = {}) {
  * Быстрая проверка ZIP-архива (синхронная версия для небольших файлов).
  * Используется для быстрого отклонения явно опасных архивов.
  *
- * @param {Buffer} buffer - буфер с данными ZIP-архива
- * @returns {boolean} - true если архив выглядит безопасным
+ * @param buffer - буфер с данными ZIP-архива
+ * @returns - true если архив выглядит безопасным
  */
-export function quickZipCheck(buffer) {
+export function quickZipCheck(buffer: Buffer): boolean {
   // Проверяем минимальный размер ZIP-архива
   if (buffer.length < 22) {
     return false; // Слишком маленький для валидного ZIP
@@ -376,7 +431,7 @@ export function quickZipCheck(buffer) {
   const signature = buffer.slice(0, 4);
   const pk34 = Buffer.from('PK\x03\x04', 'binary');
   const pk56 = Buffer.from('PK\x05\x06', 'binary');
-  
+
   if (signature.compare(pk34) !== 0 && signature.compare(pk56) !== 0) {
     return false; // Не ZIP-архив
   }
