@@ -10,6 +10,37 @@
 const CHUNK_SIZE = 32 * 1024;
 
 /**
+ * Бюджет непрерывной работы между уступками главному потоку (мс).
+ *
+ * Обоснование: 50 мс — граница, после которой задача считается длинной и
+ * портит отзывчивость (INP). Уступаем управление, как только бюджет выбран.
+ */
+const YIELD_BUDGET_MS = 50;
+
+/**
+ * Уступает управление главному потоку.
+ *
+ * scheduler.yield() возвращает управление, сохраняя приоритет продолжения
+ * этой работы, — в отличие от setTimeout, который вдобавок получает
+ * минимальную задержку в 4 мс после нескольких вложенных вызовов.
+ * Safari API пока не поддерживает, поэтому для него остаётся setTimeout.
+ */
+async function yieldToMainThread(): Promise<void> {
+  // lib.dom описывает scheduler.yield() не во всех версиях TypeScript,
+  // поэтому наличие метода проверяется вручную
+  const scheduler = (
+    globalThis as { scheduler?: { yield?: () => Promise<void> } }
+  ).scheduler;
+
+  if (typeof scheduler?.yield === 'function') {
+    await scheduler.yield();
+    return;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
  * Кодирует файл в base64.
  *
  * @param file - выбранный файл
@@ -26,6 +57,7 @@ export async function fileToBase64(file: File, signal?: AbortSignal): Promise<st
 
   const bytes = new Uint8Array(buffer);
   const parts: string[] = [];
+  let deadline = performance.now() + YIELD_BUDGET_MS;
 
   for (let offset = 0; offset < bytes.length; offset += CHUNK_SIZE) {
     if (signal?.aborted) {
@@ -38,8 +70,13 @@ export async function fileToBase64(file: File, signal?: AbortSignal): Promise<st
     // аргументы по одному, поэтому порция ограничена по размеру
     parts.push(String.fromCharCode(...chunk));
 
-    // Отдаём управление главному потоку, чтобы интерфейс не подвисал
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Уступаем управление, только когда исчерпан бюджет времени: уступка
+    // на каждой порции означала бы сотни пробуждений на файл, каждое с
+    // минимальной задержкой таймера, — это секунды простоя на 30 МиБ
+    if (performance.now() >= deadline) {
+      await yieldToMainThread();
+      deadline = performance.now() + YIELD_BUDGET_MS;
+    }
   }
 
   return btoa(parts.join(''));

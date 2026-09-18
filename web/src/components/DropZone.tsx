@@ -6,7 +6,7 @@
  * дополнительный способ.
  */
 
-import { useCallback, useId, useRef, useState } from 'react';
+import { memo, useCallback, useId, useRef, useState } from 'react';
 import { INPUT_FORMATS, MAX_UPLOAD_BYTES } from '../config';
 
 interface DropZoneProps {
@@ -19,7 +19,10 @@ interface DropZoneProps {
 /** Список расширений для атрибута accept. */
 const ACCEPT = INPUT_FORMATS.map((format) => `.${format}`).join(',');
 
-export function DropZone({ onFiles, disabled = false }: DropZoneProps) {
+export const DropZone = memo(function DropZone({
+  onFiles,
+  disabled = false,
+}: DropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const inputId = useId();
@@ -117,4 +120,4 @@ export function DropZone({ onFiles, disabled = false }: DropZoneProps) {
       </p>
     </div>
   );
-}
+});

@@ -11,7 +11,7 @@ import { fetchStatuses, submitConversion } from '../api/conversion';
 import { ApiError, buildDownloadUrl } from '../api/client';
 import { describeError } from '../api/errors';
 import { fileToBase64 } from '../lib/base64';
-import { createLimiter } from '../lib/limiter';
+import { createLimiter, type Limiter } from '../lib/limiter';
 import { detectInputFormat, stripExtension } from '../lib/format';
 import {
   BATCH_CONCURRENCY,
@@ -164,13 +164,54 @@ export function useConversionQueue({
   const settingsRef = useRef({ outputType, options });
   settingsRef.current = { outputType, options };
 
-  const limiterRef = useRef(createLimiter(BATCH_CONCURRENCY, BATCH_MIN_INTERVAL_MS));
+  // Зеркало списка задач для чтения внутри колбэков и таймера опроса.
+  //
+  // Читать состояние напрямую нельзя: колбэк, зависящий от items, получает
+  // новую идентичность на каждом обновлении прогресса. Для memo(TaskRow) это
+  // критично — нестабильные пропсы обнуляют сравнение и перерисовывают все
+  // строки таблицы на каждом тике опроса (см. TaskTable).
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+
+  // Ограничитель живёт в ссылке, потому что cancelAll заменяет его новым:
+  // значение нужно читать в момент вызова, а не в момент создания
+  const limiterRef = useRef<Limiter | null>(null);
+
+  // Таймеры отложенных скачиваний: их нужно снимать при размонтировании и
+  // при повторном запуске, иначе клики по скрытым ссылкам продолжат
+  // срабатывать после ухода со страницы
+  const downloadTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+
+  /**
+   * Возвращает текущий ограничитель, создавая его при первом обращении.
+   *
+   * Создание ленивое намеренно: аргумент useRef вычисляется на каждом
+   * рендере, поэтому ограничитель — объект с очередью, множеством
+   * контроллеров и замыканиями — создавался и сразу уходил в мусор на
+   * каждом обновлении прогресса.
+   *
+   * @returns ограничитель, актуальный на момент вызова
+   */
+  const getLimiter = useCallback((): Limiter => {
+    let limiter = limiterRef.current;
+
+    if (limiter === null) {
+      limiter = createLimiter(BATCH_CONCURRENCY, BATCH_MIN_INTERVAL_MS);
+      limiterRef.current = limiter;
+    }
+
+    return limiter;
+  }, []);
 
   useEffect(() => {
-    const limiter = limiterRef.current;
-
+    // Ссылки читаются в момент размонтирования: cancelAll мог заменить
+    // ограничитель, а список отложенных скачиваний — измениться
     return () => {
-      limiter.clear();
+      limiterRef.current?.clear();
+
+      for (const timer of downloadTimersRef.current) {
+        clearTimeout(timer);
+      }
     };
   }, []);
 
@@ -225,7 +266,7 @@ export function useConversionQueue({
 
       // Сервер ограничил частоту — приостанавливаем остальные отправки
       if (error instanceof ApiError && error.status === 429 && error.retryAfterSec) {
-        limiterRef.current.pause(error.retryAfterSec * 1000);
+        getLimiter().pause(error.retryAfterSec * 1000);
       }
 
       dispatch({
@@ -234,7 +275,7 @@ export function useConversionQueue({
         patch: { status: 'failed', errorText: describeError(error) },
       });
     }
-  }, []);
+  }, [getLimiter]);
 
   /**
    * Добавляет файлы в очередь, отсеивая неподдерживаемые и слишком крупные.
@@ -286,7 +327,7 @@ export function useConversionQueue({
   const startAll = useCallback(() => {
     const { outputType: currentOutput, options: currentOptions } = settingsRef.current;
 
-    for (const item of items) {
+    for (const item of itemsRef.current) {
       if (item.status !== 'pending') {
         continue;
       }
@@ -298,21 +339,23 @@ export function useConversionQueue({
         downloadName: `${stripExtension(item.file.name)}.${currentOutput}`,
       };
 
-      void limiterRef.current.run((signal) => sendItem(prepared, signal));
+      void getLimiter().run((signal) => sendItem(prepared, signal));
     }
-  }, [items, sendItem]);
+  }, [sendItem, getLimiter]);
 
   /** Отменяет отправку: прерывает запросы и помечает задачи отменёнными. */
   const cancelAll = useCallback(() => {
-    limiterRef.current.clear();
+    getLimiter().clear();
+    // Ограничитель одноразовый: после clear() он навсегда помечен очищенным
+    // и отвергает новые задачи, поэтому заменяется свежим
     limiterRef.current = createLimiter(BATCH_CONCURRENCY, BATCH_MIN_INTERVAL_MS);
 
-    for (const item of items) {
+    for (const item of itemsRef.current) {
       if (isActiveStatus(item.status)) {
         dispatch({ type: 'patch', id: item.id, patch: { status: 'cancelled' } });
       }
     }
-  }, [items]);
+  }, [getLimiter]);
 
   /**
    * Повторяет задачу с новым идентификатором.
@@ -322,7 +365,7 @@ export function useConversionQueue({
    */
   const retryItem = useCallback(
     (id: string) => {
-      const item = items.find((entry) => entry.id === id);
+      const item = itemsRef.current.find((entry) => entry.id === id);
 
       if (!item) {
         return;
@@ -349,15 +392,15 @@ export function useConversionQueue({
         },
       });
 
-      void limiterRef.current.run((signal) => sendItem(restarted, signal));
+      void getLimiter().run((signal) => sendItem(restarted, signal));
     },
-    [items, sendItem]
+    [sendItem, getLimiter]
   );
 
   /** Скачивает готовый результат. */
   const downloadItem = useCallback(
     (id: string) => {
-      const item = items.find((entry) => entry.id === id);
+      const item = itemsRef.current.find((entry) => entry.id === id);
 
       if (!item?.result) {
         return;
@@ -370,34 +413,41 @@ export function useConversionQueue({
       link.click();
       link.remove();
     },
-    [items]
+    []
   );
 
   /** Скачивает все готовые результаты по очереди. */
   const downloadAll = useCallback(() => {
-    const ready = items.filter((item) => item.status === 'completed' && item.result);
+    // Повторное нажатие начинает batch заново, а не добавляет второй поверх
+    for (const timer of downloadTimersRef.current) {
+      clearTimeout(timer);
+    }
 
-    ready.forEach((item, index) => {
+    const ready = itemsRef.current.filter(
+      (item) => item.status === 'completed' && item.result
+    );
+
+    downloadTimersRef.current = ready.map((item, index) =>
       // Небольшая задержка между загрузками: браузеры ограничивают
       // количество одновременных скачиваний
-      setTimeout(() => downloadItem(item.id), index * 300);
-    });
-  }, [items, downloadItem]);
-
-  // Зеркало состояния для чтения внутри таймера опроса: сам таймер
-  // не должен перезапускаться на каждом обновлении прогресса
-  const itemsRef = useRef(items);
-  itemsRef.current = items;
-
-  // Идентификаторы задач, по которым нужно опрашивать статус
-  const polledIds = useMemo(
-    () => items.filter((item) => isActiveStatus(item.status)).map((item) => item.taskId),
-    [items]
-  );
+      setTimeout(() => downloadItem(item.id), index * 300)
+    );
+  }, [downloadItem]);
 
   // Строковый ключ: эффект опроса перезапускается только при изменении
-  // состава задач, а не на каждом обновлении прогресса
-  const polledKey = polledIds.join(',');
+  // состава задач, а не на каждом обновлении прогресса.
+  //
+  // Мемоизируется именно строка, а не промежуточный массив идентификаторов:
+  // массив — тоже новое значение на каждом обновлении, и memo по нему
+  // бесполезен, а join всё равно выполнялся бы на каждом рендере
+  const polledKey = useMemo(
+    () =>
+      items
+        .filter((item) => isActiveStatus(item.status))
+        .map((item) => item.taskId)
+        .join(','),
+    [items]
+  );
 
   useEffect(() => {
     if (polledKey === '') {
@@ -408,14 +458,18 @@ export function useConversionQueue({
     let timer: ReturnType<typeof setTimeout> | undefined;
     let interval = POLL_INTERVAL_MS;
     let stopped = false;
-    const deadline = Date.now() + POLL_DEADLINE_MS;
+    let deadline = Date.now() + POLL_DEADLINE_MS;
 
     /**
      * Применяет ответ сервера к очереди.
      */
     const applyStatuses = (statuses: TaskStatusResponse[]) => {
+      // Индекс строится один раз на пачку: поиск через find внутри цикла
+      // давал O(n·m) на каждом тике опроса
+      const byTaskId = new Map(itemsRef.current.map((entry) => [entry.taskId, entry]));
+
       for (const status of statuses) {
-        const item = itemsRef.current.find((entry) => entry.taskId === status.taskId);
+        const item = byTaskId.get(status.taskId);
 
         if (!item) {
           continue;
@@ -479,6 +533,18 @@ export function useConversionQueue({
         .map((item) => item.taskId);
 
       if (activeIds.length === 0) {
+        // Опрашивать пока нечего: все задачи ещё в pending. Цепочку таймеров
+        // обрывать нельзя — статусы сменятся на encoding/uploading/queued,
+        // но набор идентификаторов в polledKey останется прежним (все эти
+        // статусы активны), эффект не перезапустится, и опрос не заведётся
+        // уже никогда. Поэтому ждём и проверяем снова
+        //
+        // Дедлайн отодвигается: он отмеряет время ожидания ответов сервера,
+        // а не время лежания файлов в очереди. Без этого задачи, добавленные
+        // и запущенные спустя POLL_DEADLINE_MS, падали бы с «превышено время
+        // ожидания» на первом же тике
+        deadline = Date.now() + POLL_DEADLINE_MS;
+        timer = setTimeout(() => void tick(), interval);
         return;
       }
 
@@ -504,10 +570,12 @@ export function useConversionQueue({
       }
 
       if (Date.now() > deadline) {
-        for (const id of activeIds) {
-          const item = itemsRef.current.find((entry) => entry.taskId === id);
+        // Обходим список задач один раз, а не ищем каждую по идентификатору
+        const active = new Set(activeIds);
 
-          if (item && isActiveStatus(item.status)) {
+        for (const item of itemsRef.current) {
+          // Статус проверяется заново: за время запроса задача могла завершиться
+          if (active.has(item.taskId) && isActiveStatus(item.status)) {
             dispatch({
               type: 'patch',
               id: item.id,

@@ -118,18 +118,32 @@ export async function fetchStatuses(
     return [];
   }
 
-  const results: TaskStatusResponse[] = [];
+  const chunks: string[][] = [];
 
   for (let offset = 0; offset < taskIds.length; offset += STATUS_BATCH_SIZE) {
-    const chunk = taskIds.slice(offset, offset + STATUS_BATCH_SIZE);
-    const query = chunk.map((id) => `taskIds=${encodeURIComponent(id)}`).join('&');
-
-    const response = await request<BatchStatusResponse>(`/status?${query}`, { signal });
-
-    results.push(...response.tasks);
+    chunks.push(taskIds.slice(offset, offset + STATUS_BATCH_SIZE));
   }
 
-  return results;
+  // Пачки независимы, поэтому уходят параллельно: последовательный обход
+  // давал водопад — вторая пачка стартовала только после ответа на первую.
+  //
+  // Всплеск при этом ограничен. Лимит сервера — 20 запросов в секунду на IP,
+  // из них отправка файлов занимает до 10: две одновременные загрузки с
+  // паузой 400 мс, и каждая списывает по две единицы из-за двойного
+  // middleware на маршруте конвертации. Опрос статусов тратит один запрос
+  // на каждые STATUS_BATCH_SIZE задач за тик, так что в бюджет он начинает
+  // упираться лишь при сотнях одновременно активных задач
+  const responses = await Promise.all(
+    chunks.map((chunk) => {
+      const query = chunk.map((id) => `taskIds=${encodeURIComponent(id)}`).join('&');
+
+      return request<BatchStatusResponse>(`/status?${query}`, { signal });
+    })
+  );
+
+  // Promise.all сохраняет порядок ответов, но он и не важен: вызывающая
+  // сторона сопоставляет статусы по taskId, а не по позиции в массиве
+  return responses.flatMap((response) => response.tasks);
 }
 
 /**

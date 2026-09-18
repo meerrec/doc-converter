@@ -14,28 +14,16 @@ interface TaskTableProps {
 }
 
 export function TaskTable({ queue, busy }: TaskTableProps) {
-  const { items, stats } = queue;
+  const { items, stats, downloadItem, retryItem, removeItem } = queue;
 
-  const handleDownload = useCallback(
-    (id: string) => {
-      queue.downloadItem(id);
-    },
-    [queue]
-  );
+  // Зависимости — отдельные функции, а не объект queue: сам объект
+  // создаётся заново на каждом рендере, и колбэки на его основе теряли бы
+  // идентичность, обнуляя memo у строк таблицы
+  const handleDownload = useCallback((id: string) => downloadItem(id), [downloadItem]);
 
-  const handleRetry = useCallback(
-    (id: string) => {
-      queue.retryItem(id);
-    },
-    [queue]
-  );
+  const handleRetry = useCallback((id: string) => retryItem(id), [retryItem]);
 
-  const handleRemove = useCallback(
-    (id: string) => {
-      queue.removeItem(id);
-    },
-    [queue]
-  );
+  const handleRemove = useCallback((id: string) => removeItem(id), [removeItem]);
 
   if (items.length === 0) {
     return null;

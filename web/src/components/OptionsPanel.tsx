@@ -4,17 +4,19 @@
  * Поля показываются по контексту: кодировка имеет смысл для текстовых
  * форматов, разделитель — для CSV, параметры листа — для таблиц. Так
  * пользователь не отправляет заведомо неприменимые опции.
+ *
+ * Видимость полей вычисляет родитель и передаёт готовыми флагами: список
+ * форматов — производное от очереди значение, а очередь обновляется на
+ * каждом тике опроса. Булевы пропсы позволяют memo пропускать эти
+ * обновления, список же был бы новым массивом каждый раз.
  */
 
-import { useId } from 'react';
+import { memo, useId } from 'react';
 import {
   CODE_PAGES,
-  CSV_FORMAT,
   DELIMITERS,
   OUTPUT_FORMATS,
   OUTPUT_FORMAT_LABELS,
-  SPREADSHEET_INPUT_FORMATS,
-  TEXT_INPUT_FORMATS,
 } from '../config';
 import type { ConversionOptions } from '../api/types';
 
@@ -23,17 +25,23 @@ interface OptionsPanelProps {
   onOutputTypeChange: (value: string) => void;
   options: ConversionOptions;
   onOptionsChange: (patch: Partial<ConversionOptions>) => void;
-  /** Форматы добавленных файлов — определяют видимость полей. */
-  inputFormats: string[];
+  /** Показывать выбор кодировки: среди файлов есть текстовые. */
+  showCodePage: boolean;
+  /** Показывать выбор разделителя: среди файлов есть CSV. */
+  showDelimiter: boolean;
+  /** Показывать параметры листа: среди файлов есть таблицы. */
+  showSpreadsheet: boolean;
   disabled?: boolean;
 }
 
-export function OptionsPanel({
+export const OptionsPanel = memo(function OptionsPanel({
   outputType,
   onOutputTypeChange,
   options,
   onOptionsChange,
-  inputFormats,
+  showCodePage,
+  showDelimiter,
+  showSpreadsheet,
   disabled = false,
 }: OptionsPanelProps) {
   const outputId = useId();
@@ -44,12 +52,6 @@ export function OptionsPanel({
   const orientationId = useId();
   const fitToWidthId = useId();
   const placeholdersId = useId();
-
-  const showCodePage = inputFormats.some((format) => TEXT_INPUT_FORMATS.has(format));
-  const showDelimiter = inputFormats.includes(CSV_FORMAT);
-  const showSpreadsheet = inputFormats.some((format) =>
-    SPREADSHEET_INPUT_FORMATS.has(format)
-  );
 
   return (
     <form className="options" onSubmit={(event) => event.preventDefault()}>
@@ -229,4 +231,4 @@ export function OptionsPanel({
       </fieldset>
     </form>
   );
-}
+});

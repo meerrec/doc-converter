@@ -13,6 +13,11 @@ import { TaskTable } from './components/TaskTable';
 import { useConversionQueue } from './hooks/useConversionQueue';
 import { request } from './api/client';
 import { detectInputFormat } from './lib/format';
+import {
+  CSV_FORMAT,
+  SPREADSHEET_INPUT_FORMATS,
+  TEXT_INPUT_FORMATS,
+} from './config';
 import type { ConversionOptions, HealthResponse } from './api/types';
 
 /** Состояние доступности сервиса. */
@@ -61,19 +66,29 @@ export function App() {
     setOptions((current) => ({ ...current, ...patch }));
   }, []);
 
-  // Форматы добавленных файлов определяют, какие поля опций показывать
-  const inputFormats = useMemo(() => {
-    const formats = new Set<string>();
+  // Форматы добавленных файлов определяют, какие поля опций показывать.
+  //
+  // Наружу отдаём булевы флаги, а не список форматов: список — это новый
+  // массив на каждом обновлении прогресса, и он обнулял бы memo у панели
+  // опций, заставляя её перерисовываться на каждом тике опроса
+  const optionFields = useMemo(() => {
+    let showCodePage = false;
+    let showDelimiter = false;
+    let showSpreadsheet = false;
 
     for (const item of queue.items) {
       const format = detectInputFormat(item.file.name);
 
-      if (format) {
-        formats.add(format);
+      if (!format) {
+        continue;
       }
+
+      showCodePage ||= TEXT_INPUT_FORMATS.has(format);
+      showDelimiter ||= format === CSV_FORMAT;
+      showSpreadsheet ||= SPREADSHEET_INPUT_FORMATS.has(format);
     }
 
-    return [...formats];
+    return { showCodePage, showDelimiter, showSpreadsheet };
   }, [queue.items]);
 
   const isBusy = stats.pending > 0 || stats.active > 0;
@@ -111,7 +126,9 @@ export function App() {
             onOutputTypeChange={handleOutputTypeChange}
             options={options}
             onOptionsChange={handleOptionsChange}
-            inputFormats={inputFormats}
+            showCodePage={optionFields.showCodePage}
+            showDelimiter={optionFields.showDelimiter}
+            showSpreadsheet={optionFields.showSpreadsheet}
             disabled={isBusy}
           />
 
