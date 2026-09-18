@@ -88,8 +88,8 @@ export class RateLimitGuard implements CanActivate, OnModuleDestroy {
     this.refillPerMs = (config.get<number>('RATE_PER_SEC') ?? 5) / 1000;
 
     // unref: таймер не должен удерживать процесс живым. Прежняя реализация
-    // вешала обычный setInterval и не снимала его, из-за чего тесты
-    // завершались только через --forceExit
+    // вешала обычный setInterval и не снимала его, из-за чего тестовый прогон
+    // не завершался сам и процесс приходилось убивать
     this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
     this.cleanupTimer.unref();
   }

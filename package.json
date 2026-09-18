@@ -11,8 +11,8 @@
     "dev:api": "NODE_ENV=development node dist/nest/main.js",
     "dev:worker": "NODE_ENV=development node dist/worker/index.js",
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:worker\"",
-    "pretest": "npm run build:server",
-    "test": "NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules jest --forceExit",
+    "test": "NODE_ENV=test LOG_LEVEL=silent AUDIT_LOG_LEVEL=error vitest run",
+    "test:watch": "NODE_ENV=test LOG_LEVEL=silent AUDIT_LOG_LEVEL=error vitest",
     "test:e2e": "E2E=1 npm run test",
     "lint": "echo 'Linter not configured yet'",
     "health": "curl -s http://localhost:3000/health | jq",
@@ -49,13 +49,15 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@swc/core": "^1.16.2",
     "@types/express": "^4.17.25",
     "@types/node": "^26.6.1",
     "@types/yauzl": "^2.10.3",
     "concurrently": "^8.2.2",
-    "jest": "^29.7.0",
     "supertest": "^6.3.3",
     "typescript": "^5.9.3",
+    "unplugin-swc": "^1.6.0",
+    "vitest": "^5.0.1",
     "yazl": "^2.5.1"
   },
   "engines": {

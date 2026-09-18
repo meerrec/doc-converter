@@ -12,7 +12,7 @@
  * Все комментарии на русском языке.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import os from 'node:os';
 import path from 'node:path';
@@ -29,9 +29,8 @@ process.env.RATE_PER_SEC = '100';
 process.env.RATE_BURST = '100';
 
 const { createServer } = await import('./helpers/server.js');
-// Домен — TypeScript, а Jest работает без транспиляции: и сервер, и модуль
-// хранилища берутся из собранного dist (сборку делает pretest)
-const { writeResult } = await import('../dist/storage/fileStorage.js');
+// Сервер и модуль хранилища берутся из исходников: Vitest читает TypeScript
+const { writeResult } = await import('../src/storage/fileStorage.js');
 
 let server;
 let app;

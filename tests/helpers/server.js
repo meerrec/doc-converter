@@ -1,9 +1,7 @@
 /**
  * Запуск сервера для тестов.
  *
- * Сервер собирается из `dist/`: Jest не читает TypeScript без транспиляции,
- * а конфигурация проекта её намеренно не включает (ESM без `transform`).
- * Сборку перед прогоном выполняет `pretest` (`npm run build:server`).
+ * Сервер берётся из исходников на TypeScript: раннер (Vitest) читает их напрямую.
  *
  * Импорт динамический, а не статический: тесты выставляют переменные
  * окружения (STORAGE_PATH, RATE_*) до обращения к серверу, а `config/index.js`
@@ -17,13 +15,13 @@
  */
 export async function createServer() {
   // Порт 0 — «любой свободный». Так наборы тестов, идущие параллельно
-  // в разных воркерах Jest, не конфликтуют за 3000: раньше второй набор
+  // в разных воркерах, не конфликтуют за 3000: раньше второй набор
   // получал EADDRINUSE и прогон вёл себя неустойчиво.
   // Если тест задал порт явно, значение не трогаем.
   process.env.API_PORT ??= '0';
   process.env.PORT ??= '0';
 
-  const { createServer: createNestServer } = await import('../../dist/nest/bootstrap.js');
+  const { createServer: createNestServer } = await import('../../src/nest/bootstrap.js');
 
   return createNestServer();
 }

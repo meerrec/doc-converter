@@ -180,18 +180,16 @@ npm run health               # curl http://localhost:3000/health | jq
 
 ```bash
 npm test                     # весь набор
+npm run test:watch           # режим наблюдения
 npm run test:e2e             # то же с E2E=1
 
 # Один файл / один тест
-NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules npx jest --forceExit tests/security.test.js
-NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules npx jest --forceExit -t "should reject ZIP bomb"
+NODE_ENV=test npx vitest run tests/security.test.js
+NODE_ENV=test npx vitest run -t "should reject ZIP bomb"
 ```
 
-`NODE_OPTIONS=--experimental-vm-modules` обязателен: Jest запускается на ESM без транспиляции
-(`transform: {}` в `jest.config.js`) и без него падает на `import`.
-
-`--forceExit` нужен потому, что Jest иначе виснет на открытых хендлах — HTTP-сервер,
-поднятый в тестах через `createServer()`, `setInterval` в rate limit и пул fork-процессов.
+Раннер — Vitest; тесты работают с исходниками на TypeScript, сборка перед прогоном
+не требуется.
 
 Фикстур-атаки не лежат в `tests/fixtures/` — они генерируются кодом в
 `tests/helpers/attackFixtures.js` (zip-бомбы, path traversal, XML-бомбы, валидные DOCX/PDF).

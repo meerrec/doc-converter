@@ -1,19 +1,14 @@
 /**
  * Проверки NestJS-приложения.
  *
- * Тесты запускаются против **собранного** `dist/`: Jest не умеет читать
- * TypeScript без транспиляции, а конфигурация проекта её намеренно не включает
- * (ESM без `transform`). Поэтому скрипт `test` сначала выполняет сборку —
- * заодно это гарантирует, что типы проверены.
- *
- * На этапе перехода на Vitest (этап 5) тесты будут импортировать исходники
- * напрямую, и сборка перед прогоном станет не нужна.
+ * Тесты работают с исходниками на TypeScript: раннер — Vitest, сборка перед
+ * прогоном не нужна.
  *
  * Покрывается каркас: проверка доступности, формат ошибок Р7 и ограничитель
  * частоты. Маршруты конвертации проверяются отдельно, после их переноса.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 
 // Порт задаётся до загрузки модулей: config/index.js читает окружение
@@ -24,7 +19,7 @@ process.env.HOST = '127.0.0.1';
 process.env.RATE_PER_SEC = '2';
 process.env.RATE_BURST = '5';
 
-const { createServer } = await import('../dist/nest/bootstrap.js');
+const { createServer } = await import('../src/nest/bootstrap.js');
 
 let app;
 let server;

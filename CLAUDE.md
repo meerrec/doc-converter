@@ -58,8 +58,8 @@ Nest-контекста, поэтому DI здесь не подходит.
 
 Логирование — `pino` и `pino-http` напрямую (`src/nest/common/logger.ts`).
 `nestjs-pino` не подходит: пакет поставляет исходники на TypeScript и требует
-сборщик, а Jest здесь работает без транспиляции. Оба пакета грузятся через
-`createRequire` — их объявления типов не экспортируют вызываемую функцию.
+сборщик. Оба пакета грузятся через `createRequire` — их объявления типов
+не экспортируют вызываемую функцию.
 
 Формат ошибок задаёт `src/nest/common/r7-exception.filter.ts`: Nest по умолчанию
 отвечает `{ statusCode, message, error }`, что несовместимо с контрактом Р7.
@@ -70,31 +70,25 @@ Nest-контекста, поэтому DI здесь не подходит.
 
 ```bash
 npm test                     # весь набор
+npm run test:watch           # то же в режиме наблюдения
 npm run test:e2e             # то же с E2E=1
 
 # Один файл / один тест
-NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules npx jest --forceExit tests/security.test.js
-NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules npx jest --forceExit -t "should reject ZIP bomb"
+NODE_ENV=test npx vitest run tests/security.test.js
+NODE_ENV=test npx vitest run -t "should reject ZIP bomb"
 ```
 
-`NODE_OPTIONS=--experimental-vm-modules` обязателен — Jest запускается на ESM без транспиляции
-(`transform: {}` в `jest.config.js`). Без него Jest падает на `import`.
+Тесты читают **исходники** на TypeScript, а не собранный `dist/`: сборка перед прогоном
+не нужна. Раньше её делал `pretest`, и он же страховал от прогона против устаревшего
+`dist/` — вместе с переходом на Vitest этот риск ушёл.
 
-Перед прогоном выполняется `pretest` — сборка сервера. Это нужно всем тестам:
-Jest не читает TypeScript, поэтому и сервер, и домен они берут из собранного `dist/`.
-Заодно гарантируется, что типы проверены. После перехода на Vitest (исходники вместо
-сборки) шаг уйдёт.
+Транспиляция идёт через SWC (`unplugin-swc` в `vitest.config.ts`) — не ради TypeScript,
+его снимает Vite, а ради метаданных декораторов: NestJS разрешает зависимости конструктора
+через `design:paramtypes`, а esbuild эту метаинформацию не порождает, и внедрение
+зависимостей в тестах падало бы.
 
-Прямой вызов `npx jest` сборку не выполняет — можно незаметно прогнать набор против
-устаревшего `dist/`.
-
-В `jest.config.js` есть `moduleNameMapper` для `rxjs`: Jest не применяет условие
-`node` из карты экспорта пакета и добирается до сборки `esm5`, которую не умеет
-разбирать. Правка тоже временная — Vitest разрешает модули как Node.
-
-`--forceExit` в тест-скрипте нужен, потому что Jest иначе виснет на открытых хендлах: HTTP-сервер,
-поднятый в тестах через `createServer()`, `setInterval` в ограничителе частоты, пул fork-процессов.
-Код возврата при этом остаётся корректным — при падении тестов Jest отдаёт 1.
+`LOG_LEVEL=silent` и `AUDIT_LOG_LEVEL=error` в тест-скрипте глушат логи: pino и аудит-логгер
+пишут в stdout, и без этого вывод тестов не читается.
 
 `lint` — заглушка (`echo 'Linter not configured yet'`); линтер в проекте не настроен.
 

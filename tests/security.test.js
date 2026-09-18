@@ -12,35 +12,34 @@
  * Все комментарии на русском языке.
  */
 
-import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import request from 'supertest';
 import { createServer } from './helpers/server.js';
 
-// Домен — TypeScript, а Jest работает без транспиляции: модули безопасности
-// берутся из собранного dist (сборку перед прогоном делает pretest).
+// Модули безопасности берутся из исходников на TypeScript.
 import { 
   checkMagicBytes, 
   verifyMagicBytes,
   getFormatFromMagic,
   MAGIC_SIGNATURES 
-} from '../dist/security/magicBytes.js';
+} from '../src/security/magicBytes.js';
 import { 
   validateUrl, 
   validateDns,
   checkPrivateIp,
   PRIVATE_IP_RANGES 
-} from '../dist/security/urlGuard.js';
+} from '../src/security/urlGuard.js';
 import {
   validateZip,
   quickZipCheck,
   checkZipEntryName,
   ZIP_VALIDATION_LIMITS
-} from '../dist/security/zipGuard.js';
+} from '../src/security/zipGuard.js';
 import {
   validateXml,
   checkXmlContent,
   XML_VALIDATION_LIMITS
-} from '../dist/security/xmlGuard.js';
+} from '../src/security/xmlGuard.js';
 import {
   buildZipBomb,
   buildZipTraversal,
@@ -76,7 +75,7 @@ afterAll(async () => {
   if (server) {
     await new Promise((resolve) => server.close(resolve));
   }
-  jest.clearAllMocks();
+  vi.clearAllMocks();
 });
 
 // ===========================================================================

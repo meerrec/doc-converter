@@ -13,7 +13,7 @@
  * Все комментарии на русском языке.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 
 // Ограничитель частоты поднимаем: тесты делают несколько запросов подряд
