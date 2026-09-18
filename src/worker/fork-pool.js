@@ -239,35 +239,19 @@ export function getHealth() {
 }
 
 /**
- * Очищает пул.
- */
-export function resetPool() {
-  for (const item of pool) {
-    try {
-      item.child.kill('SIGTERM');
-    } catch {
-      // Игнорируем ошибки
-    }
-  }
-  pool.length = 0;
-}
-
-/**
  * Возвращает объект пула для использования в sandbox.
  *
- * @returns {{runTask: Function, getHealth: Function, resetPool: Function}}
+ * @returns {{runTask: Function, getHealth: Function}}
  */
 export function getForkPool() {
   return {
     runTask,
-    getHealth,
-    resetPool
+    getHealth
   };
 }
 
 export default {
   runTask,
   getHealth,
-  resetPool,
   getForkPool
 };

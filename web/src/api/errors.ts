@@ -45,11 +45,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   content_validation_failed: 'Файл не прошёл проверку',
 
   // Ход выполнения
-  incompatible_formats: 'Такое преобразование форматов не поддерживается',
-  file_empty: 'Файл пустой',
-  output_too_small: 'Не удалось получить корректный результат конвертации',
   conversion_failed: 'Не удалось сконвертировать документ',
-  conversion_validation_failed: 'Документ не прошёл проверку перед конвертацией',
   job_processing_failed: 'Ошибка обработки задачи на сервере',
   sync_timeout: 'Превышено время обработки запроса',
   sync_disabled: 'Синхронный режим на сервере выключен',

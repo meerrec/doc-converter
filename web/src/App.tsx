@@ -15,10 +15,10 @@ import { request } from './api/client';
 import { detectInputFormat } from './lib/format';
 import {
   CSV_FORMAT,
-  SPREADSHEET_INPUT_FORMATS,
-  TEXT_INPUT_FORMATS,
-} from './config';
-import type { ConversionOptions, HealthResponse } from './api/types';
+  spreadsheetInputFormatSet,
+  textInputFormatSet,
+} from '@doc-converter/contract';
+import type { ConversionOptions, HealthResponse } from '@doc-converter/contract';
 
 /** Состояние доступности сервиса. */
 type HealthState = 'checking' | 'ok' | 'unavailable';
@@ -83,9 +83,9 @@ export function App() {
         continue;
       }
 
-      showCodePage ||= TEXT_INPUT_FORMATS.has(format);
+      showCodePage ||= textInputFormatSet.has(format);
       showDelimiter ||= format === CSV_FORMAT;
-      showSpreadsheet ||= SPREADSHEET_INPUT_FORMATS.has(format);
+      showSpreadsheet ||= spreadsheetInputFormatSet.has(format);
     }
 
     return { showCodePage, showDelimiter, showSpreadsheet };

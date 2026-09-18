@@ -7,7 +7,8 @@
  */
 
 import { memo, useCallback, useId, useRef, useState } from 'react';
-import { INPUT_FORMATS, MAX_UPLOAD_BYTES } from '../config';
+import { INPUT_FORMATS } from '@doc-converter/contract';
+import { MAX_UPLOAD_BYTES } from '../config';
 
 interface DropZoneProps {
   /** Вызывается с выбранными файлами. */

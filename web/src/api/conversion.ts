@@ -15,7 +15,7 @@ import type {
   ConversionRequest,
   TaskStatusResponse,
   BatchStatusResponse,
-} from './types';
+} from '@doc-converter/contract';
 
 /** Параметры постановки задачи в очередь. */
 export interface SubmitParams {

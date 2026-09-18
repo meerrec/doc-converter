@@ -2,9 +2,9 @@
 # Dockerfile для сервиса конвертации документов
 #
 # Базовый образ: node:24-bookworm-slim
-# Обоснование версии: isolated-vm начиная с 6.x требует Node >= 22, а 7.x — >= 24.
-# На Node 20 модуль собирается, но падает с SIGSEGV при создании изолята
-# (несовместимость с внутренним API V8).
+# Обоснование версии: Node 24 — среда, на которой сервис разрабатывается и
+# тестируется; WASM-движку LibreOffice нужен --disable-wasm-trap-handler
+# (см. NODE_OPTIONS ниже), а не конкретная мажорная версия.
 # - Формат: ES modules ("type": "module")
 # - Non-root пользователь: conv
 # - Hardening: read_only, cap_drop ALL, no-new-privileges
@@ -26,30 +26,31 @@ RUN apt-get update && \
         fonts-noto-mono \
     && rm -rf /var/lib/apt/lists/*
 
-# Инструменты сборки нативных модулей.
-# Обоснование: isolated-vm — нативный модуль, у него нет prebuilt-бинарника
-# под Node 20, поэтому prebuild-install откатывается на `node-gyp rebuild`,
-# которому нужны python3, make и компилятор C++. Без них сборка образа
-# падает на шаге установки зависимостей.
-# В финальный образ эти пакеты не переносятся — там уже собранный модуль.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        python3 \
-        make \
-        g++ \
-    && rm -rf /var/lib/apt/lists/*
+# Инструменты сборки нативных модулей здесь больше не нужны: единственный
+# нативный модуль (isolated-vm) удалён, а оставшиеся зависимости приходят
+# либо чистым JS, либо готовыми бинарниками (msgpackr-extract — опциональный
+# ускоритель BullMQ с prebuild-сборками; при их отсутствии откатывается на JS).
 
 # Создаем non-root пользователя
 RUN groupadd -r conv && \
     useradd -r -g conv -m -d /home/conv -s /bin/false conv
 
-# Копируем приложение
+# Копируем приложение.
+#
+# Манифесты всех участников workspace копируются до установки: pnpm читает
+# pnpm-workspace.yaml и без package.json каждого пакета отказывается ставить
+# зависимости. Отдельным слоем — чтобы кеш не сбрасывался на каждой правке
+# исходников.
 WORKDIR /app
 COPY pnpm*.yaml ./
 COPY package*.json ./
+COPY packages/contract/package.json ./packages/contract/
+COPY web/package.json ./web/
 
-# Устанавливаем зависимости (включая devDependencies для сборки)
-RUN npx pnpm ci
+# Ставим зависимости только серверной части (включая devDependencies для
+# сборки). Фильтр отсекает React и Vite из web — в образе api/worker они
+# не нужны и заметно увеличивают размер.
+RUN npx pnpm ci --filter doc-converter
 
 COPY . .
 

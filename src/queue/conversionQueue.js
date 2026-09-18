@@ -239,58 +239,6 @@ export async function getQueueStats() {
 }
 
 // ===========================================================================
-// Очистка
-// ===========================================================================
-
-/**
- * Удаляет завершенные задачи из очереди
- * 
- * @param {number} [maxAgeMs=86400000] - максимальный возраст в мс (24 часа)
- * @returns {Promise<{removed: number}>}
- */
-export async function cleanupCompletedJobs(maxAgeMs = 86400000) {
-  const queue = await getConversionQueue();
-  
-  const completed = await queue.getCompleted();
-  const failed = await queue.getFailed();
-  
-  const allJobs = [...completed, ...failed];
-  let removed = 0;
-  
-  for (const job of allJobs) {
-    if (job.finishedOn) {
-      const age = Date.now() - job.finishedOn.getTime();
-      
-      if (age > maxAgeMs) {
-        await job.remove();
-        removed++;
-      }
-    }
-  }
-  
-  return { removed };
-}
-
-/**
- * Удаляет зависшие задачи
- * 
- * @returns {Promise<{removed: number}>}
- */
-export async function cleanupStalledJobs() {
-  const queue = await getConversionQueue();
-  
-  const stalled = await queue.getStalled();
-  let removed = 0;
-  
-  for (const job of stalled) {
-    await job.remove();
-    removed++;
-  }
-  
-  return { removed };
-}
-
-// ===========================================================================
 // Утилиты
 // ===========================================================================
 
@@ -334,8 +282,6 @@ export default {
   getJobStatus,
   getJobProgress,
   getQueueStats,
-  cleanupCompletedJobs,
-  cleanupStalledJobs,
   jobExists,
   removeJob,
   QUEUE_NAME,

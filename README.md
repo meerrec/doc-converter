@@ -48,10 +48,11 @@ npm run health       # curl http://localhost:3000/health | jq
 Интерфейс работает через асинхронный режим API (`async: true`) и опрашивает
 `GET /status` одной пачкой на все активные задачи.
 
+Интерфейс входит в общий pnpm-workspace, поэтому ставится и запускается из корня:
+
 ```bash
-cd web
-npm install
-npm run dev          # http://localhost:5173, запросы к API идут через прокси Vite
+pnpm install
+pnpm --filter doc-converter-web dev   # http://localhost:5173, прокси Vite
 ```
 
 В production статику раздаёт отдельный контейнер nginx (см. `web/nginx.conf`),
@@ -59,10 +60,17 @@ npm run dev          # http://localhost:5173, запросы к API идут ч�
 поэтому CORS не нужен.
 
 ```bash
-cd web
-npm run typecheck    # tsc --noEmit
-npm run build        # tsc --noEmit + vite build → web/dist
+pnpm --filter @doc-converter/contract build   # контракт — до сборки интерфейса
+pnpm --filter doc-converter-web typecheck     # tsc --noEmit
+pnpm --filter doc-converter-web build         # tsc --noEmit + vite build → web/dist
 ```
+
+## Контракт API
+
+`packages/contract` — zod-схемы и выведенные из них типы, общие для сервера
+и веб-интерфейса: формы запросов и ответов, списки форматов, кодировки,
+разделители и коды ошибок. Из одной схемы получаются и тип для TypeScript,
+и рантайм-проверка, поэтому серверная и клиентская стороны не могут разойтись.
 
 ## Пример использования
 

@@ -1,5 +1,26 @@
 # Архитектура
 
+## Структура репозитория
+
+Монорепозиторий на pnpm-workspace:
+
+| Каталог | Роль |
+|---|---|
+| `src/` | Сервер: API (Express) и воркер очереди. Корневой пакет `doc-converter` |
+| `packages/contract/` | **Контракт API**: zod-схемы и выведенные из них типы. Общий для сервера и веба |
+| `web/` | Интерфейс: Vite + React + TypeScript |
+| `tests/` | Тесты сервера (Jest + supertest) |
+
+`packages/contract` — единственный источник правды по формам запросов и ответов,
+спискам форматов, кодировкам и кодам ошибок. Схемы написаны на zod, поэтому из одной
+схемы выводятся и тип для TypeScript, и рантайм-проверка: разойтись между сервером
+и клиентом они не могут. Веб уже потребляет контракт целиком; сервер переходит
+на него по мере переноса на NestJS.
+
+Порядок сборки: контракт собирается **до** веба (`pnpm --filter @doc-converter/contract build`).
+
+## Пути выполнения
+
 Сервис собран из двух **независимых путей выполнения**, и это главное, что нужно понять
 перед правкой кода.
 
@@ -20,8 +41,7 @@
 Ранее асинхронный путь использовал `isolated-vm` (`worker/wasm-isolate.js`). От этого
 механизма отказались: WASM-память не изолируется в пределах потока (о чём предупреждает
 и загрузчик самой библиотеки, `wasm/loader-isolated.cjs`), а вызов конвертера через
-границу изолята падает с ошибкой клонирования. Модуль `wasm-isolate.js` остался в коде,
-но в конвейере конвертации не участвует.
+границу изолята падает с ошибкой клонирования. Модуль и зависимость `isolated-vm` удалены.
 
 ## Синхронный путь
 
@@ -134,23 +154,27 @@ POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
 ### Файловое хранилище
 
 `storage/fileStorage.js` пишет результат атомарно: `.tmp` → `rename` → `chmod 0o444`.
-Запись идёт в `STORAGE_PATH`. Автоматической очистки нет: `cleanupStorage()` объявлена,
-но не вызывается ниоткуда, TTL у файлов отсутствует.
+Запись идёт в `STORAGE_PATH`. Автоматической очистки нет: механизм удалён вместе с
+мёртвой `cleanupStorage()`, TTL у файлов отсутствует.
 
 ## Форматы и опции
 
 ### Совместимость форматов
 
-Матрицы попарной совместимости нет. `worker/converter.js:149` проверяет два условия:
-входной формат есть в списке входных, выходной — в списке выходных.
+Матрицы попарной совместимости нет. Проверяются только allowlist'ы из
+`api/middleware/validate.js`: входной формат — по `ALLOWED_INPUT_FORMATS`, выходной —
+по `ALLOWED_OUTPUT_FORMATS`. Всё, что прошло allowlist, передаётся WASM-библиотеке;
+поддерживает ли она конкретную пару, заранее не проверяется — неподдерживаемая пара
+приводит к ошибке конвертации.
 
-- **Вход:** `docx`, `xlsx`, `pptx`, `doc`, `xls`, `ppt`, `odt`, `ods`, `odp`, `rtf`, `txt`, `csv`, `html`, `htm`, `pdf`
-- **Выход:** `pdf`, `pdfa`, `docx`, `xlsx`, `pptx`, `odt`, `ods`, `odp`, `rtf`, `txt`, `csv`, `html`, `png`, `jpg`, `jpeg`, `svg`
+- **Вход:** `doc`, `docx`, `xls`, `xlsx`, `ppt`, `pptx`, `odt`, `ods`, `odp`, `rtf`, `txt`, `html`, `htm`, `csv`, `pdf`, `epub`
+- **Выход:** `pdf`, `pdfa`, `docx`, `xlsx`, `csv`, `txt`, `html`, `png`, `jpg`, `jpeg`, `svg`, `odt`, `ods`, `odp`, `rtf`, `epub`
 
 Следствия: `doc`/`xls`/`ppt` — только на вход; `png`/`jpg`/`svg`/`pdfa` — только на выход;
-`htm` — только на вход. Allowlist в `api/middleware/validate.js` шире: он допускает
-`epub` на вход, но `converter.js` его не поддерживает, поэтому такой запрос дойдёт
-до `incompatible_formats`.
+`htm` — только на вход.
+
+Ранее в `worker/converter.js` жил отдельный список совместимости (`isConversionSupported`)
+со своей матрицей форматов, но вызывался он только из неиспользуемого кода и удалён.
 
 ### Маппинг опций Р7 → LibreOffice
 
@@ -196,7 +220,6 @@ rateLimit → validate (схема + allowlist) → urlGuard (SSRF) → magicByt
 | `src/api/routes/convert.js` | `POST /ConvertService.ashx`: валидация, идемпотентность, выбор режима |
 | `src/api/routes/status.js` | `GET /status/:taskId` и пакетный `GET /status` |
 | `src/api/routes/results.js` | `GET /results/:fileName` — отдача готовых файлов (смонтирован также на `/storage/results`) |
-| `src/api/routes/health.js` | Готовые `/health`, `/health/ready`, `/health/live` — **не смонтированы** |
 | `src/api/middleware/validate.js` | Схема запроса, allowlist форматов, проверка контента |
 | `src/api/middleware/rateLimit.js` | Sliding window на IP (in-memory) |
 | `src/api/middleware/auditLog.js` | Аудит-логгер на pino |
@@ -213,29 +236,32 @@ rateLimit → validate (схема + allowlist) → urlGuard (SSRF) → magicByt
 | `src/storage/fileStorage.js` | Атомарная запись результатов |
 | `src/worker/sandbox.js` | Семафор и бюджет времени синхронного пути |
 | `src/worker/fork-pool.js` | Пул fork-процессов |
-| `src/worker/fork-runner.js` | **Мёртвый код** — вторая реализация пула, не импортируется нигде |
 | `src/worker/fork-worker.js` | Дочерний процесс: вызов WASM |
 | `src/worker/index.js` | BullMQ Worker |
 | `src/worker/processor.js` | Обработчик задачи очереди |
-| `src/worker/converter.js` | Валидация форматов, расширения и MIME-типы |
+| `src/worker/converter.js` | Справочник форматов: расширения файлов, контекст задачи |
 | `src/worker/optionsMapper.js` | Маппинг опций Р7 → LibreOffice |
-| `src/worker/wasm-isolate.js` | `isolated-vm` изолят — **в конвейере не участвует** (см. ниже) |
 
 `src/index.js` и вложенные `index.js` — плоские реэкспорты; точками входа они не являются.
 `default`-экспорты через `export *` не реэкспортируются.
 
 ## Как добавить новый формат
 
-Формат добавляется **в трёх местах** (это сквозное соглашение проекта):
+Формат добавляется **в четырёх местах** (это сквозное соглашение проекта):
 
 1. `api/middleware/validate.js` — в `ALLOWED_INPUT_FORMATS` и/или `ALLOWED_OUTPUT_FORMATS`.
 2. `security/magicBytes.js` — сигнатура в таблице `SIGNATURES` (если формат бинарный).
-3. `worker/converter.js` — в `supportedInput` / `supportedOutput`, а также в `getMimeType`
-   и `getFileExtension`.
+3. `worker/converter.js` — расширение в карте `getFileExtension` (соответствие
+   формата результата расширению файла).
+4. `web/src/config.ts` — в `INPUT_FORMATS` / `OUTPUT_FORMATS` и, если нужно,
+   в `OUTPUT_FORMAT_LABELS`.
 
 Если формат — ZIP-контейнер, добавьте его в список `zipFormats` в
 `api/middleware/validate.js:392` и `worker/processor.js:244`.
 Если у формата есть специфичные опции — в `mapFormatSpecificOptions` (`optionsMapper.js:369`).
+
+Планируемый перевод на общий пакет контракта (`packages/contract`) сократит это
+до одного места: allowlist, сигнатуры и расширения будут выводиться из одной схемы.
 
 ## Известные расхождения и мёртвый код
 
@@ -244,46 +270,47 @@ rateLimit → validate (схема + allowlist) → urlGuard (SSRF) → magicByt
 
 **Функциональные:**
 
-0. `wasm-isolate.js` и `converter.convertDocument` — не используются: асинхронный путь
-   переведён на fork-пул. Модуль остался в коде вместе с зависимостью `isolated-vm`,
-   которая тянет за собой требование Node ≥ 24 и toolchain при сборке образа.
-1. `convertDocumentAsync` (`converter.js:295`) — заглушка: возвращает `{ taskId, queued: true }`
-   и ничего не кладёт в очередь.
-2. `xmlGuard` не подключён: `validateXml` импортирован в `processor.js:41`, но не вызывается.
-3. `validateZip` в `convert.js:464` и `processor.js:245` вызывается **без проверки результата** —
+1. `xmlGuard` не подключён: `validateXml` импортирован в `processor.js:41`, но не вызывается.
+2. `validateZip` в `convert.js:473` и `processor.js:245` вызывается **без проверки результата** —
    реагируют только на исключение, поэтому нарушения-лимиты там не отсекаются.
-4. Роутер `api/routes/health.js` (`/health/ready`, `/health/live`) не смонтирован: `server.js:125`
-   объявляет собственный `/health` с `const wasmReady = true; // TODO`.
-5. `checkRedisHealth()` возвращает объект `{ healthy }`, а используется как boolean
-   (`health-check.js:19`, `routes/health.js:83`) — проверка Redis не срабатывает никогда.
-6. `bodyTimeoutMiddleware` не работает: он подключён после `express.json()`
-   (`server.js:53-59`), когда тело уже разобрано, и сразу выходит по раннему условию.
+3. `bodyTimeoutMiddleware` не работает: он подключён после `express.json()`
+   (`server.js:54-60`), когда тело уже разобрано, и сразу выходит по раннему условию.
+4. `/health` объявлен прямо в `server.js:126` с `const wasmReady = true; // TODO` —
+   проверка готовности WASM не выполняется, ответ всегда `ok`.
 
 **Гонки и дефекты:**
 
-7. В `fork-pool.js` на таймауте сначала вызывается `cleanup()`, который помечает процесс
+5. В `fork-pool.js` на таймауте сначала вызывается `cleanup()`, который помечает процесс
    свободным, и только потом `kill('SIGKILL')` — убитый процесс возвращается в пул,
    и следующая задача упадёт на `child.send`.
-8. `checkKeyConflict` (`idempotency.js:351`) в обеих ветках возвращает `{ conflict: false }`.
-9. `MAX_TASK_ID_LENGTH = 64` в `reserveTaskId`, тогда как схема допускает `key` до 128 символов:
+6. `checkKeyConflict` (`idempotency.js:351`) в обеих ветках возвращает `{ conflict: false }`.
+7. `MAX_TASK_ID_LENGTH = 64` в `reserveTaskId`, тогда как схема допускает `key` до 128 символов:
    ключ длиной 65–128 проходит валидацию, но роняет `reserveTaskId` обычным `Error` → `500`.
-10. `cleanupCompletedJobs` вызывает `job.finishedOn.getTime()` при `finishedOn: number`,
-    а `cleanupStalledJobs` — несуществующий `queue.getStalled()`; обе функции к тому же
-    нигде не вызываются.
 
 **Несоответствия имён и значений:**
 
-11. `STORAGE_WRITE_TIMEOUT_MS` в `.env.example` против `STORE_WRITE_TIMEOUT_MS` в коде.
-12. `PORT`/`HOST` из окружения не читаются: порт задаётся только через `API_PORT`.
-13. `REDIS_PASSWORD`, `REDIS_DB`, `REDIS_CONNECTION_STRING` объявлены, но не используются —
+8. `STORAGE_WRITE_TIMEOUT_MS` в `.env.example` против `STORE_WRITE_TIMEOUT_MS` в коде.
+9. `PORT`/`HOST` из окружения не читаются: порт задаётся только через `API_PORT`.
+10. `REDIS_PASSWORD`, `REDIS_DB`, `REDIS_CONNECTION_STRING` объявлены, но не используются —
     подключение идёт без авторизации и всегда в БД 0.
-14. TTL статуса задачи различается: 30 с из API против 3600 с из воркера.
-15. Три формата `fileUrl`: `/results/{id}.{ext}` (`fileStorage.js`), `/storage/results/{file}`
+11. TTL статуса задачи различается: 30 с из API против 3600 с из воркера.
+12. Три формата `fileUrl`: `/results/{id}.{ext}` (`fileStorage.js`), `/storage/results/{file}`
     (`convert.js:331`) и примеры в JSDoc. Синхронный путь файл не сохраняет вообще.
-16. `RATE_PER_SEC` фактически не ограничивает: `allowed` определяется burst-веткой (20 > 5),
+13. `RATE_PER_SEC` фактически не ограничивает: `allowed` определяется burst-веткой (20 > 5),
     а счётчик инкрементируется после проверки.
-17. `fork-pool.resetPool`, `sandbox.createTaskTimer`/`createCancellableTask`, `cleanupStorage`,
-    `UnsupportedOptionError`, `validateR7Options`, `WORKER_MEMORY_MB` — объявлены и не используются.
+14. Экспортируются, но не используются вне своего модуля (часть — только внутри него):
+    `getSandboxStats`, `executeInSandbox`, `convertWithWasmSandbox`, `getTaskSemaphore`,
+    `resetTaskSemaphore` (`sandbox.js`); `createDefaultOptions`, `mergeOptionsWithDefaults`
+    (`optionsMapper.js`); `listResults`, `getResultSize` (`fileStorage.js`).
+
+**Устранено при расчистке мёртвого кода:**
+
+Удалены `worker/wasm-isolate.js` вместе с зависимостью `isolated-vm` и константами
+`ISOLATE_MEMORY_MB`/`WORKER_MEMORY_MB`, `worker/fork-runner.js` (вторая реализация пула),
+несмонтированный роутер `api/routes/health.js`, заглушка `convertDocumentAsync`,
+а также неиспользуемые `resetPool`, `createTaskTimer`, `createCancellableTask`,
+`cleanupStorage`, `UnsupportedOptionError`, `validateR7Options`, `cleanupCompletedJobs`
+и `cleanupStalledJobs`. Вместе с `isolated-vm` из образа ушёл toolchain `python3/make/g++`.
 
 ## Тесты
 

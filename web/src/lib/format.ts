@@ -2,7 +2,7 @@
  * Вспомогательные функции форматирования и разбора имён файлов.
  */
 
-import { INPUT_FORMATS } from '../config';
+import { INPUT_FORMATS } from '@doc-converter/contract';
 
 /** Единицы измерения размера файла. */
 const SIZE_UNITS = ['Б', 'КБ', 'МБ', 'ГБ'] as const;

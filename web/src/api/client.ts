@@ -8,7 +8,7 @@
  * - сквозной X-Request-Id для логов сервиса
  */
 
-import type { ApiErrorBody } from './types';
+import type { ApiErrorBody } from '@doc-converter/contract';
 
 /**
  * Базовый адрес API.

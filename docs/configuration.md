@@ -57,9 +57,12 @@ process.env → src/config/index.js (константы с дефолтами) �
 |---|---|---|
 | `MAX_CONCURRENT` | `4` | Одновременных задач конвертации на процесс. Эмпирически оптимально для Node.js с WASM: ~240 МБ на задачу |
 | `FORK_POOL_SIZE` | `4` | Размер пула `child_process.fork` для синхронного пути; совпадает с `MAX_CONCURRENT` для переиспользования процессов |
-| `ISOLATE_MEMORY_MB` | `512` | Лимит heap для `isolated-vm`. В конвейере конвертации модуль не используется — параметр остался от прежней схемы |
-| `WORKER_MEMORY_MB` | `512` | Лимит old-generation heap для запасного варианта на `worker_threads` (уровень B). Константа объявлена, но **нигде не используется** — fallback не реализован |
-| `NODE_OPTIONS` | `--disable-wasm-trap-handler --max-old-space-size=1536` | Уровень C. Без `--disable-wasm-trap-handler` WASM не запустится при `ulimit -v` ниже ~10 ГБ; `--max-old-space-size=1536` — резерв под WASM + heap Node.js |
+| `NODE_OPTIONS` | `--disable-wasm-trap-handler --max-old-space-size=1536` | Без `--disable-wasm-trap-handler` WASM не запустится при `ulimit -v` ниже ~10 ГБ; `--max-old-space-size=1536` — резерв под WASM + heap Node.js |
+
+Потолок памяти задаётся извне: контейнером (`mem_limit` в `docker-compose.yml`) и
+`fork-pool.js`, который передаёт каждому форку свой `--max-old-space-size`. Отдельных
+констант на изолят (`ISOLATE_MEMORY_MB`) и на `worker_threads` (`WORKER_MEMORY_MB`)
+больше нет — оба механизма удалены вместе с переходом на fork-пул.
 
 `NODE_OPTIONS` читается самим Node.js при старте процесса, а не кодом сервиса,
 поэтому в контейнерах переменная задаётся в `Dockerfile:88` и в `docker-compose.yml`.

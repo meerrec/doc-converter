@@ -96,26 +96,16 @@ export const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 4);
 export const FORK_POOL_SIZE = Number(process.env.FORK_POOL_SIZE || 4);
 
 // ============================================================================
-// ЛИМИТЫ ПАМЯТИ WASM — 4 уровня защиты
+// ЛИМИТЫ ПАМЯТИ WASM
 // ============================================================================
 
 /**
- * Лимит heap для isolated-vm (Уровень A).
- * Обоснование: 512 МБ достаточно для конвертации документа среднего размера.
- * При превышении изолят умирает, основной процесс жив.
- */
-export const ISOLATE_MEMORY_MB = Number(process.env.ISOLATE_MEMORY_MB || 512);
-
-/**
- * Лимит old generation heap для worker_threads fallback (Уровень B).
- * Обоснование: совпадает с ISOLATE_MEMORY_MB для консистентности.
- */
-export const WORKER_MEMORY_MB = Number(process.env.WORKER_MEMORY_MB || 512);
-
-/**
- * NODE_OPTIONS для отключения wasm trap handler (Уровень C).
+ * NODE_OPTIONS для отключения wasm trap handler.
  * Обоснование: без этого WASM не запустится при ulimit -v ниже ~10 ГБ.
  * --max-old-space-size=1536 — reservation для WASM + Node.js heap.
+ *
+ * Границы памяти задаются извне: контейнером (mem_limit в docker-compose)
+ * и fork-pool.js, который передаёт каждому форку свой --max-old-space-size.
  */
 export const NODE_OPTIONS = process.env.NODE_OPTIONS ||
   '--disable-wasm-trap-handler --max-old-space-size=1536';

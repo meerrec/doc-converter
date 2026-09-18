@@ -292,51 +292,6 @@ export async function convertWithWasmSandbox(
 }
 
 // ===========================================================================
-// Управление таймаутами
-// ===========================================================================
-
-/**
- * Создает таймер для задачи
- * 
- * @param {Function} callback - callback при таймауте
- * @param {number} [timeout=JOB_TIMEOUT_MS] - таймаут в мс
- * @returns {NodeJS.Timeout}
- */
-export function createTaskTimer(callback, timeout = JOB_TIMEOUT_MS) {
-  return setTimeout(callback, timeout);
-}
-
-/**
- * Создает отменяемую задачу
- * 
- * @param {Function} fn - функция выполнения
- * @param {number} [timeout=JOB_TIMEOUT_MS] - таймаут в мс
- * @returns {Promise<{result: any, cancelled: boolean}>}
- */
-export async function createCancellableTask(fn, timeout = JOB_TIMEOUT_MS) {
-  let cancelled = false;
-  let timer = null;
-  
-  const promise = fn();
-  
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      cancelled = true;
-      reject(new Error(`Task timeout after ${timeout}ms`));
-    }, timeout);
-  });
-  
-  try {
-    const result = await Promise.race([promise, timeoutPromise]);
-    return { result, cancelled: false };
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
-}
-
-// ===========================================================================
 // Статистика
 // ===========================================================================
 
@@ -365,7 +320,5 @@ export default {
   executeInSandbox,
   convertWithLimits,
   convertWithWasmSandbox,
-  createTaskTimer,
-  createCancellableTask,
   getSandboxStats,
 };

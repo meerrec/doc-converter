@@ -43,15 +43,18 @@ NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules npx jest --forceExit -t "sh
 
 ### Веб-интерфейс (`web/`)
 
-Отдельный пакет: Vite + React + TypeScript, свой `package.json` и `node_modules`
-(в pnpm-workspace не включён намеренно — чтобы не смешивать store с нативным `isolated-vm`).
+Отдельный пакет Vite + React + TypeScript, включён в pnpm-workspace наравне с
+`packages/contract`. Раньше держался на отдельном npm-сторе из-за нативного
+`isolated-vm` — после его удаления обособление потеряло смысл.
+
+Ставится и собирается из корня:
 
 ```bash
-cd web
-npm install
-npm run dev          # http://localhost:5173, запросы к API — через прокси Vite
-npm run typecheck    # tsc --noEmit (он же входит в build)
-npm run build        # → web/dist
+pnpm install                                    # весь workspace
+pnpm --filter doc-converter-web dev             # http://localhost:5173, прокси Vite
+pnpm --filter doc-converter-web typecheck       # tsc --noEmit (он же входит в build)
+pnpm --filter doc-converter-web build           # → web/dist
+pnpm --filter @doc-converter/contract build     # контракт: обязателен до сборки web
 ```
 
 Интерфейс работает только через асинхронный режим (`async: true`): синхронный путь
@@ -101,10 +104,10 @@ POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
 **Конвертация в обоих режимах идёт через один fork-пул.** Разница только в инициаторе:
 sync запускает её из обработчика запроса, async — из обработчика задачи BullMQ.
 
-`worker/wasm-isolate.js` (изолят на `isolated-vm`) в конвейере **не участвует** — от него
-отказались: WASM-память не изолируется в пределах потока, а вызов конвертера через границу
-изолята падает с ошибкой клонирования. Файл оставлен, но не подключён; зависимость
-`isolated-vm` при этом требует Node ≥ 24 и toolchain при сборке образа.
+Ранее существовал третий путь — изолят на `isolated-vm` (`worker/wasm-isolate.js`).
+От него отказались: WASM-память не изолируется в пределах потока, а вызов конвертера
+через границу изолята падает с ошибкой клонирования. Модуль и зависимость `isolated-vm`
+удалены — не возвращай их. Вместе с ними из образа ушёл toolchain `python3/make/g++`.
 
 Опции Р7 библиотека понимает частично: работают `outputFormat`, `inputFormat`, `password`,
 `pdf`, `image`; остальное (`CharSet`, `FieldDelimiter`, `PageSize` и пр. из `optionsMapper.js`)
@@ -152,12 +155,15 @@ sync запускает её из обработчика запроса, async �
 - Формат ошибок API — единый: `{ error: <код>, message, taskId? }`, где код — snake_case
   (`magic_mismatch`, `url_private_ip`, `field_type_mismatch`, …). Исключения несут `statusCode`
   и `errorCode` как свойства — обработчик ошибок в `server.js` маппит их в HTTP-ответ.
-- Новые форматы добавляются в трёх местах: allowlist в `api/middleware/validate.js`, сигнатуры в
-  `security/magicBytes.js`, списки совместимости в `worker/converter.js`.
-- `isolated-vm` — нативный модуль, импортируется лениво. Если он не собран под текущий Node,
-  API-сервер всё равно должен стартовать: не переноси его в статический импорт.
-  В конвейере конвертации модуль не используется (см. выше), но остаётся в зависимостях.
-- `vm2` не использовать никогда (прямо запрещено комментарием в `wasm-isolate.js`).
+- Контракт API живёт в `packages/contract`: zod-схемы и выведенные из них типы.
+  Веб уже берёт оттуда типы, списки форматов, кодировки и коды ошибок. Сервер
+  переходит на контракт по мере переноса на NestJS — **до завершения переноса**
+  списки форматов приходится править и там, и в серверных копиях: allowlist
+  в `api/middleware/validate.js`, сигнатуры в `security/magicBytes.js`, карта
+  расширений в `worker/converter.js` (`getFileExtension`).
+- `vm2` не использовать никогда.
+- Нативных модулей в зависимостях нет — образ собирается без компилятора. Если появится
+  новый, помни: он потребует toolchain в стадии builder `Dockerfile`.
 - Библиотеке конвертера нужен **явный `wasmLoader`**: подпуть `…/wasm/loader.cjs` не объявлен
   в `exports` пакета, поэтому импортируется по абсолютному пути через `pathToFileURL`.
   Без загрузчика инициализация падает с `WASM_NOT_INITIALIZED`.

@@ -17,8 +17,8 @@ import {
   DELIMITERS,
   OUTPUT_FORMATS,
   OUTPUT_FORMAT_LABELS,
-} from '../config';
-import type { ConversionOptions } from '../api/types';
+} from '@doc-converter/contract';
+import type { ConversionOptions } from '@doc-converter/contract';
 
 interface OptionsPanelProps {
   outputType: string;

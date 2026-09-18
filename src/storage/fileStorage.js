@@ -227,36 +227,6 @@ export async function listResults() {
   }
 }
 
-/**
- * Очищает хранилище от старых файлов.
- *
- * @param {number} [maxAgeMs=86400000] - максимальный возраст файлов в мс (24 часа)
- * @returns {Promise<{deleted: number, errors: number}>} - статистика очистки
- */
-export async function cleanupStorage(maxAgeMs = 86400000) {
-  const files = await listResults();
-  let deleted = 0;
-  let errors = 0;
-  
-  const now = Date.now();
-  
-  for (const filePath of files) {
-    try {
-      const stats = await fs.stat(filePath);
-      const age = now - stats.mtimeMs;
-      
-      if (age > maxAgeMs) {
-        await fs.unlink(filePath);
-        deleted++;
-      }
-    } catch (err) {
-      errors++;
-    }
-  }
-  
-  return { deleted, errors };
-}
-
 export default {
   saveFile,
   generateFileUrl,
@@ -265,6 +235,5 @@ export default {
   resultExists,
   deleteResult,
   getResultSize,
-  listResults,
-  cleanupStorage
+  listResults
 };

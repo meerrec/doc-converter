@@ -14,7 +14,9 @@
     "test": "NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules jest --forceExit",
     "test:e2e": "E2E=1 npm run test",
     "lint": "echo 'Linter not configured yet'",
-    "health": "curl -s http://localhost:3000/health | jq"
+    "health": "curl -s http://localhost:3000/health | jq",
+    "build:contract": "pnpm --filter @doc-converter/contract build",
+    "build:web": "pnpm --filter doc-converter-web build"
   },
   "keywords": [
     "document-converter",
@@ -31,10 +33,8 @@
     "bullmq": "^5.1.0",
     "express": "^4.18.2",
     "ioredis": "^5.3.2",
-    "isolated-vm": "^7.0.1",
     "pino": "^8.17.2",
     "pino-http": "^8.6.1",
-    "uuid": "^9.0.0",
     "yauzl": "^2.10.0",
     "zod": "^4.6.5"
   },
@@ -47,9 +47,5 @@
   "engines": {
     "node": ">=24.0.0"
   },
-  "overrides": {
-    "isolated-vm": {
-      "node": ">=24.0.0"
-    }
-  }
+  "private": true
 }

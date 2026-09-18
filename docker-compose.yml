@@ -25,10 +25,10 @@
 #     "Minimum memoryswap limit should be larger than memory limit".
 #   - tmpfs учитывается в mem_limit (shmem в memory cgroup), т.е.
 #     /tmp:size=512m съедает до 512 МБ из лимита контейнера.
-#   - Потолок памяти родительского процесса складывается из ДВУХ разных
-#     движков (см. CLAUDE.md — это не дубли):
-#       fork-пул (sync, sandbox.js):  MAX_CONCURRENT x --max-old-space-size
-#       isolated-vm (async, wasm-isolate.js): ISOLATE_MEMORY_MB
+#   - Потолок памяти родительского процесса задаёт fork-пул: каждый форк
+#     получает свой --max-old-space-size, то есть MAX_CONCURRENT x 1536 МБ
+#     heap. Отдельного бюджета на изолят больше нет — от isolated-vm
+#     отказались, оба пути (sync и async) идут через fork-пул.
 #   - version: '3.8' убран намеренно: поле obsolete в Compose v2, а в схеме
 #     v3 mem_limit/memswap_limit МОЛЧА игнорируются при docker stack deploy.
 #     Для Swarm-деплоя нужен deploy.resources.limits.memory (не дублировать
@@ -81,7 +81,6 @@ services:
       # Fork Pool
       - FORK_POOL_SIZE=4
       - MAX_CONCURRENT=4
-      - ISOLATE_MEMORY_MB=512
 
       # BullMQ
       - BULLMQ_LOCK_DURATION=120000
@@ -188,7 +187,6 @@ services:
       # Fork Pool
       - FORK_POOL_SIZE=4
       - MAX_CONCURRENT=4
-      - ISOLATE_MEMORY_MB=512
 
       # BullMQ
       - BULLMQ_LOCK_DURATION=120000

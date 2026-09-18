@@ -38,20 +38,6 @@ import {
 // ===========================================================================
 
 /**
- * Неподдерживаемая опция
- */
-export class UnsupportedOptionError extends Error {
-  constructor(optionName, value) {
-    super(`Unsupported option: ${optionName}=${value}`);
-    this.name = 'UnsupportedOptionError';
-    this.optionName = optionName;
-    this.value = value;
-    this.statusCode = 400;
-    this.errorCode = 'unsupported_option';
-  }
-}
-
-/**
  * Некорректное значение опции
  */
 export class InvalidOptionValueError extends Error {
@@ -414,46 +400,6 @@ function mapFormatSpecificOptions(inputFormat, outputFormat, r7Options) {
 }
 
 // ===========================================================================
-// Валидация опций
-// ===========================================================================
-
-/**
- * Валидирует опции Р7-Офис
- * 
- * @param {object} r7Options - опции Р7-Офис
- * @returns {void}
- */
-export function validateR7Options(r7Options = {}) {
-  const {
-    codePage,
-    delimiter,
-    region,
-  } = r7Options;
-  
-  // codePage
-  if (codePage !== undefined && !SUPPORTED_CODE_PAGES.includes(codePage)) {
-    throw new InvalidOptionValueError('codePage', codePage, SUPPORTED_CODE_PAGES);
-  }
-  
-  // delimiter
-  if (delimiter !== undefined && !SUPPORTED_DELIMITERS.includes(delimiter)) {
-    throw new InvalidOptionValueError('delimiter', delimiter, SUPPORTED_DELIMITERS);
-  }
-  
-  // region
-  if (region !== undefined) {
-    const regionPattern = /^[a-zA-Z]{2}(-[a-zA-Z]{2})?$/;
-    if (!regionPattern.test(region)) {
-      throw new InvalidOptionValueError(
-        'region',
-        region,
-        ['ISO-like codes (xx or xx-YY)']
-      );
-    }
-  }
-}
-
-// ===========================================================================
 // Утилиты
 // ===========================================================================
 
@@ -492,7 +438,6 @@ export function mergeOptionsWithDefaults(
 
 export default {
   mapR7OptionsToLibreOffice,
-  validateR7Options,
   createDefaultOptions,
   mergeOptionsWithDefaults,
   // Маппинг отдельных опций
@@ -503,6 +448,5 @@ export default {
   mapSpreadsheetLayout,
   mapDocumentRenderer,
   // Ошибки
-  UnsupportedOptionError,
   InvalidOptionValueError,
 };

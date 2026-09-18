@@ -26,7 +26,7 @@ import type {
   TaskResult,
   TaskStatus,
   TaskStatusResponse,
-} from '../api/types';
+} from '@doc-converter/contract';
 
 /** Состояние задачи в интерфейсе. */
 export type QueueItemStatus =
