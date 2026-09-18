@@ -1,0 +1,294 @@
+# =============================================================================
+# docker-compose.yml для сервиса конвертации документов
+#
+# Архитектура:
+#   - API сервер (Express) на порту 3000
+#   - Worker процесс для асинхронной обработки
+#   - Valkey как брокер очереди и хранилище идемпотентности
+#
+# Сеть:
+#   - converter: внутренняя сеть (internal: true)
+#   - Нет доступа наружу для worker и valkey
+#
+# Безопасность:
+#   - Все контейнеры non-root
+#   - cap_drop: ALL
+#   - read_only: true
+#   - no-new-privileges: true
+#   - tmpfs для временных файлов
+#
+# Память:
+#   - memswap_limit == mem_limit => swap ВЫКЛЮЧЕН. Это осознанно: при
+#     нехватке памяти контейнер убивается OOM-killer'ом, а не деградирует
+#     в swap. Значения менять ТОЛЬКО парой — если mem_limit окажется
+#     больше memswap_limit, контейнер не стартует с ошибкой
+#     "Minimum memoryswap limit should be larger than memory limit".
+#   - tmpfs учитывается в mem_limit (shmem в memory cgroup), т.е.
+#     /tmp:size=512m съедает до 512 МБ из лимита контейнера.
+#   - Потолок памяти родительского процесса складывается из ДВУХ разных
+#     движков (см. CLAUDE.md — это не дубли):
+#       fork-пул (sync, sandbox.js):  MAX_CONCURRENT x --max-old-space-size
+#       isolated-vm (async, wasm-isolate.js): ISOLATE_MEMORY_MB
+#   - version: '3.8' убран намеренно: поле obsolete в Compose v2, а в схеме
+#     v3 mem_limit/memswap_limit МОЛЧА игнорируются при docker stack deploy.
+#     Для Swarm-деплоя нужен deploy.resources.limits.memory (не дублировать
+#     оба ключа в одном файле — какой из них победит, не документировано).
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # API Server
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: doc-converter-api
+    restart: unless-stopped
+    networks:
+      - converter
+    environment:
+      # Общие настройки
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+
+      # Valkey / Redis
+      - REDIS_HOST=valkey
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_CONNECTION_STRING=redis://valkey:6379/0
+
+      # Storage
+      - STORAGE_PATH=/data/storage
+
+      # WASM и конвертация
+      - SYNC_ENABLED=true
+
+      # Таймауты
+      - SYNC_TIMEOUT_MS=30000
+      - SYNC_QUEUE_WAIT_MS=5000
+      - REQUEST_BODY_TIMEOUT_MS=15000
+      - FETCH_TIMEOUT_MS=30000
+      - VALIDATION_TIMEOUT_MS=10000
+      - STORAGE_WRITE_TIMEOUT_MS=5000
+      - JOB_TIMEOUT_MS=60000
+
+      # Rate Limiting
+      - RATE_PER_SEC=5
+      - RATE_BURST=20
+
+      # Fork Pool
+      - FORK_POOL_SIZE=4
+      - MAX_CONCURRENT=4
+      - ISOLATE_MEMORY_MB=512
+
+      # BullMQ
+      - BULLMQ_LOCK_DURATION=120000
+      - BULLMQ_STALLED_INTERVAL=60000
+      - BULLMQ_MAX_STALLED_COUNT=1
+
+      # Логирование
+      - LOG_LEVEL=info
+      - AUDIT_LOG_PATH=/var/log/converter/audit.log
+
+      # Идемпотентность
+      - IDEMPOTENCY_TTL_SEC=3600
+
+      # Node.js опции
+      - NODE_OPTIONS=--disable-wasm-trap-handler --max-old-space-size=1536 --unhandled-rejections=strict
+    volumes:
+      - storage-data:/data/storage
+      - audit-log:/var/log/converter
+    ports:
+      - "3000:3000"
+    # Hardening
+    user: conv
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    # 3g — паритет с worker. api обслуживает sync-конвертацию через тот же
+    # fork-пул (routes/convert.js -> sandbox.js), и конфигурация пулов
+    # идентична: FORK_POOL_SIZE=4, MAX_CONCURRENT=4.
+    # mem_limit и memswap_limit держать равными (swap off, см. заголовок).
+    mem_limit: 3g
+    memswap_limit: 3g
+    cpus: "1.0"
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    depends_on:
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "/app/src/api/health-check.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # Web Interface
+  # ---------------------------------------------------------------------------
+  # nginx раздаёт собранный интерфейс и проксирует API на сервис api.
+  # Благодаря общему origin (порт 8080) CORS не нужен: у сервиса он
+  # включается только при NODE_ENV=development.
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+
+    restart: unless-stopped
+    networks:
+      - converter
+    ports:
+      # 8080, чтобы не конфликтовать с опубликованным портом API (3000)
+      - "8080:8080"
+    depends_on:
+      # Без условия service_healthy: healthcheck API сейчас всегда падает
+      # (health-check.js читает несуществующее поле), и условие
+      # заблокировало бы запуск интерфейса
+      - api
+
+  # ---------------------------------------------------------------------------
+  # Worker Process
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks:
+      - converter
+    environment:
+      # Общие настройки
+      - NODE_ENV=production
+
+      # Valkey / Redis
+      - REDIS_HOST=valkey
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_CONNECTION_STRING=redis://valkey:6379/0
+
+      # Storage
+      - STORAGE_PATH=/data/storage
+
+      # WASM и конвертация
+      - SYNC_ENABLED=false
+
+      # Таймауты
+      - JOB_TIMEOUT_MS=60000
+
+      # Fork Pool
+      - FORK_POOL_SIZE=4
+      - MAX_CONCURRENT=4
+      - ISOLATE_MEMORY_MB=512
+
+      # BullMQ
+      - BULLMQ_LOCK_DURATION=120000
+      - BULLMQ_STALLED_INTERVAL=60000
+      - BULLMQ_MAX_STALLED_COUNT=1
+
+      # Логирование
+      - LOG_LEVEL=info
+      - AUDIT_LOG_PATH=/var/log/converter/audit.log
+
+      # Node.js опции для worker
+      # --max-old-space-size=1536: лимит heap V8
+      # --disable-wasm-trap-handler: совместимость с mem_limit
+      - NODE_OPTIONS=--disable-wasm-trap-handler --max-old-space-size=1536 --unhandled-rejections=strict
+    volumes:
+      - storage-data:/data/storage
+      - audit-log:/var/log/converter
+    # Hardening
+    user: conv
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    # ВНИМАНИЕ: fork-pool.js задаёт КАЖДОМУ форку --max-old-space-size=1536,
+    # поэтому 4 одновременные конвертации (MAX_CONCURRENT=4) в теории требуют
+    # ~6 ГБ heap. 3g покрывает ~2 тяжёлые задачи разом; при насыщении пула
+    # сработает OOM-killer. Это осознанный backstop (fork-pool.js: "Ограничение
+    # по памяти будет через Docker cgroups"), но при разборе OOM в первую
+    # очередь смотреть на MAX_CONCURRENT, а не на mem_limit.
+    # mem_limit и memswap_limit держать равными (swap off, см. заголовок).
+    mem_limit: 3g
+    memswap_limit: 3g
+    cpus: "2.0"
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    depends_on:
+      valkey:
+        condition: service_healthy
+    # Worker запускает отдельный процесс
+    command: ["node", "/app/src/worker/index.js"]
+
+  # ---------------------------------------------------------------------------
+  # Valkey (Redis-compatible)
+  # ---------------------------------------------------------------------------
+  valkey:
+    image: valkey/valkey:8.1
+    restart: unless-stopped
+    networks:
+      - converter
+    volumes:
+      - valkey-data:/data
+    command: ["valkey-server", "--appendonly", "yes", "--protected-mode", "no"]
+    # Valkey требует дополнительных capabilities для сохранения данных
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    read_only: false
+    tmpfs:
+      - /tmp:size=100m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    # 512m при appendonly yes: перезапись AOF форкается, и COW-страницы
+    # прибавляются к этому же лимиту, внутри которого уже лежит tmpfs на 100m.
+    # mem_limit и memswap_limit держать равными (swap off, см. заголовок).
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: "0.5"
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  converter:
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  valkey-data:
+    name: doc-converter-valkey-data
+  storage-data:
+    name: doc-converter-storage-data
+  audit-log:
+    name: doc-converter-audit-log
