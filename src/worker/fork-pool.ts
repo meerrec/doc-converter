@@ -193,6 +193,101 @@ function getAvailableFork(): PoolItem {
 }
 
 /**
+ * Заменяет процесс в пуле новым.
+ *
+ * Нужна для аварийных случаев: убитый или упавший процесс в пул больше
+ * не годится. `cleanup` к этому моменту уже пометил его свободным
+ * (`busy = false`), поэтому без замены следующая задача отправила бы задание
+ * в мёртвый процесс и провисела бы до собственного таймаута — под нагрузкой
+ * один таймаут тянул за собой серию неудачных задач.
+ *
+ * @param item - элемент пула, требующий замены
+ */
+function replaceFork(item: PoolItem): void {
+  const index = pool.indexOf(item);
+
+  if (index === -1) {
+    return;
+  }
+
+  pool[index] = {
+    child: createFork(),
+    busy: false,
+    lastUsed: Date.now()
+  };
+}
+
+/**
+ * Прогревает процессы пула — по одному, последовательно.
+ *
+ * Инициализация конвертера внутри процесса читает WASM-ассеты и сканирует
+ * шрифты. Замерено: если несколько процессов делают это одновременно, они
+ * конкурируют за CPU и не укладываются в `JOB_TIMEOUT_MS` — задачи падают с
+ * `conversion_timeout` (две параллельные конвертации занимали ~79 с против
+ * ~2 с у прогретого процесса). Последовательный прогрев снимает конкуренцию,
+ * а задачи в прогретом процессе занимают миллисекунды.
+ *
+ * Вызывается воркером при старте. Неудача прогрева не критична: конвертер
+ * тогда создастся лениво, на первой задаче.
+ */
+export async function warmupPool(): Promise<void> {
+  ensurePool();
+
+  for (const item of pool) {
+    await warmupFork(item);
+  }
+}
+
+/**
+ * Прогревает один процесс, дожидаясь ответа либо таймаута задачи.
+ *
+ * @param item - элемент пула
+ */
+function warmupFork(item: PoolItem): Promise<void> {
+  return new Promise((resolve) => {
+    const child = item.child;
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+
+    const finish = (): void => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timer);
+      child.off('message', onMessage);
+      child.off('exit', finish);
+      resolve();
+    };
+
+    const onMessage = (message: unknown): void => {
+      if (!isForkWorkerMessage(message)) {
+        return;
+      }
+
+      if (message.type === 'warmup-done' || message.error) {
+        finish();
+      }
+    };
+
+    // Процесс мог не пережить прогрев: без таймаута старт воркера завис бы
+    timer = setTimeout(finish, JOB_TIMEOUT_MS);
+    timer.unref();
+
+    child.on('message', onMessage);
+    child.on('exit', finish);
+
+    try {
+      child.send({ type: 'warmup' });
+    } catch {
+      // Процесс уже завершился — пул заменит его при следующей задаче
+      finish();
+    }
+  });
+}
+
+/**
  * Выполняет задачу через пул.
  *
  * @param task - данные задачи
@@ -276,6 +371,9 @@ export async function runTask(
       }
 
       if (code !== 0) {
+        // Процесс умер сам (например, его убил OOM-killer контейнера) —
+        // в пул он не возвращается
+        replaceFork(forkItem);
         completeError(new Error(`Process exited with code ${code}`));
       }
     };
@@ -291,6 +389,11 @@ export async function runTask(
       } catch (err) {
         console.error('[fork-pool] Ошибка SIGKILL:', err);
       }
+
+      // Убитый процесс заменяется новым: cleanup уже пометил его свободным,
+      // и без замены следующая задача ушла бы в мёртвый процесс
+      replaceFork(forkItem);
+
       reject(new Error('conversion_timeout'));
     }, timeout);
 

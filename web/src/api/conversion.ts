@@ -8,7 +8,8 @@
  */
 
 import { request, UPLOAD_TIMEOUT_MS } from './client';
-import { STATUS_BATCH_SIZE } from '../config';
+import { STATUS_BATCH_SIZE, STATUS_CONCURRENCY } from '../config';
+import { createLimiter } from '../lib/limiter';
 import type {
   ConversionAcceptedResponse,
   ConversionOptions,
@@ -100,6 +101,16 @@ export async function submitConversion(
 }
 
 /**
+ * Ограничитель одновременных запросов статусов.
+ *
+ * Отдельный от лимитера отправки: пауза между стартами здесь не нужна —
+ * опрос идёт по расписанию поллера, — а нужно лишь не выпускать все порции
+ * разом. `clear()` у него не вызывается: лимитер живёт столько же, сколько
+ * приложение, и отмена опроса идёт через сигнал запроса.
+ */
+const statusLimiter = createLimiter(STATUS_CONCURRENCY, 0);
+
+/**
  * Запрашивает статусы задач одной пачкой.
  *
  * Один запрос на всю пачку вместо запроса на задачу: каждый HTTP-запрос
@@ -126,17 +137,15 @@ export async function fetchStatuses(
 
   // Пачки независимы, поэтому уходят параллельно: последовательный обход
   // давал водопад — вторая пачка стартовала только после ответа на первую.
-  //
-  // Всплеск при этом ограничен. Сервер держит ведро на RATE_BURST запросов
-  // с пополнением RATE_PER_SEC в секунду; отправка файлов занимает около
-  // 2,5 запроса в секунду. Опрос статусов тратит один запрос на каждые
-  // STATUS_BATCH_SIZE задач за тик, поэтому в бюджет он начинает упираться
-  // лишь при сотнях одновременно активных задач
+  // Параллелизм ограничен лимитером: без него тысяча активных задач
+  // выпускала бы 25 одновременных запросов и упиралась в 429
   const responses = await Promise.all(
     chunks.map((chunk) => {
       const query = chunk.map((id) => `taskIds=${encodeURIComponent(id)}`).join('&');
 
-      return request<BatchStatusResponse>(`/status?${query}`, { signal });
+      return statusLimiter.run(() =>
+        request<BatchStatusResponse>(`/status?${query}`, { signal })
+      );
     })
   );
 

@@ -161,7 +161,11 @@ describe('Защита маршрута результатов', () => {
   });
 
   it('не отдаёт файл со слишком длинным идентификатором задачи', async () => {
-    const longTaskId = 'a'.repeat(65);
+    // 129 символов — на один больше, чем допускает KEY_PATTERN контракта
+    // (и MAX_TASK_ID_LENGTH в security/limits.ts). Границей было 64, но это
+    // расхождение с контрактом: ключ длиной 65–128 проходил валидацию схемы
+    // и падал с 500 уже в reserveTaskId
+    const longTaskId = 'a'.repeat(129);
     const response = await request(app).get(`/results/${longTaskId}.pdf`);
 
     expect(response.status).toBe(400);

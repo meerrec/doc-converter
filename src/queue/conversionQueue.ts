@@ -23,11 +23,13 @@
  * - Для очистки нужно использовать cleanup функции
  */
 
-import { getRedisClient } from './connection.js';
+import { createQueueRedisClient } from './connection.js';
 import {
   JOB_TIMEOUT_MS,
-  IDEMPOTENCY_TTL_SEC,
+  FAILED_JOB_TTL_SEC,
+  MAX_FAILED_JOBS,
 } from '../config/index.js';
+import type { Redis } from 'ioredis';
 import type {
   DefaultJobOptions,
   JobsOptions,
@@ -73,6 +75,14 @@ const QUEUE_NAME = 'conversion';
 let conversionQueue: Queue | null = null;
 
 /**
+ * Соединение очереди.
+
+ * Отдельное от клиента приложения: запись задачи не должна делить TCP-сессию
+ * с чтениями статусов, которые обслуживают запросы клиентов.
+ */
+let queueConnection: Redis | null = null;
+
+/**
  * Опции, передаваемые в конструктор очереди.
  *
  * В типах BullMQ часть полей описана только у Worker, а `timeout` остался
@@ -93,20 +103,28 @@ interface ConversionQueueOptions extends QueueOptions {
 export async function getConversionQueue(): Promise<Queue> {
   if (!conversionQueue) {
     const { Queue } = await loadBullmq();
-    const redis = await getRedisClient();
+
+    queueConnection = createQueueRedisClient();
 
     const queueOptions: ConversionQueueOptions = {
-      connection: redis,
+      connection: queueConnection,
       // Настройки BullMQ
       lockDuration: JOB_TIMEOUT_MS * 2,
       stalledInterval: JOB_TIMEOUT_MS,
       maxStalledCount: 1,
       // Настройки по умолчанию для задач
       defaultJobOptions: {
+        // Ретраев нет осознанно: ошибки конвертации детерминированы (битый
+        // документ, таймаут WASM), и повтор лишь сжигает ещё 60 с CPU.
+        // `backoff` здесь стоял раньше, но при attempts: 1 не используется
+        // никогда — мёртвая настройка
         attempts: 1,
-        backoff: { type: 'exponential', delay: 1000 },
         removeOnComplete: true,
-        removeOnFail: false,
+        // Упавшая задача нужна для диагностики, но не вечно: раньше здесь было
+        // `false`, и задачи с payload'ом копились без ограничения — при 512 МБ
+        // у Valkey это заканчивалось OOM-kill. age покрывает рабочий день,
+        // count ограничивает память независимо от возраста
+        removeOnFail: { age: FAILED_JOB_TTL_SEC, count: MAX_FAILED_JOBS },
         timeout: JOB_TIMEOUT_MS
       },
     };
@@ -130,6 +148,13 @@ export async function resetConversionQueue(): Promise<void> {
     await conversionQueue.close();
     conversionQueue = null;
   }
+
+  // Соединение очереди закрывается отдельно: BullMQ не закрывает клиент,
+  // переданный ему готовым экземпляром
+  if (queueConnection) {
+    queueConnection.disconnect();
+    queueConnection = null;
+  }
 }
 
 // ===========================================================================
@@ -138,10 +163,18 @@ export async function resetConversionQueue(): Promise<void> {
 
 /**
  * Данные задачи конвертации.
+ *
+ * Содержимое файла передаётся путём на общем томе (`inputPath`), а не телом
+ * задачи: base64 в Redis занимал до 133 МБ на задачу. Поле `inputBuffer`
+ * остаётся для задач, поставленных в очередь до обновления, — при
+ * rolling-деплое они обязаны доработать.
  */
 interface ConversionJobData {
   taskId: string;
-  inputBuffer: string;
+  inputPath?: string;
+  inputSize?: number;
+  /** Устаревшее поле: содержимое файла в base64. */
+  inputBuffer?: string;
   inputFormat: string;
   outputFormat: string;
   options?: object;
@@ -153,7 +186,8 @@ interface ConversionJobData {
  *
  * @param jobData - данные задачи
  * @param jobData.taskId - уникальный идентификатор
- * @param jobData.inputBuffer - содержимое файла в base64
+ * @param jobData.inputPath - путь к входному файлу на общем томе
+ * @param jobData.inputSize - размер входного файла в байтах
  * @param jobData.inputFormat - формат входного файла
  * @param jobData.outputFormat - формат выходного файла
  * @param jobData.options - опции конвертации
@@ -162,19 +196,15 @@ interface ConversionJobData {
  * @param options.ttl - время жизни в секундах (по умолчанию IDEMPOTENCY_TTL_SEC)
  */
 export async function addConversionJob(
-  jobData: ConversionJobData,
-  options: { ttl?: number } = {}
+  jobData: ConversionJobData
 ): Promise<{ taskId: string; queued: boolean }> {
-  const ttl = options.ttl ?? IDEMPOTENCY_TTL_SEC;
   const queue = await getConversionQueue();
 
-  // `ttl` остался от Bull — BullMQ его не читает, и в типах библиотеки
-  // такого поля нет: тип расширен здесь, чтобы значение сохранилось
-  // без приведения типов
-  const jobOptions: JobsOptions & { ttl: number } = {
+  // Время жизни задачи задаётся не здесь, а в defaultJobOptions
+  // (removeOnComplete / removeOnFail): поле `ttl` осталось от Bull, BullMQ
+  // его не читает вовсе
+  const jobOptions: JobsOptions = {
     jobId: jobData.taskId,
-    // TTL для задачи
-    ttl: ttl * 1000,
   };
 
   await queue.add(QUEUE_NAME, jobData, jobOptions);
@@ -237,26 +267,6 @@ export async function getJobInfo(taskId: string): Promise<JobInfo | null> {
   }
 }
 
-/**
- * Получает статус задачи
- *
- * @param taskId - идентификатор задачи
- */
-export async function getJobStatus(taskId: string): Promise<string | null> {
-  const info = await getJobInfo(taskId);
-  return info?.state || null;
-}
-
-/**
- * Получает прогресс задачи
- *
- * @param taskId - идентификатор задачи
- */
-export async function getJobProgress(taskId: string): Promise<JobProgress> {
-  const info = await getJobInfo(taskId);
-  return info?.progress || 0;
-}
-
 // ===========================================================================
 // Статистика очереди
 // ===========================================================================
@@ -274,57 +284,24 @@ export async function getQueueStats(): Promise<{
 }> {
   const queue = await getConversionQueue();
 
-  const [counts, completed, failed, delayed, active, waiting] = await Promise.all([
-    queue.getJobCounts(),
-    queue.getCompleted(),
-    queue.getFailed(),
-    queue.getDelayed(),
-    queue.getActive(),
-    queue.getWaiting(),
-  ]);
+  // Только getJobCounts: getCompleted(), getFailed() и родственные им делают
+  // LRANGE 0 -1 и читают каждую задачу целиком вместе с её данными
+  const counts = await queue.getJobCounts(
+    'completed',
+    'failed',
+    'delayed',
+    'active',
+    'waiting'
+  );
 
   return {
     counts,
-    completedCount: completed.length,
-    failedCount: failed.length,
-    delayedCount: delayed.length,
-    activeCount: active.length,
-    waitingCount: waiting.length,
+    completedCount: counts.completed ?? 0,
+    failedCount: counts.failed ?? 0,
+    delayedCount: counts.delayed ?? 0,
+    activeCount: counts.active ?? 0,
+    waitingCount: counts.waiting ?? 0,
   };
-}
-
-// ===========================================================================
-// Утилиты
-// ===========================================================================
-
-/**
- * Проверяет, существует ли задача
- *
- * @param taskId - идентификатор задачи
- */
-export async function jobExists(taskId: string): Promise<boolean> {
-  const info = await getJobInfo(taskId);
-  return info !== null;
-}
-
-/**
- * Удаляет задачу
- *
- * @param taskId - идентификатор задачи
- */
-export async function removeJob(taskId: string): Promise<boolean> {
-  const queue = await getConversionQueue();
-
-  try {
-    const job = await queue.getJob(taskId);
-    if (job) {
-      await job.remove();
-      return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
 }
 
 export default {
@@ -332,10 +309,6 @@ export default {
   resetConversionQueue,
   addConversionJob,
   getJobInfo,
-  getJobStatus,
-  getJobProgress,
   getQueueStats,
-  jobExists,
-  removeJob,
   QUEUE_NAME,
 };

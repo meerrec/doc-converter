@@ -252,13 +252,20 @@ curl http://localhost:3000/health
 | `415` | `magic_mismatch`, `magic_buffer_empty`, `magic_type_missing`, `magic_unsupported_type`, `magic_buffer_too_small` | Содержимое не соответствует объявленному `filetype` |
 | `422` | `archive_forbidden_name`, `archive_ratio_exceeded`, `archive_too_many_entries`, `archive_too_deep`, `archive_duplicate_entry`, `archive_forbidden_extension`, `archive_entry_too_large`, `archive_total_too_large`, `archive_empty`, `archive_corrupt`, `content_validation_failed` | Архив не прошёл проверку |
 | `429` | `rate_limited` | Превышен лимит запросов с одного IP |
+| `503` | `storage_unavailable` | Хранилище состояния недоступно: Valkey не отвечает или упёрся в `maxmemory`, либо недоступен каталог входных файлов. Ответ несёт `Retry-After` |
 | `500` | `conversion_failed`, `internal`, `job_processing_failed`, `output_too_small` | Сбой конвертации |
 | `501` | `sync_disabled` | `async: false` при выключенном синхронном режиме |
 | `504` | `sync_timeout` | Синхронный запрос не уложился в бюджет времени |
 | `408` | `body_timeout` | Тело запроса не пришло за `REQUEST_BODY_TIMEOUT_MS` (на практике не срабатывает — см. ограничения). Статус отдаёт фильтр ошибок для исключений Nest с кодом 408 |
 
-Отдельно у `/status` свои коды: `invalid_request` (400, не передан `taskIds`),
-`task_not_found` (404), `status_check_failed` (500), `batch_status_check_failed` (500).
+Отдельно у `/status` свои коды: `invalid_request` (400 — не передан `taskIds` либо
+идентификаторов больше `MAX_STATUS_BATCH_IDS`), `task_not_found` (404),
+`status_check_failed` (500).
+
+Пакетный ответ деградирует по задачам, а не по запросу: если Valkey недоступен,
+каждая задача получает `status: "error"`, а сам запрос остаётся `200` — иначе клиент
+не отличил бы недоступность хранилища от ошибки собственного запроса. Неизвестный
+идентификатор даёт `status: "not_found"`.
 
 ### Ограничение частоты
 

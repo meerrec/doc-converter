@@ -15,9 +15,24 @@
  */
 
 import { createRequire } from 'node:module';
-import { checkRedisHealth } from '../../queue/connection.js';
+import { checkRedisHealth, closeRedisClient } from '../../queue/connection.js';
 
 const require = createRequire(import.meta.url);
+
+/**
+ * Завершает процесс, закрывая соединение с Valkey.
+ *
+ * Проверка запускается каждые 30 секунд отдельным процессом, поэтому
+ * `process.exit` без закрытия оставлял бы соединение на стороне Valkey
+ * до истечения TCP-таймаутов — при нескольких репликах это копящиеся
+ * сессии от каждого healthcheck'а.
+ *
+ * @param code - код завершения
+ */
+async function exitWith(code: number): Promise<never> {
+  await closeRedisClient();
+  process.exit(code);
+}
 
 /**
  * Выполняет проверки и завершает процесс соответствующим кодом.
@@ -30,7 +45,7 @@ async function runHealthCheck(): Promise<void> {
 
     if (!redisHealth.healthy) {
       console.error('Redis connection failed:', redisHealth.error);
-      process.exit(1);
+      await exitWith(1);
     }
 
     // Проверяем, что пакет конвертера и его WASM-ассеты на месте
@@ -38,14 +53,14 @@ async function runHealthCheck(): Promise<void> {
       require.resolve('@matbee/libreoffice-converter/package.json');
     } catch {
       console.error('Конвертер недоступен: пакет @matbee/libreoffice-converter не найден');
-      process.exit(1);
+      await exitWith(1);
     }
 
     console.log('Health check passed');
-    process.exit(0);
+    await exitWith(0);
   } catch (err) {
     console.error('Health check failed:', (err as Error).message);
-    process.exit(1);
+    await exitWith(1);
   }
 }
 

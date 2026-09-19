@@ -16,13 +16,16 @@ import type { RequestHandler } from 'express';
 import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { Logger, type INestApplication } from '@nestjs/common';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import type { Server } from 'node:http';
 import type { Express } from 'express';
 import { AppModule } from './app.module.js';
 import { R7ExceptionFilter } from './common/r7-exception.filter.js';
 import { requestIdMiddleware, type RequestWithId } from './common/request-id.middleware.js';
 import { PinoLoggerService, createLogger } from './common/logger.js';
-import { resolvePort } from './config/env.js';
+import { resolvePort, resolveTrustProxy } from './config/env.js';
+import { closeRedisClient } from '../queue/connection.js';
+import { resetConversionQueue } from '../queue/conversionQueue.js';
 import {
   BODY_LIMIT_BYTES,
   applyCors,
@@ -59,7 +62,9 @@ export interface CreatedServer {
  * @returns инициализированное приложение
  */
 export async function createApp(): Promise<INestApplication> {
-  const app = await NestFactory.create(AppModule, {
+  // Тип именно NestExpressApplication: настройка `trust proxy` живёт
+  // в Express-адаптере, и в базовом INestApplication метода `set` нет
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     // Логи буферизуются до применения логгера, иначе старт пишется в stdout
     // в обход настроенного уровня
     bufferLogs: true,
@@ -88,6 +93,14 @@ export async function createApp(): Promise<INestApplication> {
       logger,
       genReqId: (req: RequestWithId) => req.requestId ?? '',
     })
+  );
+
+  // Доверие заголовкам прокси. Без этого `req.ip` за nginx — адрес контейнера
+  // nginx, и ограничитель частоты считает всех клиентов одним: общее ведро
+  // на RATE_BURST запросов вместо ведра на каждого
+  app.set(
+    'trust proxy',
+    resolveTrustProxy(config.get<string>('TRUST_PROXY') ?? 'false')
   );
 
   applySecurityHeaders(app, nodeEnv === 'production');
@@ -142,10 +155,17 @@ export async function startServer(): Promise<Server> {
     logger.log(`Получен ${signal}, остановка…`);
 
     server.close(() => {
-      void nest.close().then(() => {
+      void (async () => {
+        // Очередь и соединение с Valkey закрываются явно: оборванное вместе
+        // с процессом соединение оставляет на стороне Valkey висящие
+        // блокировки задач и незакрытые клиентские сессии
+        await resetConversionQueue();
+        await closeRedisClient();
+        await nest.close();
+
         logger.log('Сервер остановлен');
         process.exit(0);
-      });
+      })();
     });
   };
 

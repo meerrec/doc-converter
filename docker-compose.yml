@@ -60,7 +60,13 @@ services:
       - REDIS_CONNECTION_STRING=redis://valkey:6379/0
 
       # Storage
+      # Том монтируется в /data целиком, а каталоги разделены: результаты —
+      # /data/storage, входные файлы очереди — /data/incoming. Разделение
+      # обязательно: имена результатов собираются как {taskId}.{ext}, где
+      # taskId — клиентский `key`, поэтому входной документ в общем каталоге
+      # стал бы доступен по GET /results/{key}.{ext}
       - STORAGE_PATH=/data/storage
+      - INPUT_STORAGE_PATH=/data/incoming
 
       # WASM и конвертация
       - SYNC_ENABLED=true
@@ -77,10 +83,16 @@ services:
       # Rate Limiting
       - RATE_PER_SEC=5
       - RATE_BURST=20
+      # Перед api ровно один прокси (nginx) — доверяем его заголовку
+      # X-Forwarded-For. Без этого req.ip у всех клиентов равен адресу
+      # контейнера nginx, и все они делят одно ведро ограничителя частоты
+      - TRUST_PROXY=1
 
-      # Fork Pool
-      - FORK_POOL_SIZE=4
-      - MAX_CONCURRENT=4
+      # Fork Pool.
+      # 2 — предел по памяти: библиотека конвертера 2.x держит ~1.16 ГБ на
+      # процесс, а контейнеру отведено 3 ГБ (см. mem_limit ниже)
+      - FORK_POOL_SIZE=2
+      - MAX_CONCURRENT=2
 
       # BullMQ
       - BULLMQ_LOCK_DURATION=120000
@@ -97,10 +109,14 @@ services:
       # Node.js опции
       - NODE_OPTIONS=--disable-wasm-trap-handler --max-old-space-size=1536 --unhandled-rejections=strict
     volumes:
-      - storage-data:/data/storage
+      # Том общий с worker: через него передаётся входной файл очереди
+      - storage-data:/data
       - audit-log:/var/log/converter
     ports:
-      - "3000:3000"
+      # Только на loopback: при TRUST_PROXY=1 клиент, дотянувшийся до порта
+      # напрямую, подставил бы в X-Forwarded-For чужой адрес и обошёл
+      # ограничитель частоты. Наружу API отдаёт nginx (сервис web)
+      - "127.0.0.1:3000:3000"
     # Hardening
     user: conv
     read_only: true
@@ -113,11 +129,15 @@ services:
     pids_limit: 256
     # 3g — паритет с worker. api обслуживает sync-конвертацию через тот же
     # fork-пул (http/convert.controller.ts -> sandbox.js), и конфигурация пулов
-    # идентична: FORK_POOL_SIZE=4, MAX_CONCURRENT=4.
+    # идентична: FORK_POOL_SIZE=2, MAX_CONCURRENT=2 — по ~1.16 ГБ на процесс.
     # mem_limit и memswap_limit держать равными (swap off, см. заголовок).
     mem_limit: 3g
     memswap_limit: 3g
-    cpus: "1.0"
+    # 2.0 — паритет с worker. При одном ядре синхронная конвертация не
+    # укладывается в SYNC_TIMEOUT_MS: инициализация WASM (чтение ассетов и
+    # сканирование шрифтов) на одном ядре занимает больше 30 с, и запрос
+    # падает с sync_timeout. Проверено: с 2.0 тот же запрос проходит за 3 с
+    cpus: "2.0"
     ulimits:
       nofile:
         soft: 4096
@@ -177,6 +197,7 @@ services:
 
       # Storage
       - STORAGE_PATH=/data/storage
+      - INPUT_STORAGE_PATH=/data/incoming
 
       # WASM и конвертация
       - SYNC_ENABLED=false
@@ -184,9 +205,11 @@ services:
       # Таймауты
       - JOB_TIMEOUT_MS=60000
 
-      # Fork Pool
-      - FORK_POOL_SIZE=4
-      - MAX_CONCURRENT=4
+      # Fork Pool.
+      # 2 — предел по памяти: библиотека конвертера 2.x держит ~1.16 ГБ на
+      # процесс, а контейнеру отведено 3 ГБ (см. mem_limit ниже)
+      - FORK_POOL_SIZE=2
+      - MAX_CONCURRENT=2
 
       # BullMQ
       - BULLMQ_LOCK_DURATION=120000
@@ -202,7 +225,8 @@ services:
       # --disable-wasm-trap-handler: совместимость с mem_limit
       - NODE_OPTIONS=--disable-wasm-trap-handler --max-old-space-size=1536 --unhandled-rejections=strict
     volumes:
-      - storage-data:/data/storage
+      # Тот же том, что у api: воркер читает входной файл по пути из задачи
+      - storage-data:/data
       - audit-log:/var/log/converter
     # Hardening
     user: conv
@@ -215,11 +239,12 @@ services:
       - no-new-privileges:true
     pids_limit: 512
     # ВНИМАНИЕ: fork-pool.js задаёт КАЖДОМУ форку --max-old-space-size=1536,
-    # поэтому 4 одновременные конвертации (MAX_CONCURRENT=4) в теории требуют
-    # ~6 ГБ heap. 3g покрывает ~2 тяжёлые задачи разом; при насыщении пула
-    # сработает OOM-killer. Это осознанный backstop (fork-pool.js: "Ограничение
-    # по памяти будет через Docker cgroups"), но при разборе OOM в первую
-    # очередь смотреть на MAX_CONCURRENT, а не на mem_limit.
+    # а библиотека конвертера 2.x добавляет к этому ~1.16 ГБ RSS на процесс
+    # (замерено). 3g покрывает 2 одновременные задачи (MAX_CONCURRENT=2);
+    # при насыщении пула сработает OOM-killer. Это осознанный backstop
+    # (fork-pool.js: "Ограничение по памяти будет через Docker cgroups"),
+    # но при разборе OOM в первую очередь смотреть на MAX_CONCURRENT,
+    # а не на mem_limit.
     # mem_limit и memswap_limit держать равными (swap off, см. заголовок).
     mem_limit: 3g
     memswap_limit: 3g
@@ -233,6 +258,11 @@ services:
         condition: service_healthy
     # Worker запускает отдельный процесс (собранный: исходники на TypeScript)
     command: ["node", "/app/dist/worker/index.js"]
+    # HEALTHCHECK из образа воркеру не нужен: он проверяет доступность Valkey,
+    # но запускается отдельным процессом, который каждые 30 секунд поднимает
+    # новое соединение. Доступность Valkey и так видна по самому воркеру
+    healthcheck:
+      disable: true
 
   # ---------------------------------------------------------------------------
   # Valkey (Redis-compatible)
@@ -244,7 +274,19 @@ services:
       - converter
     volumes:
       - valkey-data:/data
-    command: ["valkey-server", "--appendonly", "yes", "--protected-mode", "no"]
+    # maxmemory 400mb при mem_limit 512m: запас на фрагментацию и COW-страницы
+    # перезаписи AOF (см. обоснование лимита памяти ниже).
+    # Политика именно noeviction, а не allkeys-lru: вытеснение ключей BullMQ —
+    # это молчаливая потеря задач. С noeviction Valkey вернёт ошибку на запись,
+    # и API отдаст 503 — видимая деградация вместо OOM-kill, уносящего очередь.
+    #
+    # maxmemory-clients 64mb — страховка от одного жадного читателя: без неё
+    # клиент, запросивший разом много ключей, выедает память в обход maxmemory
+    # (буферы ответов в этот счёт не входят). --save "" отключает RDB-снимки:
+    # при включённом AOF они дублируют форк и его COW-страницы.
+    command: ["valkey-server", "--appendonly", "yes", "--protected-mode", "no",
+              "--maxmemory", "400mb", "--maxmemory-policy", "noeviction",
+              "--maxmemory-clients", "64mb", "--save", ""]
     # Valkey требует дополнительных capabilities для сохранения данных
     cap_add:
       - CHOWN

@@ -5,11 +5,15 @@
  * на всю пачку вместо запроса на задачу. Ответы повторяют прежние дословно —
  * интерфейс сопоставляет статусы по `taskId` и разбирает поля `result`,
  * `error` и `queued`.
+ *
+ * Пачка читается одной командой MGET на весь запрос: опрос статусов — самый
+ * частый запрос к Valkey, и раньше он обходился в четыре команды на задачу.
  */
 
 import { Controller, Get, Param, Query, Req, Res } from '@nestjs/common';
 import type { Response } from 'express';
-import { getTaskInfo } from '../../queue/idempotency.js';
+import { getTaskInfo, getTasksInfo, type TaskInfo } from '../../queue/idempotency.js';
+import { MAX_STATUS_BATCH_IDS } from '../../config/index.js';
 import { getJobInfo } from '../../queue/conversionQueue.js';
 import { logRejection } from '../common/audit-log.js';
 import type { RequestWithId } from '../common/request-id.middleware.js';
@@ -145,14 +149,33 @@ export class StatusController {
     // расширение контракта (400 отдаётся только при отсутствии параметра).
     const ids = Array.isArray(taskIds) ? taskIds : [taskIds];
 
+    // Потолок на размер пачки: она превращается в один MGET на 2×N ключей,
+    // и без ограничения один запрос забирал бы несоразмерно много ресурсов
+    // Valkey при том, что лимит частоты считает запросы, а не идентификаторы
+    if (ids.length > MAX_STATUS_BATCH_IDS) {
+      res.status(400).json({
+        error: 'invalid_request',
+        message: `Слишком много идентификаторов: не более ${MAX_STATUS_BATCH_IDS} за запрос`,
+      });
+      return;
+    }
+
     try {
-      const tasks = await Promise.all(ids.map((id) => this.describe(id)));
+      // Одна команда на всю пачку; состояние каждой задачи уже прочитано
+      const infos = await getTasksInfo(ids);
+
+      const tasks = await Promise.all(
+        infos.map((info, index) => this.describe(ids[index] as string, info))
+      );
 
       res.json({ tasks });
-    } catch (error) {
-      res.status(500).json({
-        error: 'batch_status_check_failed',
-        message: (error as { message?: string }).message ?? 'Batch status check failed',
+    } catch {
+      // Valkey недоступен. Раньше каждая задача деградировала по отдельности,
+      // и запрос оставался успешным — поведение сохранено: иначе один обрыв
+      // связи превращал бы опрос пачки в 500, а клиент не отличал бы
+      // недоступность хранилища от собственной ошибки запроса
+      res.json({
+        tasks: ids.map((taskId) => ({ taskId, status: 'error' })),
       });
     }
   }
@@ -161,21 +184,45 @@ export class StatusController {
    * Собирает описание одной задачи для пакетного ответа.
    *
    * @param taskId - идентификатор задачи
+   * @param taskInfo - состояние из Valkey (null, если задачи там нет)
    * @returns описание задачи
    */
-  private async describe(taskId: string): Promise<Record<string, unknown>> {
+  private async describe(
+    taskId: string,
+    taskInfo: TaskInfo | null
+  ): Promise<Record<string, unknown>> {
     try {
-      const taskInfo = await getTaskInfo(taskId);
-
       if (taskInfo) {
-        return {
+        const status = taskInfo.status;
+        const result = taskInfo.result as
+          | { error?: string; errorCode?: string }
+          | null;
+
+        const payload: Record<string, unknown> = {
           taskId,
-          status: taskInfo.status,
-          progress: taskInfo.status === 'completed' ? 100 : 50,
-          result: taskInfo.result,
+          status,
+          progress: status === 'completed' ? 100 : status === 'processing' ? 50 : 0,
         };
+
+        // Поле `result` сохраняется как было: интерфейс читает из него fileUrl.
+        // Ошибка дополнительно раскрывается в `error` — раньше в пакетном
+        // ответе его не было, и текст ошибки до интерфейса не доходил
+        if (result) {
+          payload.result = result;
+
+          if (status === 'failed' || result.error) {
+            payload.error = {
+              code: result.errorCode || 'conversion_failed',
+              message: result.error || 'Unknown error',
+            };
+          }
+        }
+
+        return payload;
       }
 
+      // В Valkey задачи нет: она могла не дойти до очереди либо её состояние
+      // уже истекло. BullMQ — единственный оставшийся источник сведений
       const jobInfo = await getJobInfo(taskId);
 
       if (jobInfo) {

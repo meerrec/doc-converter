@@ -5,6 +5,7 @@
  * NOTE: All comments in Russian as per project requirements.
  */
 
+import path from 'node:path';
 import { createRequire } from 'node:module';
 
 // Версия берётся из package.json — см. обоснование у CONVERTER_VERSION ниже
@@ -91,15 +92,20 @@ export const MIN_OUTPUT_BYTES = Number(process.env.MIN_OUTPUT_BYTES || 32);
 
 /**
  * Максимальное количество одновременных задач конвертации на один процесс воркера.
- * Обоснование: 4 — эмпирически оптимально для Node.js с WASM (~240 МБ на задачу).
+ *
+ * Обоснование: 2 — предел по памяти. Библиотека конвертера 2.x держит на
+ * процесс около 1.16 ГБ (замерено по RSS: распакованные WASM-ассеты вместо
+ * сжатых `.gz` в 1.x, где хватало ~240 МБ). Контейнеру воркера отведено 3 ГБ
+ * (`mem_limit` в compose), поэтому 4 процесса не влезают, а 2 укладываются
+ * с запасом. Поднимать значение можно только вместе с `mem_limit`.
  */
-export const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 4);
+export const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
 
 /**
  * Размер пула fork-процессов.
  * Обоснование: совпадает с MAX_CONCURRENT для оптимального переиспользования.
  */
-export const FORK_POOL_SIZE = Number(process.env.FORK_POOL_SIZE || 4);
+export const FORK_POOL_SIZE = Number(process.env.FORK_POOL_SIZE || 2);
 
 // ============================================================================
 // ЛИМИТЫ ПАМЯТИ WASM
@@ -159,6 +165,86 @@ export const REDIS_PORT = Number(process.env.REDIS_PORT || 6379);
 /** Путь к storage. */
 export const STORAGE_PATH = process.env.STORAGE_PATH || '/data/storage/results';
 
+/**
+ * Каталог входных файлов, ожидающих конвертации в очереди.
+ *
+ * Обоснование: async-путь передаёт документ воркеру через диск, а не через
+ * Redis. Раньше файл ехал в теле задачи в base64 — до 133 МБ на задачу
+ * (MAX_FILE_BYTES = 100 МиБ), и при тысячах задач в очереди это не помещалось
+ * в память Valkey. Теперь api и worker обмениваются путём, а сам том
+ * (`storage-data`) у них общий.
+ *
+ * Каталог обязан лежать ВНЕ STORAGE_PATH. Имена результатов собираются как
+ * `{taskId}.{ext}`, где taskId — клиентский `key`, поэтому входной файл
+ * в общем каталоге стал бы доступен по GET /results/{key}.{ext}. Вложенность
+ * проверяется ниже и роняет старт приложения.
+ */
+export const INPUT_STORAGE_PATH = process.env.INPUT_STORAGE_PATH || '/data/incoming';
+
+/**
+ * Время жизни входного файла на диске (мс).
+ *
+ * Обоснование: час с большим запасом перекрывает и JOB_TIMEOUT_MS (60 с),
+ * и время ожидания задачи в очереди. Всё, что старше, — осиротевший файл:
+ * api успел записать документ, но упал до постановки задачи в очередь.
+ */
+export const INPUT_FILE_TTL_MS = Number(process.env.INPUT_FILE_TTL_MS || 3600000);
+
+/**
+ * Предельное число идентификаторов в одном запросе статусов.
+ *
+ * Обоснование: интерфейс шлёт порции по 40 (`STATUS_BATCH_SIZE` в
+ * `web/src/config.ts`), 64 оставляют запас сторонним клиентам. Потолок нужен
+ * потому, что батч превращается в один MGET на 2×N ключей: без ограничения
+ * один запрос с тысячей идентификаторов занимал бы соединение и память
+ * несоразмерно своему лимиту частоты. 64 идентификатора по 36 символов —
+ * это около 3 КБ URL, что укладывается в буфер заголовков nginx (8 КБ).
+ */
+export const MAX_STATUS_BATCH_IDS = Number(
+  process.env.MAX_STATUS_BATCH_IDS || 64
+);
+
+/**
+ * Значение заголовка Retry-After при недоступном Valkey (в секундах).
+ *
+ * Обоснование: 5 — верхняя граница задержки переподключения ioredis
+ * (retryStrategy в queue/connection.ts ограничен пятью секундами), то есть
+ * к моменту повтора соединение с большой вероятностью уже восстановлено.
+ */
+export const STORAGE_RETRY_AFTER_SEC = Number(
+  process.env.STORAGE_RETRY_AFTER_SEC || 5
+);
+
+/**
+ * Период уборки осиротевших входных файлов (мс).
+ *
+ * Обоснование: 10 минут — обход каталога дешёвый (один `readdir` и `stat`
+ * по файлам), а файлы живут час, поэтому спешить с уборкой некуда. Реже
+ * смысла нет: осиротевший файл занимает диск до следующего прохода.
+ */
+export const INPUT_CLEANUP_INTERVAL_MS = Number(
+  process.env.INPUT_CLEANUP_INTERVAL_MS || 600000
+);
+
+/**
+ * Проверяет, что каталог входных файлов не вложен в каталог результатов.
+ *
+ * @throws {Error} - если каталоги пересекаются
+ */
+function assertInputPathIsOutsideStorage(): void {
+  const storage = path.resolve(STORAGE_PATH);
+  const input = path.resolve(INPUT_STORAGE_PATH);
+
+  if (input === storage || input.startsWith(storage + path.sep)) {
+    throw new Error(
+      `INPUT_STORAGE_PATH (${input}) не должен находиться внутри STORAGE_PATH (${storage}): ` +
+        'входные документы станут доступны через GET /results/{taskId}.{ext}'
+    );
+  }
+}
+
+assertInputPathIsOutsideStorage();
+
 // ============================================================================
 // ИДЕМПОТЕНТНОСТЬ
 // ============================================================================
@@ -215,6 +301,62 @@ export const BULLMQ_LOCK_DURATION = Number(
  */
 export const BULLMQ_STALLED_INTERVAL = Number(
   process.env.BULLMQ_STALLED_INTERVAL || JOB_TIMEOUT_MS
+);
+
+/**
+ * Максимум повторов задачи, снятой как зависшая.
+ *
+ * Обоснование: 1 — задача, чей воркер был убит (OOM, SIGKILL), подбирается
+ * повторно ровно один раз. Больше не имеет смысла: если конвертация валит
+ * процесс, повтор убьёт его снова.
+ */
+export const BULLMQ_MAX_STALLED_COUNT = Number(
+  process.env.BULLMQ_MAX_STALLED_COUNT || 1
+);
+
+/**
+ * Время жизни упавшей задачи в очереди (в секундах).
+ * Обоснование: сутки — упавшая задача нужна для разбора инцидента в пределах
+ * рабочего дня. Бессрочное хранение (прежнее `removeOnFail: false`) копило
+ * payload'ы задач без ограничения и приводило к OOM у Valkey.
+ */
+export const FAILED_JOB_TTL_SEC = Number(process.env.FAILED_JOB_TTL_SEC || 86400);
+
+/**
+ * Предельное число упавших задач в очереди.
+ * Обоснование: 1000 ограничивает память независимо от возраста записей —
+ * при всплеске отказов `age` не успевает ничего удалить.
+ */
+export const MAX_FAILED_JOBS = Number(process.env.MAX_FAILED_JOBS || 1000);
+
+/**
+ * Пауза воркера при отказе Valkey по памяти (мс).
+ *
+ * Обоснование: полминуты — время, за которое администратор успевает увидеть
+ * единственную внятную ошибку и освободить память. Всё это время воркер не
+ * берёт задачи и не пишет в Redis, то есть не усугубляет переполнение.
+ *
+ * Пауза нужна потому, что при `maxmemory` + `noeviction` отказ записи
+ * замыкается в цикл: задача не может завершиться (`moveToFinished` — это
+ * запись), а обрезка упавших задач выполняется именно при завершении
+ * очередной задачи. Без паузы воркер молотит отказы со скоростью событий
+ * event loop — в разобранном инциденте это дало 181 010 строк лога за 47 с.
+ */
+export const WORKER_OOM_PAUSE_MS = Number(
+  process.env.WORKER_OOM_PAUSE_MS || 30000
+);
+
+/**
+ * Доля `maxmemory`, при превышении которой воркер предупреждает о памяти.
+ *
+ * Обоснование: 0.9 — порог, за которым до отказа по памяти остаётся меньше
+ * 10 % лимита, то есть считаные крупные записи. Предупреждение на старте
+ * отличает «наследство в томе» (RDB загружен уже почти под лимит) от
+ * «код кладёт в Redis слишком много»: в первом случае `used_memory` высок
+ * с первой секунды и не растёт, во втором — растёт на глазах.
+ */
+export const VALKEY_MEMORY_WARN_RATIO = Number(
+  process.env.VALKEY_MEMORY_WARN_RATIO || 0.9
 );
 
 // ============================================================================

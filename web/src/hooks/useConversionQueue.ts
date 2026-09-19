@@ -434,23 +434,18 @@ export function useConversionQueue({
     );
   }, [downloadItem]);
 
-  // Строковый ключ: эффект опроса перезапускается только при изменении
-  // состава задач, а не на каждом обновлении прогресса.
+  // Признак «есть что опрашивать».
   //
-  // Мемоизируется именно строка, а не промежуточный массив идентификаторов:
-  // массив — тоже новое значение на каждом обновлении, и memo по нему
-  // бесполезен, а join всё равно выполнялся бы на каждом рендере
-  const polledKey = useMemo(
-    () =>
-      items
-        .filter((item) => isActiveStatus(item.status))
-        .map((item) => item.taskId)
-        .join(','),
-    [items]
-  );
+  // Раньше зависимостью была строка из идентификаторов активных задач, поэтому
+  // каждое завершение задачи перезапускало эффект: опрос обрывался, накопленный
+  // интервал сбрасывался и немедленно уходил внеочередной запрос. При сорока
+  // завершающихся подряд задачах это давало сорок лишних запросов. Актуальный
+  // список задач и так читается через itemsRef, поэтому зависеть достаточно
+  // от самого факта наличия активных
+  const hasActive = items.some((item) => isActiveStatus(item.status));
 
   useEffect(() => {
-    if (polledKey === '') {
+    if (!hasActive) {
       return;
     }
 
@@ -458,7 +453,11 @@ export function useConversionQueue({
     let timer: ReturnType<typeof setTimeout> | undefined;
     let interval = POLL_INTERVAL_MS;
     let stopped = false;
-    let deadline = Date.now() + POLL_DEADLINE_MS;
+
+    // Дедлайн ведётся на задачу, а не на эффект: при постоянном потоке задач
+    // общий дедлайн истекал бы и «падал» на только что добавленные задачи,
+    // которым ждать ещё пять минут
+    const deadlines = new Map<string, number>();
 
     /**
      * Применяет ответ сервера к очереди.
@@ -528,28 +527,60 @@ export function useConversionQueue({
         return;
       }
 
+      const now = Date.now();
+
       const activeIds = itemsRef.current
         .filter((item) => isActiveStatus(item.status) && item.status !== 'pending')
         .map((item) => item.taskId);
 
-      if (activeIds.length === 0) {
+      // Дедлайн новой задачи отсчитывается с момента, когда её стало можно
+      // опрашивать, а не с запуска эффекта
+      for (const taskId of activeIds) {
+        if (!deadlines.has(taskId)) {
+          deadlines.set(taskId, now + POLL_DEADLINE_MS);
+        }
+      }
+
+      const active = new Set(activeIds);
+
+      // Завершившиеся задачи перестают занимать память
+      for (const taskId of deadlines.keys()) {
+        if (!active.has(taskId)) {
+          deadlines.delete(taskId);
+        }
+      }
+
+      // Задачи, ждущие дольше дедлайна, снимаются с опроса. Статус проверяется
+      // заново: пока шёл предыдущий запрос, задача могла завершиться
+      for (const item of itemsRef.current) {
+        const expiresAt = deadlines.get(item.taskId);
+
+        if (expiresAt !== undefined && expiresAt <= now && isActiveStatus(item.status)) {
+          deadlines.delete(item.taskId);
+          active.delete(item.taskId);
+
+          dispatch({
+            type: 'patch',
+            id: item.id,
+            patch: {
+              status: 'failed',
+              errorText: 'Превышено время ожидания обработки',
+            },
+          });
+        }
+      }
+
+      if (active.size === 0) {
         // Опрашивать пока нечего: все задачи ещё в pending. Цепочку таймеров
         // обрывать нельзя — статусы сменятся на encoding/uploading/queued,
-        // но набор идентификаторов в polledKey останется прежним (все эти
-        // статусы активны), эффект не перезапустится, и опрос не заведётся
-        // уже никогда. Поэтому ждём и проверяем снова
-        //
-        // Дедлайн отодвигается: он отмеряет время ожидания ответов сервера,
-        // а не время лежания файлов в очереди. Без этого задачи, добавленные
-        // и запущенные спустя POLL_DEADLINE_MS, падали бы с «превышено время
-        // ожидания» на первом же тике
-        deadline = Date.now() + POLL_DEADLINE_MS;
+        // но признак hasActive от этого не изменится, эффект не перезапустится,
+        // и опрос не заведётся уже никогда. Поэтому ждём и проверяем снова
         timer = setTimeout(() => void tick(), interval);
         return;
       }
 
       try {
-        const statuses = await fetchStatuses(activeIds, controller.signal);
+        const statuses = await fetchStatuses([...active], controller.signal);
         applyStatuses(statuses);
         interval = POLL_INTERVAL_MS;
       } catch (error) {
@@ -557,8 +588,12 @@ export function useConversionQueue({
           return;
         }
 
-        // Превышен лимит частоты — ждём столько, сколько просит сервер
-        if (error instanceof ApiError && error.status === 429) {
+        // Превышен лимит частоты или хранилище временно недоступно — ждём
+        // столько, сколько просит сервер (оба ответа несут Retry-After)
+        if (
+          error instanceof ApiError &&
+          (error.status === 429 || error.status === 503)
+        ) {
           interval = Math.min(
             (error.retryAfterSec ?? 1) * 1000,
             POLL_MAX_INTERVAL_MS * 4
@@ -567,26 +602,6 @@ export function useConversionQueue({
           // Прочие сбои: постепенно снижаем частоту опроса
           interval = Math.min(interval * 2, POLL_MAX_INTERVAL_MS);
         }
-      }
-
-      if (Date.now() > deadline) {
-        // Обходим список задач один раз, а не ищем каждую по идентификатору
-        const active = new Set(activeIds);
-
-        for (const item of itemsRef.current) {
-          // Статус проверяется заново: за время запроса задача могла завершиться
-          if (active.has(item.taskId) && isActiveStatus(item.status)) {
-            dispatch({
-              type: 'patch',
-              id: item.id,
-              patch: {
-                status: 'failed',
-                errorText: 'Превышено время ожидания обработки',
-              },
-            });
-          }
-        }
-        return;
       }
 
       timer = setTimeout(() => void tick(), interval);
@@ -605,7 +620,7 @@ export function useConversionQueue({
     // items намеренно не в зависимостях: актуальное состояние читается
     // через itemsRef, иначе таймер перезапускался бы на каждом обновлении
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [polledKey]);
+  }, [hasActive]);
 
   const stats = useMemo(() => {
     let pending = 0;

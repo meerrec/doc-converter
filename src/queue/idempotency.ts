@@ -1,72 +1,91 @@
 /**
- *Идемпотентность через Valkey.
+ *Идемпотентность и состояние задач в Valkey.
  *
  * Реализация на основе SET NX EX для гарантии, что:
  * 1. Тот же key не запустит конвертацию повторно
  * 2. Клиент может получить статус существующей задачи
  * 3. Задачи не дублируются при повторных запросах
  *
+ * Число обращений к Valkey здесь принципиально: статус опрашивается клиентом
+ * постоянно. Поэтому состояние читается одной командой MGET на пачку задач,
+ * а не командой на ключ, и на задачу приходится ровно два ключа — статус
+ * и результат. Ключи прогресса и ошибки убраны: их никто не создавал, а на
+ * каждом опросе по ним выполнялся HGETALL.
+ *
  * Все комментарии на русском языке.
  */
 
 import { getRedisClient } from './connection.js';
 import { TASK_TTL_SECONDS, MAX_TASK_ID_LENGTH } from '../security/limits.js';
-import { randomUUID } from 'crypto';
 
 /**
- * Префикс для ключей задач в Valkey.
+ * Префикс для ключей задач.
  */
 const TASK_KEY_PREFIX = 'task:';
 
 /**
- * Префикс для хранения статуса задач.
- */
-const TASK_STATUS_PREFIX = 'task:';
-
-/**
- * Префикс для хранения owner (для идемпотентности).
+ * Суффикс ключа владельца (для идемпотентности).
  */
 const TASK_OWNER_SUFFIX = ':owner';
 
 /**
- * Префикс для хранения результата задач.
+ * Суффикс ключа результата задачи.
  */
 const TASK_RESULT_SUFFIX = ':result';
 
 /**
- * Прогресс задачи, хранимый в Valkey.
+ * Суффикс ключа метаданных задачи.
  */
-interface TaskProgress {
-  percent: number;
-  message: string;
-}
+const TASK_METADATA_SUFFIX = ':metadata';
 
 /**
- * Ошибка задачи, хранимая в Valkey.
+ * Состояние задачи, хранимое в Valkey.
  */
-interface TaskErrorInfo {
-  code: string;
-  message: string;
-}
-
-/**
- * Полная информация о задаче.
- */
-interface TaskInfo {
+export interface TaskInfo {
+  /** Идентификатор задачи. */
   taskId: string;
+  /** Статус: queued, processing, completed, failed. */
   status: string;
-  progress: TaskProgress;
+  /** Результат задачи либо null. */
   result: unknown;
-  error: TaskErrorInfo | null;
+}
+
+/** Ключ владельца задачи. */
+function ownerKey(taskId: string): string {
+  return `${TASK_KEY_PREFIX}${taskId}${TASK_OWNER_SUFFIX}`;
+}
+
+/** Ключ статуса задачи. */
+function statusKey(taskId: string): string {
+  return `${TASK_KEY_PREFIX}${taskId}`;
+}
+
+/** Ключ результата задачи. */
+function resultKey(taskId: string): string {
+  return `${TASK_KEY_PREFIX}${taskId}${TASK_RESULT_SUFFIX}`;
+}
+
+/** Ключ метаданных задачи. */
+function metadataKey(taskId: string): string {
+  return `${TASK_KEY_PREFIX}${taskId}${TASK_METADATA_SUFFIX}`;
 }
 
 /**
- * Генерирует уникальный taskId.
+ * Разбирает JSON из значения Valkey.
  *
- * @returns UUID v4
+ * @param raw - значение ключа
+ * @returns разобранное значение или null
  */
-export function generateTaskId(): string {
-  return randomUUID();
+function parseJson(raw: string | null): unknown {
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -86,30 +105,31 @@ export async function reserveTaskId(
   }
 
   const client = await getRedisClient();
-  const ownerKey = `${TASK_KEY_PREFIX}${taskId}${TASK_OWNER_SUFFIX}`;
 
-  // SET NX EX - устанавливаем только если ключа нет, с TTL.
-  // Токены идут в порядке EX → NX: такую форму принимают типы ioredis,
-  // для самого Redis порядок опций SET значения не имеет
-  const result = await client.set(
-    ownerKey,
+  // SET ... EX ... NX GET — одна команда вместо SET + GET. Токены идут
+  // в порядке EX → NX → GET: такую форму принимают типы ioredis, для самого
+  // Redis порядок опций SET значения не имеет.
+  // Ответ — прежнее значение ключа, либо null, если ключ удалось занять
+  const previous = await client.set(
+    ownerKey(taskId),
     'reserved',
     'EX',
     ttlSec,
-    'NX'
+    'NX',
+    'GET'
   );
 
-  if (result === 'OK') {
-    // Успешно зарезервировали
+  if (previous === null) {
     return { reserved: true };
   }
 
-  // Ключ уже существует, проверяем статус
-  const status = await client.get(`${TASK_STATUS_PREFIX}${taskId}`);
+  // Ключ занят: отдаём текущий статус задачи, если он ещё не истёк.
+  // undefined вместо 'unknown' — вызывающий сам решает, что показать клиенту
+  const status = await client.get(statusKey(taskId));
 
   return {
     reserved: false,
-    existing: status || 'unknown'
+    existing: status ?? undefined
   };
 }
 
@@ -126,67 +146,66 @@ export async function setTaskStatus(
   ttlSec: number = TASK_TTL_SECONDS
 ): Promise<void> {
   const client = await getRedisClient();
-  const statusKey = `${TASK_STATUS_PREFIX}${taskId}`;
 
-  await client.setex(statusKey, ttlSec, status);
+  await client.setex(statusKey(taskId), ttlSec, status);
 }
 
 /**
- * Получает статус задачи.
+ * Читает состояние пачки задач одной командой.
  *
- * @param taskId - уникальный идентификатор задачи
- * @returns текущий статус или null
- */
-export async function getTaskStatus(taskId: string): Promise<string | null> {
-  const client = await getRedisClient();
-  const statusKey = `${TASK_STATUS_PREFIX}${taskId}`;
-
-  return await client.get(statusKey);
-}
-
-/**
- * Устанавливает прогресс задачи.
+ * MGET на всю пачку вместо GET на каждый ключ: пакетный опрос статусов —
+ * самый частый запрос к Valkey, и раньше он стоил четырёх команд на задачу,
+ * две из которых читали никогда не создаваемые ключи.
  *
- * @param taskId - уникальный идентификатор задачи
- * @param percent - процент выполнения (0-100)
- * @param message - сообщение о прогрессе
+ * @param taskIds - идентификаторы задач
+ * @returns состояния задач в том же порядке; null для неизвестных задач
  */
-export async function setTaskProgress(
-  taskId: string,
-  percent: number,
-  message: string = ''
-): Promise<void> {
-  const client = await getRedisClient();
-  const progressKey = `${TASK_STATUS_PREFIX}${taskId}:progress`;
-
-  await client.hset(
-    progressKey,
-    'percent', String(percent),
-    'message', message
-  );
-  await client.expire(progressKey, TASK_TTL_SECONDS);
-}
-
-/**
- * Получает прогресс задачи.
- *
- * @param taskId - уникальный идентификатор задачи
- * @returns прогресс или null
- */
-export async function getTaskProgress(taskId: string): Promise<TaskProgress | null> {
-  const client = await getRedisClient();
-  const progressKey = `${TASK_STATUS_PREFIX}${taskId}:progress`;
-
-  const result = await client.hgetall(progressKey);
-
-  if (!result || Object.keys(result).length === 0) {
-    return null;
+export async function getTasksInfo(
+  taskIds: string[]
+): Promise<(TaskInfo | null)[]> {
+  if (taskIds.length === 0) {
+    return [];
   }
 
-  return {
-    percent: result.percent ? Number(result.percent) : 0,
-    message: result.message || ''
-  };
+  const client = await getRedisClient();
+  const keys: string[] = [];
+
+  for (const taskId of taskIds) {
+    keys.push(statusKey(taskId), resultKey(taskId));
+  }
+
+  const values = await client.mget(...keys);
+
+  return taskIds.map((taskId, index) => {
+    const status = values[index * 2] ?? null;
+    const rawResult = values[index * 2 + 1] ?? null;
+
+    // Ни статуса, ни результата — задача неизвестна. Раньше здесь возвращался
+    // объект со статусом 'unknown', поэтому ветка not_found в контроллере
+    // статусов была недостижима: клиент принимал 'unknown' за живую задачу
+    // и опрашивал её до пятиминутного дедлайна
+    if (status === null && rawResult === null) {
+      return null;
+    }
+
+    return {
+      taskId,
+      status: status ?? 'unknown',
+      result: parseJson(rawResult)
+    };
+  });
+}
+
+/**
+ * Читает состояние одной задачи.
+ *
+ * @param taskId - уникальный идентификатор задачи
+ * @returns состояние задачи или null, если задачи в Valkey нет
+ */
+export async function getTaskInfo(taskId: string): Promise<TaskInfo | null> {
+  const [info] = await getTasksInfo([taskId]);
+
+  return info ?? null;
 }
 
 /**
@@ -194,130 +213,16 @@ export async function getTaskProgress(taskId: string): Promise<TaskProgress | nu
  *
  * @param taskId - уникальный идентификатор задачи
  * @param result - результат задачи
+ * @param ttlSec - время жизни в секундах
  */
-export async function setTaskResult(taskId: string, result: object): Promise<void> {
-  const client = await getRedisClient();
-  const resultKey = `${TASK_KEY_PREFIX}${taskId}${TASK_RESULT_SUFFIX}`;
-
-  // Сохраняем результат как JSON
-  await client.setex(
-    resultKey,
-    TASK_TTL_SECONDS,
-    JSON.stringify(result)
-  );
-}
-
-/**
- * Получает результат задачи.
- *
- * @param taskId - уникальный идентификатор задачи
- * @returns результат или null
- */
-export async function getTaskResult(taskId: string): Promise<unknown> {
-  const client = await getRedisClient();
-  const resultKey = `${TASK_KEY_PREFIX}${taskId}${TASK_RESULT_SUFFIX}`;
-
-  const result = await client.get(resultKey);
-
-  if (!result) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(result);
-  } catch (err) {
-    return null;
-  }
-}
-
-/**
- * Устанавливает ошибку задачи.
- *
- * @param taskId - уникальный идентификатор задачи
- * @param error - код ошибки
- * @param message - сообщение об ошибке
- */
-export async function setTaskError(
+export async function saveTaskResult(
   taskId: string,
-  error: string,
-  message: string = ''
+  result: object,
+  ttlSec: number = TASK_TTL_SECONDS
 ): Promise<void> {
   const client = await getRedisClient();
-  const errorKey = `${TASK_KEY_PREFIX}${taskId}:error`;
 
-  await client.hset(
-    errorKey,
-    'code', error,
-    'message', message
-  );
-  await client.expire(errorKey, TASK_TTL_SECONDS);
-}
-
-/**
- * Получает ошибку задачи.
- *
- * @param taskId - уникальный идентификатор задачи
- * @returns ошибка или null
- */
-export async function getTaskError(taskId: string): Promise<TaskErrorInfo | null> {
-  const client = await getRedisClient();
-  const errorKey = `${TASK_KEY_PREFIX}${taskId}:error`;
-
-  const result = await client.hgetall(errorKey);
-
-  if (!result || Object.keys(result).length === 0) {
-    return null;
-  }
-
-  return {
-    code: result.code || '',
-    message: result.message || ''
-  };
-}
-
-/**
- * Удаляет все данные задачи.
- *
- * @param taskId - уникальный идентификатор задачи
- */
-export async function deleteTask(taskId: string): Promise<void> {
-  const client = await getRedisClient();
-  const keys = [
-    `${TASK_KEY_PREFIX}${taskId}${TASK_OWNER_SUFFIX}`,
-    `${TASK_STATUS_PREFIX}${taskId}`,
-    `${TASK_KEY_PREFIX}${taskId}${TASK_RESULT_SUFFIX}`,
-    `${TASK_KEY_PREFIX}${taskId}:progress`,
-    `${TASK_KEY_PREFIX}${taskId}:error`
-  ];
-
-  // Удаляем все ключи задачи
-  await client.del(keys);
-}
-
-/**
- * Получает полную информацию о задаче.
- *
- * Форма возвращаемого объекта описана явно: к полям обращается код
- * на TypeScript, а `Object` не даёт о них никакого представления.
- *
- * @param taskId - уникальный идентификатор задачи
- * @returns информация о задаче
- */
-export async function getTaskInfo(taskId: string): Promise<TaskInfo> {
-  const [status, progress, result, error] = await Promise.all([
-    getTaskStatus(taskId),
-    getTaskProgress(taskId),
-    getTaskResult(taskId),
-    getTaskError(taskId)
-  ]);
-
-  return {
-    taskId,
-    status: status || 'unknown',
-    progress: progress || { percent: 0, message: '' },
-    result: result || null,
-    error: error || null
-  };
+  await client.setex(resultKey(taskId), ttlSec, JSON.stringify(result));
 }
 
 /**
@@ -328,10 +233,9 @@ export async function getTaskInfo(taskId: string): Promise<TaskInfo> {
  */
 export async function saveTaskMetadata(taskId: string, metadata: object): Promise<void> {
   const client = await getRedisClient();
-  const metadataKey = `${TASK_KEY_PREFIX}${taskId}:metadata`;
 
   await client.setex(
-    metadataKey,
+    metadataKey(taskId),
     TASK_TTL_SECONDS,
     JSON.stringify(metadata)
   );
@@ -345,42 +249,10 @@ export async function saveTaskMetadata(taskId: string, metadata: object): Promis
  */
 export async function getTaskMetadata(taskId: string): Promise<unknown> {
   const client = await getRedisClient();
-  const metadataKey = `${TASK_KEY_PREFIX}${taskId}:metadata`;
 
-  const metadata = await client.get(metadataKey);
+  const metadata = await client.get(metadataKey(taskId));
 
-  if (!metadata) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(metadata);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Сохраняет результат задачи с явным TTL.
- * Алиас setTaskResult для вызовов из обработчика очереди.
- *
- * @param taskId - уникальный идентификатор задачи
- * @param result - результат задачи
- * @param ttlSec - время жизни в секундах
- */
-export async function saveTaskResult(
-  taskId: string,
-  result: object,
-  ttlSec: number = TASK_TTL_SECONDS
-): Promise<void> {
-  const client = await getRedisClient();
-  const resultKey = `${TASK_KEY_PREFIX}${taskId}${TASK_RESULT_SUFFIX}`;
-
-  await client.setex(
-    resultKey,
-    ttlSec,
-    JSON.stringify(result)
-  );
+  return parseJson(metadata);
 }
 
 /**
@@ -396,16 +268,10 @@ export async function checkKeyConflict(
   newParams: Record<string, unknown>
 ): Promise<{ conflict: boolean; existingParams?: Record<string, unknown> }> {
   const client = await getRedisClient();
-  const metadataKey = `${TASK_KEY_PREFIX}${taskId}:metadata`;
 
-  const existingMetadata = await client.get(metadataKey);
+  const existingMetadata = await client.get(metadataKey(taskId));
 
   if (!existingMetadata) {
-    // Нет сохраненных метаданных, проверяем просто статус
-    const status = await getTaskStatus(taskId);
-    if (status && status !== 'completed') {
-      return { conflict: false };
-    }
     return { conflict: false };
   }
 
@@ -430,20 +296,12 @@ export async function checkKeyConflict(
 }
 
 export default {
-  generateTaskId,
   reserveTaskId,
   setTaskStatus,
-  getTaskStatus,
-  setTaskProgress,
-  getTaskProgress,
-  setTaskResult,
-  getTaskResult,
-  setTaskError,
-  getTaskError,
-  deleteTask,
   getTaskInfo,
+  getTasksInfo,
+  saveTaskResult,
   saveTaskMetadata,
   getTaskMetadata,
-  saveTaskResult,
   checkKeyConflict
 };

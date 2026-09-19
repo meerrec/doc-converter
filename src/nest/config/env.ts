@@ -73,6 +73,20 @@ export const envSchema = z.object({
 
   /** Предельный всплеск запросов на один IP. */
   RATE_BURST: z.coerce.number().int().positive().default(20),
+
+  /**
+   * Значение настройки `trust proxy` для Express.
+   *
+   * По умолчанию `false` — сервис не доверяет заголовку X-Forwarded-For:
+   * иначе клиент подставил бы в него чужой адрес и обошёл ограничитель
+   * частоты. В `docker-compose.yml` выставлена единица: перед api ровно один
+   * прокси (nginx), и без этого `req.ip` у всех клиентов равен адресу
+   * контейнера nginx — то есть все они делят одно ведро `RATE_PER_SEC`.
+   *
+   * Принимаются формы, которые понимает Express: `false`, `true`, число
+   * прокси и строки вроде `loopback` или списка подсетей.
+   */
+  TRUST_PROXY: z.string().default('false'),
 });
 
 // Версии конвертера здесь намеренно нет: она читается из package.json
@@ -115,4 +129,24 @@ export function parseEnv(source: NodeJS.ProcessEnv = process.env): Env {
  */
 export function resolvePort(ports: Pick<Env, 'PORT' | 'API_PORT'>): number {
   return ports.PORT ?? ports.API_PORT ?? 3000;
+}
+
+/**
+ * Преобразует TRUST_PROXY в значение, которое принимает Express.
+ *
+ * @param value - значение переменной окружения
+ * @returns false, true, число доверенных прокси или строку-правило
+ */
+export function resolveTrustProxy(value: string): boolean | number | string {
+  if (value === 'false') {
+    return false;
+  }
+
+  if (value === 'true') {
+    return true;
+  }
+
+  const asNumber = Number(value);
+
+  return value.trim() !== '' && Number.isInteger(asNumber) ? asNumber : value;
 }

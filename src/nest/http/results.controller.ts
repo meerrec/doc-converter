@@ -33,11 +33,11 @@ const ALLOWED_RESULT_EXTENSIONS: ReadonlySet<string> = new Set(
 /**
  * Шаблон имени файла результата.
  *
- * Длина идентификатора ограничена 64 символами — столько допускает
- * `MAX_TASK_ID_LENGTH` в `queue/idempotency.js`; более длинный идентификатор
+ * Длина идентификатора ограничена 128 символами — столько допускает
+ * `MAX_TASK_ID_LENGTH` в `security/limits.ts`; более длинный идентификатор
  * в хранилище попасть не может.
  */
-const FILE_NAME_PATTERN = /^([A-Za-z0-9._-]{1,64})\.([A-Za-z0-9]{1,8})$/;
+const FILE_NAME_PATTERN = /^([A-Za-z0-9._-]{1,128})\.([A-Za-z0-9]{1,8})$/;
 
 /** Предельная длина имени файла, запрашиваемого через параметр `?name=`. */
 const MAX_DOWNLOAD_NAME_LENGTH = 120;

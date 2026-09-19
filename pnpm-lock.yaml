@@ -12,8 +12,8 @@ importers:
         specifier: workspace:*
         version: link:packages/contract
       '@matbee/libreoffice-converter':
-        specifier: ^1.0.0
-        version: 1.20.0(zod@4.6.5)
+        specifier: ^2.7.2
+        version: 2.7.2
       '@nestjs/common':
         specifier: ^12.0.3
         version: 12.0.3(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@8.1.1)
@@ -158,16 +158,16 @@ packages:
     resolution: {integrity: sha512-Z7C/xXCiGWsg0KuKsHTKJxbWhpI3Vs5GwLfOean7MGyVFGqdRgBbAjOCh6u4bbjPc/8MJ2pZmK/0DLdCbivLDA==}
     engines: {node: '>=8'}
 
-  '@matbee/libreoffice-converter@1.20.0':
-    resolution: {integrity: sha512-9PfH1dwDdkT1jVbvU3oBSoiDWyAy7nSHqnzSKCtptg7BBk2L4+JuhjNV4wRSQ+YMn8HN8vEaiClfE/c167ft2A==}
+  '@matbee/libreoffice-converter@2.7.2':
+    resolution: {integrity: sha512-62S8uLiFvwbXiCu3IfkO1cDjTyZWUy5nlMsTrmj3l+G5zf5fQcgpvzfRDR9wId+bduarrv11ZDb8Olz5zj4zJA==}
     engines: {node: '>=18.0.0'}
     peerDependencies:
+      jszip: '>=3.0.0'
       sharp: '>=0.32.0'
-      zod: '>=3.0.0'
     peerDependenciesMeta:
-      sharp:
+      jszip:
         optional: true
-      zod:
+      sharp:
         optional: true
 
   '@msgpackr-extract/msgpackr-extract-darwin-arm64@3.0.4':
@@ -1653,8 +1653,8 @@ snapshots:
 
   '@lukeed/csprng@1.1.0': {}
 
-  '@matbee/libreoffice-converter@1.20.0(zod@4.6.5)':
-    optionalDependencies:
+  '@matbee/libreoffice-converter@2.7.2':
+    dependencies:
       zod: 4.6.5
 
   '@msgpackr-extract/msgpackr-extract-darwin-arm64@3.0.4':

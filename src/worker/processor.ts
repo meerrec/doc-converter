@@ -28,7 +28,7 @@ import type { Job } from 'bullmq';
 import {
   IDEMPOTENCY_TTL_SEC,
 } from '../config/index.js';
-import { saveFile, generateFileUrl } from '../storage/fileStorage.js';
+import { saveFile, generateFileUrl, readInput, deleteInput } from '../storage/fileStorage.js';
 import {
   setTaskStatus,
   saveTaskResult,
@@ -55,7 +55,16 @@ import { convertWithLimits } from './sandbox.js';
 export interface JobData {
   /** Идентификатор задачи. */
   taskId?: string;
-  /** Содержимое исходного файла: base64 или готовый буфер. */
+  /** Путь к входному файлу на общем с api томе. */
+  inputPath?: string;
+  /** Размер входного файла в байтах. */
+  inputSize?: number;
+  /**
+   * Содержимое исходного файла: base64 или готовый буфер.
+   *
+   * Устаревшее поле: осталось для задач, поставленных в очередь до перехода
+   * на передачу через диск. При rolling-деплое такие задачи обязаны доработать.
+   */
   inputBuffer?: string | Buffer;
   /** Формат входного файла. */
   inputFormat?: string;
@@ -170,6 +179,11 @@ function getJobId(job: Job<JobData, JobResult>): string {
 /**
  * Обрабатывает задачу из очереди
  *
+ * Прогресс в BullMQ намеренно не обновляется: `job.updateProgress` — это
+ * отдельный Lua-скрипт на каждую точку (раньше их было пять на задачу),
+ * а прогресс из очереди не читает ни один эндпоинт. `GET /status` вычисляет
+ * его из статуса задачи: completed — 100, processing — 50, иначе 0.
+ *
  * @param job - задача BullMQ
  */
 export async function processJob(job: Job<JobData, JobResult>): Promise<JobResult> {
@@ -183,9 +197,6 @@ export async function processJob(job: Job<JobData, JobResult>): Promise<JobResul
     // Валидируем задачу
     validateJobData(jobData);
 
-    // Обновляем прогресс
-    await job.updateProgress(10);
-
     // Получаем метаданные задачи
     // Значение не используется, но чтение оставлено как было:
     // ошибка Valkey должна перевести задачу в failed
@@ -194,22 +205,14 @@ export async function processJob(job: Job<JobData, JobResult>): Promise<JobResul
     // Подготавливаем входные данные
     const inputBuffer = await prepareInput(jobData);
 
-    await job.updateProgress(20);
-
     // Валидируем входные данные
     await validateInputData(inputBuffer, jobData.inputFormat);
-
-    await job.updateProgress(30);
 
     // Выполняем конвертацию
     const result = await executeConversion(inputBuffer, jobData, context);
 
-    await job.updateProgress(90);
-
     // Сохраняем результат
     const savedResult = await saveResult(result, jobData, context);
-
-    await job.updateProgress(100);
 
     // Сохраняем результат в Valkey
     await saveTaskResult(taskId, {
@@ -248,6 +251,13 @@ export async function processJob(job: Job<JobData, JobResult>): Promise<JobResul
 
     // Перебрасываем ошибку
     throw err;
+  } finally {
+    // Входной файл больше не нужен: конвертация завершена либо задача упала.
+    // deleteInput не бросает — падение на уборке не должно подменять исходную
+    // ошибку задачи
+    if (jobData.inputPath) {
+      await deleteInput(jobData.inputPath);
+    }
   }
 }
 
@@ -290,25 +300,24 @@ function validateJobData(
  * @param jobData - данные задачи
  */
 async function prepareInput(jobData: JobData): Promise<Buffer> {
-  // Проверяем, что inputBuffer есть
-  if (!jobData.inputBuffer) {
-    throw new JobValidationError('Input buffer is required', 'inputBuffer', null);
+  // Основной путь: документ лежит на общем томе, в задаче только его адрес
+  if (jobData.inputPath) {
+    return await readInput(jobData.inputPath);
   }
 
-  // Декодируем из base64
+  // Совместимость со старым форматом задачи — см. комментарий у inputBuffer
   if (typeof jobData.inputBuffer === 'string') {
     return Buffer.from(jobData.inputBuffer, 'base64');
   }
 
-  // Если уже Buffer
   if (Buffer.isBuffer(jobData.inputBuffer)) {
     return jobData.inputBuffer;
   }
 
   throw new JobValidationError(
-    'Input buffer must be string or Buffer',
-    'inputBuffer',
-    typeof jobData.inputBuffer
+    'Input path or buffer is required',
+    'inputPath',
+    null
   );
 }
 

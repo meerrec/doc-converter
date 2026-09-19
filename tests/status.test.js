@@ -61,4 +61,30 @@ describe('Пакетный статус задач', () => {
     expect(response.status).toBe(400);
     expect(response.body.error).toBe('invalid_request');
   });
+
+  it('отвечает 400 на пачку больше предельной', async () => {
+    // Пачка превращается в один MGET на 2×N ключей, поэтому у неё есть потолок
+    // (MAX_STATUS_BATCH_IDS = 64). Проверка идёт до обращения к Valkey, так что
+    // тест не зависит от его доступности
+    const ids = Array.from({ length: 65 }, (_, index) => `task-${index}`);
+    const query = ids.map((id) => `taskIds=${id}`).join('&');
+
+    const response = await request(app).get(`/status?${query}`);
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('invalid_request');
+  });
+
+  it('принимает пачку ровно по пределу', async () => {
+    const ids = Array.from({ length: 64 }, (_, index) => `task-${index}`);
+    const query = ids.map((id) => `taskIds=${id}`).join('&');
+
+    const response = await request(app).get(`/status?${query}`);
+
+    // 200 с деградацией по задачам: Valkey в тестах недоступен, и запрос
+    // обязан оставаться успешным — иначе один обрыв связи выглядел бы
+    // для клиента как ошибка его собственного запроса
+    expect(response.status).toBe(200);
+    expect(response.body.tasks).toHaveLength(64);
+  });
 });

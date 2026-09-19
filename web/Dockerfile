@@ -44,9 +44,15 @@ COPY web/nginx.conf /etc/nginx/conf.d/default.conf
 # Собранная статика
 COPY --from=builder /app/web/dist /usr/share/nginx/html
 
-EXPOSE 80
+# nginx слушает 8080 (web/nginx.conf), а не 80: compose публикует
+# "8080:8080". Порт в EXPOSE и в healthcheck обязан совпадать с ним,
+# иначе контейнер навсегда остаётся unhealthy с «Connection refused»
+EXPOSE 8080
 
+# Адрес задан явно (127.0.0.1, а не localhost): localhost резолвится ещё и в
+# IPv6 ::1, а nginx слушает только IPv4 — wget получал «Connection refused»
+# и контейнер навсегда оставался unhealthy
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget --quiet --tries=1 --spider http://localhost/ || exit 1
+  CMD wget --quiet --tries=1 --spider http://127.0.0.1:8080/ || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]

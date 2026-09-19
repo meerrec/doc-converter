@@ -28,7 +28,12 @@ import {
   type ConversionOptions,
   type ConversionRequest,
 } from '@doc-converter/contract';
-import { SYNC_ENABLED, SYNC_TIMEOUT_MS } from '../../config/index.js';
+import {
+  SYNC_ENABLED,
+  SYNC_TIMEOUT_MS,
+  IDEMPOTENCY_TTL_SEC,
+  STORAGE_RETRY_AFTER_SEC,
+} from '../../config/index.js';
 import {
   checkKeyConflict,
   getTaskInfo,
@@ -37,7 +42,8 @@ import {
   setTaskStatus,
 } from '../../queue/idempotency.js';
 import { addConversionJob } from '../../queue/conversionQueue.js';
-import { writeResult } from '../../storage/fileStorage.js';
+import { writeResult, writeInput } from '../../storage/fileStorage.js';
+import { AppError } from '../common/app-error.js';
 import { ConversionRequestPipe } from './validation.pipe.js';
 import {
   logConversionError,
@@ -50,8 +56,16 @@ import {
 } from '../conversion/conversion.service.js';
 import type { RequestWithId } from '../common/request-id.middleware.js';
 
-/** Срок хранения статуса задачи, установленного из API (в секундах). */
-const API_STATUS_TTL_SEC = SYNC_TIMEOUT_MS / 1000;
+/**
+ * Срок хранения статуса задачи, установленного из API (в секундах).
+ *
+ * Обоснование: совпадает с TTL, которым пользуется воркер. Раньше здесь стояло
+ * `SYNC_TIMEOUT_MS / 1000`, то есть 30 секунд, — и задача, простоявшая в очереди
+ * дольше, теряла ключ статуса. Клиент вместо `not_found` получал `unknown`,
+ * считал задачу живой и опрашивал её до пятиминутного дедлайна. Статус не должен
+ * исчезать раньше самой задачи.
+ */
+const API_STATUS_TTL_SEC = IDEMPOTENCY_TTL_SEC;
 
 /** Ответ асинхронного пути. */
 interface QueuedResponse {
@@ -122,36 +136,92 @@ export class ConvertController {
     const prepared = await this.conversion.checkSource(source, body.filetype);
 
     const taskId = body.key || randomUUID();
-    const reserved = await this.reserve(taskId, body, requestId, ip, ua, res);
 
-    if (!reserved) {
+    try {
+      const reserved = await this.reserve(taskId, body, requestId, ip, ua, res);
+
+      if (!reserved) {
+        return;
+      }
+
+      await saveTaskMetadata(taskId, {
+        filetype: body.filetype,
+        outputtype: body.outputtype,
+        url: body.url,
+        data: Boolean(body.data),
+        timestamp: Date.now(),
+      });
+
+      const buffer = await this.conversion.obtainInput(source, prepared, body.filetype);
+
+      await setTaskStatus(taskId, 'processing', API_STATUS_TTL_SEC);
+
+      if (body.async) {
+        await this.enqueue(taskId, buffer, body, options, requestId, res);
+        return;
+      }
+
+      await this.convertSync(taskId, buffer, body, options, {
+        requestId,
+        ip,
+        ua,
+        started,
+        res,
+      });
+    } catch (error) {
+      this.handleStorageFailure(error, res, taskId, requestId, started);
+    }
+  }
+
+  /**
+   * Отвечает на недоступность Valkey.
+   *
+   * Раньше обрыв связи давал 500: обращение к хранилищу задач идёт вне
+   * try/catch, а 500 читается клиентом как «сломано навсегда», тогда как
+   * запрос имеет смысл повторить.
+   *
+   * @param error - пойманная ошибка
+   * @param res - ответ
+   * @param taskId - идентификатор задачи
+   * @param requestId - идентификатор запроса
+   * @param started - момент начала обработки запроса
+   */
+  private handleStorageFailure(
+    error: unknown,
+    res: Response,
+    taskId: string,
+    requestId: string | undefined,
+    started: number
+  ): void {
+    // Ошибки контракта (негодный url, формат, размер) отдаёт фильтр Nest
+    if (error instanceof AppError) {
+      throw error;
+    }
+
+    // Ответ уже отправлен — например, повторный запрос с тем же key
+    if (res.headersSent) {
       return;
     }
 
-    await saveTaskMetadata(taskId, {
-      filetype: body.filetype,
-      outputtype: body.outputtype,
-      url: body.url,
-      data: Boolean(body.data),
-      timestamp: Date.now(),
-    });
+    const message = (error as Error).message;
 
-    const buffer = await this.conversion.obtainInput(source, prepared, body.filetype);
-
-    await setTaskStatus(taskId, 'processing', API_STATUS_TTL_SEC);
-
-    if (body.async) {
-      await this.enqueue(taskId, buffer, body, options, requestId, res);
-      return;
-    }
-
-    await this.convertSync(taskId, buffer, body, options, {
+    logConversionError({
       requestId,
-      ip,
-      ua,
-      started,
-      res,
+      taskId,
+      code: 'storage_unavailable',
+      message,
+      durationMs: Date.now() - started,
     });
+
+    res.setHeader('Retry-After', String(STORAGE_RETRY_AFTER_SEC));
+
+    this.fail(
+      res,
+      503,
+      'storage_unavailable',
+      'Task storage is temporarily unavailable',
+      taskId
+    );
   }
 
   /**
@@ -239,9 +309,16 @@ export class ConvertController {
     requestId: string | undefined,
     res: Response
   ): Promise<void> {
+    // Документ передаётся воркеру через общий том, а не телом задачи: base64
+    // в Redis занимал до 133 МБ на задачу, и очередь из тысяч задач физически
+    // не помещалась в память Valkey. Осиротевший файл (если постановка в
+    // очередь не удалась) уберёт cleanupInputs в воркере
+    const input = await writeInput(taskId, buffer);
+
     await addConversionJob({
       taskId,
-      inputBuffer: buffer.toString('base64'),
+      inputPath: input.filePath,
+      inputSize: input.size,
       inputFormat: body.filetype,
       outputFormat: body.outputtype,
       options,
@@ -326,7 +403,13 @@ export class ConvertController {
       }
 
       if (!outcome.success || !outcome.result) {
-        await setTaskStatus(taskId, 'failed', API_STATUS_TTL_SEC);
+        // Тоже best-effort: клиенту важнее код ошибки конвертации,
+        // чем невозможность записать статус
+        try {
+          await setTaskStatus(taskId, 'failed', API_STATUS_TTL_SEC);
+        } catch {
+          // Статус не записан — ошибка всё равно уходит в ответ
+        }
 
         const code = outcome.error?.errorCode ?? 'conversion_failed';
 
@@ -346,7 +429,14 @@ export class ConvertController {
       // синхронный путь формировал fileUrl, ничего не записывая
       const saved = await writeResult(taskId, outcome.result, body.outputtype);
 
-      await setTaskStatus(taskId, 'completed', API_STATUS_TTL_SEC);
+      // Запись статуса — best-effort: результат уже лежит на диске, и ссылка
+      // в ответе рабочая. Без этого обрыв связи с Valkey превращал бы успешную
+      // конвертацию в 500
+      try {
+        await setTaskStatus(taskId, 'completed', API_STATUS_TTL_SEC);
+      } catch {
+        // Статус не записан: задача останется в processing до истечения TTL
+      }
 
       logSuccess({
         requestId,

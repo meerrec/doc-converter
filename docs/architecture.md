@@ -57,7 +57,7 @@ POST /ConvertService.ashx
 
 ### Пошагово
 
-1. **Семафор** (`sandbox.ts`, класс `Semaphore`). Синглтон `Semaphore(MAX_CONCURRENT)` = 4 слота.
+1. **Семафор** (`sandbox.ts`, класс `Semaphore`). Синглтон `Semaphore(MAX_CONCURRENT)` = 2 слота.
    Синхронный запрос ждёт слот не дольше `SYNC_QUEUE_WAIT_MS` (5 с).
 2. **Пул** (`fork-pool.ts`). `runTask()` берёт свободный процесс из пула, при
    необходимости лениво форкает новые (до `FORK_POOL_SIZE`).
@@ -80,6 +80,19 @@ POST /ConvertService.ashx
 
 Обмен идёт через `process.send` / `process.on('message')` — это `child_process.fork`,
 а не `worker_threads`, поэтому `parentPort` здесь не применяется.
+
+**Конвертер живёт дольше одной задачи.** Библиотека 2.x в `convertDocument` создаёт и
+уничтожает конвертер на каждый вызов, а инициализация — самая дорогая часть: создание
+~0.8 с, первая конвертация ~0.3 с, каждая следующая ~12 мс. Поэтому `fork-worker.ts`
+держит конвертер (по общему промису — прогрев и задача могут запросить его одновременно)
+и сбрасывает только после ошибки, когда он может остаться нерабочим.
+
+**Пул прогревается при старте воркера** (`warmupPool` в `fork-pool.ts`) — конвертеры
+создаются последовательно, по одному процессу. Инициализация читает WASM-ассеты и
+сканирует шрифты, и одновременный запуск нескольких процессов не укладывается в
+`JOB_TIMEOUT_MS`: замерено ~79 с на две параллельные конвертации против ~2 с в прогретом
+пуле. Родитель и потомок обмениваются при этом сообщениями `{ type: 'warmup' }` и
+`{ type: 'warmup-done' }`.
 
 ### Что важно знать про этот путь
 
@@ -123,9 +136,16 @@ POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
 - Очередь называется `conversion`; имя продублировано константой в `worker/index.ts`.
 - `bullmq` загружается ленивым `await import()`: его CJS-сборка тянет ESM-only `msgpackr`,
   и статический импорт сломал бы запуск API-сервера.
-- **Прогресс нельзя обновлять в обработчике `completed`.** Задача к этому моменту уже
-  удалена из очереди (`removeOnComplete: true`), и вызов `job.updateProgress` падает
-  с «Missing key for job», роняя процесс воркера. Итоговый прогресс пишется в `processor.js`.
+- **Прогресс в BullMQ не обновляется вообще.** Прогресс из очереди не читает ни один
+  эндпоинт: `GET /status` вычисляет его из статуса задачи. Раньше воркер вызывал
+  `job.updateProgress` пять раз за задачу — это пять отдельных Lua-скриптов на задачу,
+  и они убраны. Обновлять прогресс в обработчике `completed` нельзя и по другой причине:
+  задача к этому моменту уже удалена (`removeOnComplete: true`), и вызов падает
+  с «Missing key for job», роняя процесс воркера.
+- **Содержимое файла в Redis не передаётся.** Раньше задача несла `inputBuffer` в base64 —
+  до 133 МБ на задачу при `MAX_FILE_BYTES` 100 МиБ, — и очередь из тысяч задач не помещалась
+  в память Valkey. Теперь api кладёт входной документ в `INPUT_STORAGE_PATH` (общий том),
+  а в задаче едет путь; воркер читает файл и удаляет его после обработки.
 - **Опции Р7 поддерживаются частично.** Библиотека принимает `outputFormat`, `inputFormat`,
   `password`, `pdf` и `image` — всё остальное (`CharSet`, `FieldDelimiter`, `PageSize`,
   `Margins` и прочее, что формирует `optionsMapper.ts`) она игнорирует. Практический эффект
@@ -139,22 +159,47 @@ POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
 
 | Ключ | Тип | TTL | Назначение |
 |---|---|---|---|
-| `task:{id}:owner` | string `"reserved"` | 3600 с | Резервирование `key` через `SET NX EX` — основа идемпотентности |
-| `task:{id}` | string | 3600 с (из API — 30 с) | Статус задачи |
-| `task:{id}:progress` | hash `{percent, message}` | 3600 с | Прогресс |
-| `task:{id}:result` | string (JSON) | 3600 с | Результат: `fileUrl`, `fileType`, `size` |
-| `task:{id}:error` | hash `{code, message}` | 3600 с | Ошибка |
+| `task:{id}:owner` | string `"reserved"` | 3600 с | Резервирование `key` через `SET NX EX GET` — основа идемпотентности |
+| `task:{id}` | string | 3600 с | Статус задачи |
+| `task:{id}:result` | string (JSON) | 3600 с | Результат: `fileUrl`, `fileType`, `size` либо `{error, errorCode}` |
 | `task:{id}:metadata` | string (JSON) | 3600 с | `filetype`, `outputtype`, `url`, `timestamp` — для проверки конфликта ключей |
 
-Статусы жизненного цикла: `processing` → `queued` → `completed` | `failed`; значение
-`unknown` возвращается, когда ключа нет. Из API статус пишется с TTL `SYNC_TIMEOUT_MS / 1000`
-(30 с), из воркера — с `IDEMPOTENCY_TTL_SEC` (3600 с).
+Статусы жизненного цикла: `processing` → `queued` → `completed` | `failed`. TTL статуса
+единый — `IDEMPOTENCY_TTL_SEC` (3600 с) и для API, и для воркера: раньше из API он писался
+с TTL `SYNC_TIMEOUT_MS / 1000`, и задача, простоявшая в очереди дольше 30 секунд, теряла
+статус — клиент вместо `not_found` получал `unknown` и продолжал опрос вхолостую.
+
+Ключи `task:{id}:progress` и `task:{id}:error` убраны: их никто не создавал, но на каждом
+опросе статуса по ним выполнялся `HGETALL`. Прогресс вычисляется из статуса, ошибка лежит
+в `:result`.
+
+Чтение состояния — одна команда `MGET` на пачку задач (`getTasksInfo`), а не четыре команды
+на задачу. Если в Valkey нет ни статуса, ни результата, `getTaskInfo` возвращает `null` —
+на этом построена ветка `not_found` в `status.controller.ts`.
+
+### Память Valkey
+
+`maxmemory 400mb` при `mem_limit 512m` и политике `noeviction`. Политика выбрана именно
+такая: вытеснение ключей BullMQ означало бы молчаливую потерю задач, тогда как `noeviction`
+возвращает ошибку записи, которую API отдаёт клиенту как `503 storage_unavailable`
+с `Retry-After`. Упавшие задачи в очереди ограничены по возрасту и количеству
+(`FAILED_JOB_TTL_SEC`, `MAX_FAILED_JOBS`): раньше они хранились вечно вместе с payload'ом.
 
 ### Файловое хранилище
 
 `storage/fileStorage.ts` пишет результат атомарно: `.tmp` → `rename` → `chmod 0o444`.
-Запись идёт в `STORAGE_PATH`. Автоматической очистки нет: механизм удалён вместе с
-мёртвой `cleanupStorage()`, TTL у файлов отсутствует.
+Запись идёт в `STORAGE_PATH`. Автоматической очистки результатов нет: механизм удалён вместе
+с мёртвой `cleanupStorage()`, TTL у файлов отсутствует.
+
+Входные файлы очереди лежат отдельно — в `INPUT_STORAGE_PATH`, — и пишутся той же атомарной
+схемой, но без `chmod 0o444`: файл удаляется после конвертации. Разделение каталогов
+обязательно: имена результатов собираются как `{taskId}.{ext}`, где `taskId` — клиентский
+`key`, поэтому входной документ в общем каталоге стал бы доступен по `GET /results/{key}.{ext}`.
+Вложенность проверяется на старте (`src/config/index.ts`) и роняет приложение.
+
+Жизненный цикл входного файла: api пишет его в `enqueue()`, воркер читает в `prepareInput()`
+и удаляет в `finally`. Осиротевшие файлы (api упал между записью и постановкой в очередь)
+убирает периодическая задача в воркере — по возрасту старше `INPUT_FILE_TTL_MS`.
 
 ## Форматы и опции
 
@@ -296,29 +341,30 @@ rateLimit → validate (схема + allowlist) → urlGuard (SSRF) → magicByt
 
 **Гонки и дефекты:**
 
-6. В `fork-pool.ts` на таймауте сначала вызывается `cleanup()`, который помечает процесс
-   свободным, и только потом `kill('SIGKILL')` — убитый процесс возвращается в пул,
-   и следующая задача упадёт на `child.send`.
-7. `checkKeyConflict` (`queue/idempotency.ts`) в ветке без метаданных возвращает
-   `{ conflict: false }` в обоих случаях, а вычисленный статус не используется.
-8. `MAX_TASK_ID_LENGTH = 64` в `reserveTaskId`, тогда как схема допускает `key` до 128 символов:
-   ключ длиной 65–128 проходит валидацию, но роняет `reserveTaskId` обычным `Error` → `500`.
-9. `ZipGuardError` несёт поле `code`, а не `errorCode`/`statusCode`, поэтому повреждённый
+6. `ZipGuardError` несёт поле `code`, а не `errorCode`/`statusCode`, поэтому повреждённый
    архив отдаётся наружу как 500 `internal`, а не 422.
 
 **Несоответствия имён и значений:**
 
-10. `STORAGE_WRITE_TIMEOUT_MS` в `.env.example` против `STORE_WRITE_TIMEOUT_MS` в коде.
-11. `REDIS_PASSWORD`, `REDIS_DB`, `REDIS_CONNECTION_STRING` объявлены, но не используются —
-    подключение идёт без авторизации и всегда в БД 0.
-12. TTL статуса задачи различается: 30 с из API (`SYNC_TIMEOUT_MS / 1000`) против 3600 с
-    из воркера (`IDEMPOTENCY_TTL_SEC`).
-13. `getFileExtension` в `worker/converter.ts` дословно повторяет `FILE_EXTENSIONS`
-    из контракта — две копии одной карты форматов.
-14. Экспортируются, но не используются вне своего модуля (часть — только внутри него):
+7. `STORAGE_WRITE_TIMEOUT_MS` в `.env.example` против `STORE_WRITE_TIMEOUT_MS` в коде.
+8. `REDIS_PASSWORD`, `REDIS_DB`, `REDIS_CONNECTION_STRING` объявлены, но не используются —
+   подключение идёт без авторизации и всегда в БД 0.
+9. `getFileExtension` в `worker/converter.ts` дословно повторяет `FILE_EXTENSIONS`
+   из контракта — две копии одной карты форматов.
+10. Экспортируются, но не используются вне своего модуля (часть — только внутри него):
     `getSandboxStats`, `executeInSandbox`, `convertWithWasmSandbox`, `getTaskSemaphore`,
     `resetTaskSemaphore` (`sandbox.ts`); `createDefaultOptions`, `mergeOptionsWithDefaults`
-    (`optionsMapper.ts`); `listResults`, `getResultSize` (`fileStorage.ts`).
+    (`optionsMapper.ts`); `getResultSize` (`fileStorage.ts`).
+
+**Исправлено в рамках разгрузки Valkey:**
+
+- `fork-pool.ts` на таймауте помечал процесс свободным до `kill('SIGKILL')`, из-за чего
+  убитый процесс возвращался в пул и следующая задача уходила в никуда. Теперь процесс
+  заменяется новым — и при таймауте, и при аварийном выходе.
+- `checkKeyConflict` в ветке без метаданных возвращал `{ conflict: false }` в обоих случаях.
+- `MAX_TASK_ID_LENGTH` был 64 при допускаемых контрактом 128: ключ длиной 65–128 проходил
+  валидацию схемы и падал с 500 в `reserveTaskId`.
+- TTL статуса задачи расходился: 30 с из API против 3600 с из воркера.
 
 **Устранено при расчистке мёртвого кода:**
 

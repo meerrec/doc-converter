@@ -9,7 +9,7 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { STORAGE_PATH } from '../config/index.js';
+import { STORAGE_PATH, INPUT_STORAGE_PATH, INPUT_FILE_TTL_MS } from '../config/index.js';
 
 /**
  * Обеспечивает существование директории.
@@ -113,6 +113,179 @@ export async function saveFile(
   };
 }
 
+// ===========================================================================
+// Входные файлы очереди
+// ===========================================================================
+
+/**
+ * Расширение файла, в котором входной документ ждёт конвертации.
+ *
+ * Обоснование: `.in` отсутствует в allowlist выходных форматов
+ * (`ALLOWED_RESULT_EXTENSIONS` в `nest/http/results.controller.ts`), поэтому
+ * даже ошибочно оказавшись в каталоге результатов такой файл не был бы отдан
+ * клиенту. Основная защита — отдельный каталог, это лишь второй барьер.
+ */
+const INPUT_FILE_EXTENSION = '.in';
+
+/**
+ * Собирает путь к входному файлу задачи.
+ *
+ * @param taskId - идентификатор задачи
+ * @returns полный путь к файлу
+ */
+function getInputPath(taskId: string): string {
+  return path.join(INPUT_STORAGE_PATH, `${taskId}${INPUT_FILE_EXTENSION}`);
+}
+
+/**
+ * Проверяет, что путь лежит внутри каталога входных файлов.
+ *
+ * Путь приходит из задачи очереди, а её мог создать и старый код, поэтому
+ * проверка нужна независимо от того, что ключ задачи ограничен шаблоном
+ * `KEY_PATTERN` (разделители путей в нём запрещены).
+ *
+ * @param filePath - абсолютный путь к файлу
+ * @returns true, если путь внутри INPUT_STORAGE_PATH
+ */
+function isInsideInputStorage(filePath: string): boolean {
+  const inputRoot = path.resolve(INPUT_STORAGE_PATH);
+  const resolved = path.resolve(filePath);
+
+  return resolved.startsWith(inputRoot + path.sep);
+}
+
+/**
+ * Записывает входной документ для асинхронной конвертации.
+ *
+ * Используется та же атомарная схема, что и для результатов
+ * (`.tmp` → `rename`): воркер не должен увидеть недописанный файл.
+ * Права 0o444 не выставляются — файл удаляется после конвертации, а не отдаётся.
+ *
+ * @param taskId - идентификатор задачи
+ * @param buffer - содержимое исходного файла
+ * @returns путь к файлу и его размер
+ * @throws {Error} - если запись не удалась
+ */
+export async function writeInput(
+  taskId: string,
+  buffer: Buffer
+): Promise<{ filePath: string; size: number }> {
+  const filePath = getInputPath(taskId);
+
+  if (!isInsideInputStorage(filePath)) {
+    throw new Error(`Недопустимый идентификатор задачи: ${taskId}`);
+  }
+
+  await ensureDirectory(INPUT_STORAGE_PATH);
+
+  const tempPath = `${filePath}.tmp`;
+
+  try {
+    await fs.writeFile(tempPath, buffer);
+    await fs.rename(tempPath, filePath);
+
+    return { filePath, size: buffer.length };
+  } catch (err) {
+    try {
+      await fs.unlink(tempPath);
+    } catch {
+      // Игнорируем ошибку удаления временного файла
+    }
+
+    throw new Error(`Не удалось записать входной файл: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Читает входной документ, оставленный api для воркера.
+ *
+ * @param inputPath - путь, полученный из задачи очереди
+ * @returns содержимое файла
+ * @throws {Error} - если путь вне каталога или файл недоступен
+ */
+export async function readInput(inputPath: string): Promise<Buffer> {
+  if (!isInsideInputStorage(inputPath)) {
+    throw new Error('Путь к входному файлу вне каталога входных файлов');
+  }
+
+  try {
+    return await fs.readFile(inputPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(`Входной файл не найден: ${path.basename(inputPath)}`);
+    }
+
+    throw err;
+  }
+}
+
+/**
+ * Удаляет входной файл после конвертации.
+ *
+ * Ошибка удаления не пробрасывается: результат уже получен, и падение из-за
+ * неудачного `unlink` только пометило бы успешную задачу как проваленную.
+ *
+ * @param inputPath - путь к файлу
+ */
+export async function deleteInput(inputPath: string): Promise<void> {
+  if (!isInsideInputStorage(inputPath)) {
+    return;
+  }
+
+  try {
+    await fs.unlink(inputPath);
+  } catch {
+    // Файл уже удалён или недоступен — для уборки это не ошибка
+  }
+}
+
+/**
+ * Удаляет осиротевшие входные файлы.
+ *
+ * Файл остаётся на диске, если api записал документ, но упал до постановки
+ * задачи в очередь, либо если воркер был убит до `deleteInput`. Обход идёт
+ * по каталогу, а не по ключам Valkey: к моменту уборки задача уже могла
+ * исчезнуть из очереди.
+ *
+ * @param ttlMs - возраст, после которого файл считается осиротевшим
+ * @returns число удалённых файлов
+ */
+export async function cleanupInputs(
+  ttlMs: number = INPUT_FILE_TTL_MS
+): Promise<number> {
+  let entries: string[];
+
+  try {
+    entries = await fs.readdir(INPUT_STORAGE_PATH);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return 0;
+    }
+
+    throw err;
+  }
+
+  const deadline = Date.now() - ttlMs;
+  let removed = 0;
+
+  for (const entry of entries) {
+    const filePath = path.join(INPUT_STORAGE_PATH, entry);
+
+    try {
+      const stats = await fs.stat(filePath);
+
+      if (stats.isFile() && stats.mtimeMs < deadline) {
+        await fs.unlink(filePath);
+        removed += 1;
+      }
+    } catch {
+      // Файл исчез между readdir и stat — это и есть цель уборки
+    }
+  }
+
+  return removed;
+}
+
 /**
  * Формирует URL результата.
  *
@@ -209,27 +382,6 @@ export async function getResultSize(taskId: string, extension: string): Promise<
   }
 }
 
-/**
- * Получает список всех файлов результатов.
- * Используется для cleanup.
- *
- * @returns список путей к файлам
- */
-export async function listResults(): Promise<string[]> {
-  try {
-    const files = await fs.readdir(STORAGE_PATH);
-    return files
-      .filter(file => file.endsWith('.pdf') || file.endsWith('.docx') || 
-                     file.endsWith('.xlsx') || file.endsWith('.txt'))
-      .map(file => path.join(STORAGE_PATH, file));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return [];
-    }
-    throw err;
-  }
-}
-
 export default {
   saveFile,
   generateFileUrl,
@@ -238,5 +390,9 @@ export default {
   resultExists,
   deleteResult,
   getResultSize,
-  listResults
+  // Входные файлы очереди
+  writeInput,
+  readInput,
+  deleteInput,
+  cleanupInputs
 };

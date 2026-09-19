@@ -30,6 +30,7 @@ import type {
   InputFormat,
   LibreOfficeWasmOptions,
   OutputFormat,
+  SubprocessConverter,
 } from '@matbee/libreoffice-converter';
 
 const require = createRequire(import.meta.url);
@@ -101,16 +102,91 @@ function resolveWasmPath(): string {
 /**
  * Опции инициализации WASM-движка.
  *
+ * `userProfilePath` здесь стоял до перехода на библиотеку 2.x: раньше профиль
+ * приходилось уводить в записываемый /tmp виртуальной ФС WASM, потому что
+ * /instdir доступен только для чтения. В 2.x библиотека размещает профиль
+ * сама, и опция из неё удалена — передавать её больше не нужно.
+ *
  * @returns опции для @matbee/libreoffice-converter
  */
 function buildConverterOptions(): LibreOfficeWasmOptions {
   return {
     wasmPath: resolveWasmPath(),
-    // Путь внутри виртуальной ФС WASM (не хоста!): /instdir доступен
-    // только для чтения, а /tmp в Emscripten FS записываемый
-    userProfilePath: '/tmp/libreoffice-profile',
     ...(process.env.LO_CONVERTER_VERBOSE === 'true' ? { verbose: true } : {})
   };
+}
+
+/**
+ * Конвертер, переиспользуемый между задачами процесса.
+ *
+ * Раньше здесь вызывался `convertDocument`, который создаёт конвертер и
+ * уничтожает его после каждой конвертации. Почти всё время уходило на
+ * инициализацию: она читает WASM-ассеты и сканирует шрифты. Замерено на
+ * одном документе: создание конвертера ~0.8 с, первая конвертация ~0.3 с,
+ * каждая следующая — ~12 мс. То есть на каждой задаче терялись секунды.
+ *
+ * При параллельной работе это же было причиной отказов: несколько процессов
+ * одновременно сканировали шрифты, конвертация не укладывалась в
+ * JOB_TIMEOUT_MS, и fork-процессы убивались по таймауту.
+ */
+let converterPromise: Promise<SubprocessConverter> | null = null;
+
+/**
+ * Возвращает конвертер, создавая его при первом обращении.
+ *
+ * Хранится именно промис, а не готовый конвертер: прогрев и первая задача
+ * могут запросить его одновременно, и без общего промиса создались бы два
+ * конвертера, один из которых остался бы без присмотра.
+ *
+ * @returns готовый к работе конвертер
+ */
+async function getConverter(): Promise<SubprocessConverter> {
+  if (!converterPromise) {
+    converterPromise = (async () => {
+      const { createSubprocessConverter } = await loadConverter();
+      return await createSubprocessConverter(buildConverterOptions());
+    })();
+  }
+
+  return converterPromise;
+}
+
+/**
+ * Уничтожает конвертер, чтобы следующая задача начала с чистого состояния.
+ *
+ * Нужен после ошибки конвертации: WASM-субпроцесс мог быть убит по таймауту
+ * (`restartOnMemoryError` пересоздаёт его не во всех случаях), и повторное
+ * использование такого конвертера вернуло бы ту же ошибку.
+ */
+async function resetConverter(): Promise<void> {
+  const pending = converterPromise;
+  converterPromise = null;
+
+  if (pending) {
+    try {
+      await (await pending).destroy();
+    } catch {
+      // Конвертер мог уже умереть — на исход задачи это не влияет
+    }
+  }
+}
+
+/**
+ * Прогревает конвертер — создаёт его до первой задачи.
+ *
+ * Инициализация читает WASM-ассеты и сканирует шрифты, и она плохо
+ * масштабируется: если несколько процессов пула делают это одновременно,
+ * они не укладываются в `JOB_TIMEOUT_MS` и задачи падают с
+ * `conversion_timeout`. Пул вызывает прогрев по одному процессу (см.
+ * `warmupPool` в fork-pool.ts), а результат сообщает родителю.
+ */
+async function handleWarmup(): Promise<void> {
+  try {
+    await getConverter();
+    process.send?.({ type: 'warmup-done' });
+  } catch (err) {
+    sendError(`Warmup failed: ${(err as Error).message}`);
+  }
 }
 
 /**
@@ -123,6 +199,10 @@ async function handleMessage(message: ParentMessage): Promise<void> {
     switch (message.type) {
       case 'convert':
         await handleConvert(message);
+        break;
+
+      case 'warmup':
+        await handleWarmup();
         break;
 
       default:
@@ -151,20 +231,23 @@ async function handleConvert(message: ParentMessage): Promise<void> {
   }
 
   try {
-    const converter = await loadConverter();
+    const activeConverter = await getConverter();
 
-    const result = await converter.convertDocument(
+    const result = await activeConverter.convert(
       Buffer.from(inputBuffer),
       {
         outputFormat: outputFormat as OutputFormat,
         inputFormat: inputFormat as InputFormat,
         password: options.password,
-      },
-      buildConverterOptions()
+      }
     );
 
     sendSuccess(result.data);
   } catch (err) {
+    // Сбрасываем конвертер: после ошибки он может остаться нерабочим
+    // (например, с убитым WASM-субпроцессом), и следующая задача получила бы
+    // ту же ошибку. Цена — повторная инициализация на следующей задаче
+    await resetConverter();
     sendError(`Conversion failed: ${(err as Error).message}`);
   }
 }

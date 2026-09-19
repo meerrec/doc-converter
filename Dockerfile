@@ -129,6 +129,11 @@ ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOST=0.0.0.0
 ENV STORAGE_PATH=/data/storage
+# Каталог входных файлов очереди. Обязан быть вне STORAGE_PATH: имена
+# результатов собираются из клиентского `key`, и входной документ в общем
+# каталоге стал бы доступен по GET /results/{key}.{ext}. Вложенность
+# проверяется в src/config/index.ts и роняет старт приложения.
+ENV INPUT_STORAGE_PATH=/data/incoming
 ENV AUDIT_LOG_PATH=/var/log/converter/audit.log
 ENV LOG_LEVEL=info
 
