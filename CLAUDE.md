@@ -16,7 +16,7 @@ LibreOffice Calc, которым управляет Python-скрипт чере
 - **Все комментарии, JSDoc и сообщения — на русском языке.** Сквозное
   требование проекта.
 - **Обоснование каждого числового лимита** документировано рядом с константой
-  в `src/config/index.ts` — при изменении лимита обновляй и обоснование.
+  в `packages/config/src/index.ts` — при изменении лимита обновляй и обоснование.
 
 История: сервис начинался как конвертер на WASM-сборке LibreOffice
 (`@matbee/libreoffice-converter` в fork-процессах) с Р7-совместимым API.
@@ -28,23 +28,32 @@ LibreOffice Calc, которым управляет Python-скрипт чере
 ## Команды
 
 ```bash
-pnpm install
-pnpm --filter @doc-converter/contract build   # контракт — рантайм-зависимость сервера
-npm run build:server                          # tsc → dist/ (NestJS требует декораторов)
-npm run typecheck:server
+pnpm install                       # версия pnpm — из package.json (corepack)
+npm run build                      # pnpm -r build: пакеты, затем приложения
+npm run typecheck                  # сборка + проверка типов во всех пакетах
 
-npm run start:api                             # node dist/nest/main.js
-npm run start:worker                          # WORKER_QUEUE=light node dist/worker/uno/index.js
-npm run start:autoscaler                      # node dist/autoscaler/index.js
-npm run dev                                   # api + воркер через concurrently
+pnpm --filter @doc-converter/api build          # одно приложение (с зависимостями)
+pnpm --filter @doc-converter/contract build     # одна библиотека
 
-npm test                                      # весь набор
+npm run start:api                  # node apps/api/dist/main.js
+npm run start:worker               # WORKER_QUEUE=light node apps/worker/dist/index.js
+npm run start:autoscaler           # node apps/autoscaler/dist/index.js
+npm run dev                        # api + воркер через concurrently
+
+npm test                           # весь набор
 NODE_ENV=test npx vitest run tests/complexity.test.js   # один файл
 ```
 
-Сервер запускается только из `dist/`: декораторам NestJS нужен
+Приложения запускаются только из `dist/`: декораторам NestJS нужен
 `emitDecoratorMetadata`, с которым нативное стирание типов Node несовместимо.
-Тесты же читают **исходники** на TypeScript — сборка перед прогоном не нужна.
+Тесты же читают **исходники** на TypeScript — сборка перед прогоном не нужна,
+за это отвечает `resolve.alias` в `vitest.config.ts`.
+
+Локально ставить зависимости нужно **без фильтра** (`pnpm install`).
+Команды `pnpm ci --filter …` из Dockerfile'ов делают `clean` перед установкой
+и оставляют только выбранное приложение с зависимостями — остальные теряют
+свои `node_modules`, и их проверка типов падает. Фильтр уместен только внутри
+образа, где нужен ровно один сервис.
 
 Полный стек:
 
@@ -55,26 +64,54 @@ docker compose --profile build-only build uno-worker-light   # только об
 
 ## Архитектура
 
+### Состав workspace
+
+Репозиторий разделён на запускаемые приложения и переиспользуемые библиотеки.
+Границы видны по манифестам: воркер не зависит от `@nestjs/*`, автоскейлер —
+от `minio`, а корневой `package.json` перестал быть пакетом-приложением
+и держит только инструменты разработки.
+
+```
+apps/api          NestJS: приём файлов, статусы, /health
+apps/worker       BullMQ-воркер: soffice через UNO
+apps/autoscaler   масштабирование реплик в compose
+apps/web          интерфейс на Vite + React
+packages/contract      zod-схемы и типы — общие для сервера и веба
+packages/config        таймауты, лимиты, профили масштабирования
+packages/observability логгер pino и аудит-лог
+packages/queue         Valkey, очереди BullMQ, состояние задач
+packages/storage       MinIO/S3
+```
+
+Библиотеки собираются в свой `dist/` раньше приложений: `pnpm -r build` обходит
+пакеты топологически, по графу зависимостей. Отдельный порядок в скриптах
+поддерживать не нужно.
+
+**Куда класть новый код.** Запускается отдельным процессом — `apps/`;
+импортируется больше чем одним приложением — `packages/`. Модуль, нужный
+ровно одному приложению, остаётся внутри него (`apps/api/src/security` —
+пример: проверка входных файлов нужна только приёмнику).
+
 ### Путь одной задачи
 
 ```
 POST /convert/xlsx-to-pdf  (multipart)
-  → src/nest/xlsx/xlsx.controller.ts    FileInterceptor, разбор параметров
-  → src/nest/xlsx/xlsx.service.ts       сигнатура, zip-гард, оценка сложности
-  → src/storage/s3.ts                   вход в MinIO: incoming/{jobId}.xlsx
-  → src/queue/jobStatus.ts              запись состояния: job:{jobId}
-  → src/queue/queues.ts                 задача в очередь xlsx2pdf.{tier}
+  → apps/api/src/xlsx/xlsx.controller.ts   FileInterceptor, разбор параметров
+  → apps/api/src/xlsx/xlsx.service.ts      сигнатура, zip-гард, оценка сложности
+  → packages/storage/src/s3.ts             вход в MinIO: incoming/{jobId}.xlsx
+  → packages/queue/src/jobStatus.ts        запись состояния: job:{jobId}
+  → packages/queue/src/queues.ts           задача в очередь xlsx2pdf.{tier}
                                         ↓
-  → src/worker/uno/index.ts             BullMQ Worker, concurrency: 1
-  → src/worker/uno/processor.ts         скачать вход → конвертировать → загрузить PDF
-  → src/worker/uno/uno-converter.ts     spawn python3 с таймаутом
-  → docker/uno/uno_convert.py           UNO → soffice → PDF
+  → apps/worker/src/index.ts               BullMQ Worker, concurrency: 1
+  → apps/worker/src/processor.ts           скачать вход → конвертировать → загрузить PDF
+  → apps/worker/src/uno-converter.ts       spawn python3 с таймаутом
+  → docker/uno/uno_convert.py              UNO → soffice → PDF
 ```
 
 ### Три очереди по сложности
 
 `light` / `medium` / `heavy` — по старшему из двух признаков: размер файла
-и число листов (`src/nest/xlsx/complexity.ts`, листы читаются из
+и число листов (`apps/api/src/xlsx/complexity.ts`, листы читаются из
 `xl/workbook.xml` внутри zip через yauzl, без запуска LibreOffice).
 
 Разделение обязательно: одна конвертация занимает воркер целиком, и в общей
@@ -92,7 +129,7 @@ POST /convert/xlsx-to-pdf  (multipart)
 - Соединения с Redis разделены: у приложения свой клиент
   (`getRedisClient`, `enableOfflineQueue: false`), у очереди — свой
   (`createQueueRedisClient`, опции BullMQ). Разбор причин — в
-  `src/queue/connection.ts`.
+  `packages/queue/src/connection.ts`.
 
 ### UNO-бридж
 
@@ -114,14 +151,14 @@ LibreOffice лежит в `/tmp` — корневая ФС контейнера 
 
 ## Конфигурация
 
-Все таймауты и лимиты — в **`src/config/index.ts`**, с обоснованием рядом
+Все таймауты и лимиты — в **`packages/config/src/index.ts`**, с обоснованием рядом
 с каждой константой. Не хардкодь числа в модулях.
 
 Два исключения:
 
-- `src/security/limits.ts` — лимиты zip-гарда и сигнатур (дополняют config,
+- `apps/api/src/security/limits.ts` — лимиты zip-гарда и сигнатур (дополняют config,
   а не дублируют).
-- NestJS-слой читает своё подмножество через `src/nest/config/env.ts`
+- NestJS-слой читает своё подмножество через `apps/api/src/env.ts`
   (`NODE_ENV`, `PORT`, `HOST`, `LOG_LEVEL`, `RATE_*`, `TRUST_PROXY`) —
   не при импорте модуля, а при создании приложения (тесты правят окружение
   в `beforeAll`).
@@ -134,7 +171,7 @@ LibreOffice лежит в `/tmp` — корневая ФС контейнера 
   код — snake_case из `packages/contract/src/errors.ts`
   (`file_required`, `magic_mismatch`, `storage_unavailable`, …).
   Домен бросает `AppError` со статусом и кодом; в HTTP-ответ их маппит
-  `src/nest/common/exception.filter.ts`. Всё, что не `AppError`, отдаётся
+  `apps/api/src/common/exception.filter.ts`. Всё, что не `AppError`, отдаётся
   как 500 без подробностей — иначе в ответ попадут `err.message` и системные
   коды вроде `ENOENT`.
 - **Контракт API живёт в `packages/contract`**: zod-схемы и выведенные типы.
@@ -143,6 +180,18 @@ LibreOffice лежит в `/tmp` — корневая ФС контейнера 
 - **Числовые коды FilterData — только в контракте** (`PDF_VERSION_CODES`):
   в API версия PDF называется так, как её видит пользователь («1.7»,
   «pdfa-2b»), а экспортёр LibreOffice принимает числа.
+- **Версия зависимости, встречающейся больше чем в одном манифесте, живёт
+  в каталоге** (`catalog:` в `pnpm-workspace.yaml`), а пакеты ссылаются на неё
+  протоколом `catalog:`. Диапазон в манифесте не пишется: так `typescript`
+  разошёлся на три разных версии, а `zod` — единственная зависимость, которую
+  сервер и контракт исполняют совместно, — мог разойтись на две копии
+  валидатора в одном процессе. Зависимости, объявленные ровно в одном
+  манифесте, в каталог не выносятся.
+- **Строгость проверок TypeScript — в `tsconfig.base.json`**, общем для всех
+  пакетов; конфиг пакета добавляет только то, что относится к его среде
+  (`module`, `lib`, `jsx`, `outDir`). Опция строгости, объявленная в одном
+  конфиге и забытая в другом, означает, что один и тот же код принимается
+  в одном пакете и отвергается в соседнем.
 - Комментарии объясняют «почему», а не «что». Удалённый код не комментируется —
   история остаётся в git.
 

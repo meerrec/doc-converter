@@ -3,61 +3,36 @@
   "version": "1.0.0",
   "description": "Сервис конвертации электронных таблиц XLSX → PDF через LibreOffice + UNO API",
   "type": "module",
-  "main": "dist/nest/main.js",
+  "private": true,
   "scripts": {
-    "start:api": "node dist/nest/main.js",
-    "start:worker": "WORKER_QUEUE=${WORKER_QUEUE:-light} node dist/worker/uno/index.js",
-    "start:autoscaler": "node dist/autoscaler/index.js",
-    "dev:api": "NODE_ENV=development node dist/nest/main.js",
-    "dev:worker": "NODE_ENV=development node dist/worker/uno/index.js",
-    "dev": "concurrently \"npm run dev:api\" \"npm run dev:worker\"",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r build && pnpm -r typecheck",
     "test": "NODE_ENV=test LOG_LEVEL=silent AUDIT_LOG_LEVEL=error vitest run",
     "test:watch": "NODE_ENV=test LOG_LEVEL=silent AUDIT_LOG_LEVEL=error vitest",
     "test:e2e": "E2E=1 npm run test",
     "lint": "echo 'Linter not configured yet'",
     "health": "curl -s http://localhost:3000/health | jq",
-    "build:contract": "pnpm --filter @doc-converter/contract build",
-    "build:web": "pnpm --filter doc-converter-web build",
-    "build:server": "tsc -p tsconfig.json",
-    "typecheck:server": "tsc -p tsconfig.json --noEmit"
+    "start:api": "pnpm --filter @doc-converter/api start",
+    "start:worker": "WORKER_QUEUE=${WORKER_QUEUE:-light} pnpm --filter @doc-converter/worker start",
+    "start:autoscaler": "pnpm --filter @doc-converter/autoscaler start",
+    "dev:api": "NODE_ENV=development pnpm --filter @doc-converter/api start",
+    "dev:worker": "NODE_ENV=development pnpm --filter @doc-converter/worker start",
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:worker\""
   },
   "keywords": [
     "document-converter",
     "libreoffice",
     "uno",
     "xlsx",
-    "pdf",
-    "conversion"
+    "pdf"
   ],
-  "author": "",
   "license": "MIT",
-  "dependencies": {
-    "@doc-converter/contract": "workspace:*",
-    "@nestjs/common": "^12.0.3",
-    "@nestjs/config": "^12.0.0",
-    "@nestjs/core": "^12.0.3",
-    "@nestjs/platform-express": "^12.0.3",
-    "bullmq": "^5.1.0",
-    "express": "^4.18.2",
-    "ioredis": "^5.3.2",
-    "minio": "^8.0.1",
-    "multer": "^2.0.0",
-    "pino": "^8.17.2",
-    "pino-http": "^8.6.1",
-    "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.2",
-    "yauzl": "^2.10.0",
-    "zod": "^4.6.5"
-  },
   "devDependencies": {
     "@swc/core": "^1.16.2",
-    "@types/express": "^4.17.25",
-    "@types/multer": "^2.0.0",
-    "@types/node": "^26.6.1",
-    "@types/yauzl": "^2.10.3",
+    "@types/node": "catalog:",
     "concurrently": "^8.2.2",
     "supertest": "^6.3.3",
-    "typescript": "^5.9.3",
+    "typescript": "catalog:",
     "unplugin-swc": "^1.6.0",
     "vitest": "^5.0.1",
     "yazl": "^2.5.1"
@@ -65,5 +40,5 @@
   "engines": {
     "node": ">=24.0.0"
   },
-  "private": true
+  "packageManager": "pnpm@11.21.0"
 }

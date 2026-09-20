@@ -7,8 +7,16 @@
  * а держать неиспользуемые списки — значит обещать клиенту то, чего нет.
  */
 
-/** Форматы, принимаемые на вход. */
-export const INPUT_FORMATS = ['xlsx', 'xls'] as const;
+/**
+ * Форматы, принимаемые на вход.
+ *
+ * Только XLSX. Старый бинарный `.xls` убран: он не является zip-контейнером,
+ * поэтому не проходит zip-гард, а его структура (OLE2/CFB) проверялась лишь
+ * восемью байтами сигнатуры — то есть у него была несопоставимо более слабая
+ * защита, чем у XLSX, и атакующему достаточно было выбрать формат. Через
+ * `.xls` приходили и макросы Excel 4.0, которых в XLSX не бывает.
+ */
+export const INPUT_FORMATS = ['xlsx'] as const;
 
 /** Форматы результата. Оставлен списком ради расширения (например, PDF/A). */
 export const OUTPUT_FORMATS = ['pdf'] as const;
@@ -33,7 +41,6 @@ export const FILE_EXTENSIONS: Readonly<Record<string, string>> = {
 /** MIME-типы входных форматов. */
 export const INPUT_MIME_TYPES: Readonly<Record<InputFormat, string>> = {
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  xls: 'application/vnd.ms-excel',
 };
 
 /** MIME-тип результата. */

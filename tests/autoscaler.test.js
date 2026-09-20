@@ -10,10 +10,10 @@
 import { describe, it, expect } from 'vitest';
 
 const { computeDesiredReplicas, limitStep, canScaleDown } = await import(
-  '../src/autoscaler/autoscaler.js'
+  '../apps/autoscaler/src/autoscaler.js'
 );
 
-const { SCALING_PROFILES } = await import('../src/config/index.js');
+const { SCALING_PROFILES } = await import('../packages/config/src/index.js');
 
 describe('Автомасштабирование: расчёт числа реплик', () => {
   it('пустая очередь опускает лёгкие воркеры до минимума', () => {

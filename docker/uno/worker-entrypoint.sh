@@ -18,7 +18,7 @@ set -eu
 UNO_PORT="${UNO_PORT:-2002}"
 UNO_SCRIPT="${UNO_SCRIPT_PATH:-/app/docker/uno/uno_convert.py}"
 PROFILE_DIR="${LO_PROFILE_DIR:-/tmp/lo-profile}"
-WORKER_ENTRY="${WORKER_ENTRY:-/app/dist/worker/uno/index.js}"
+WORKER_ENTRY="${WORKER_ENTRY:-/app/apps/worker/dist/index.js}"
 
 # Сколько секунд ждать готовности бриджа. Холодный старт занимает 2–5 с,
 # но под нагрузкой (одновременный старт реплик, сканирование шрифтов) время

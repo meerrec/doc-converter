@@ -4,13 +4,64 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+catalogs:
+  default:
+    '@types/node':
+      specifier: ^26.6.1
+      version: 26.6.1
+    typescript:
+      specifier: ^5.9.3
+      version: 5.9.3
+    zod:
+      specifier: ^4.6.5
+      version: 4.6.5
+
 importers:
 
   .:
+    devDependencies:
+      '@swc/core':
+        specifier: ^1.16.2
+        version: 1.16.2
+      '@types/node':
+        specifier: 'catalog:'
+        version: 26.6.1
+      concurrently:
+        specifier: ^8.2.2
+        version: 8.2.2
+      supertest:
+        specifier: ^6.3.3
+        version: 6.3.4(supports-color@8.1.1)
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+      unplugin-swc:
+        specifier: ^1.6.0
+        version: 1.6.0(@swc/core@1.16.2)(rolldown@1.2.9)(vite@8.3.0(@types/node@26.6.1))
+      vitest:
+        specifier: ^5.0.1
+        version: 5.0.1(@types/node@26.6.1)(vite@8.3.0(@types/node@26.6.1))
+      yazl:
+        specifier: ^2.5.1
+        version: 2.5.1
+
+  apps/api:
     dependencies:
+      '@doc-converter/config':
+        specifier: workspace:*
+        version: link:../../packages/config
       '@doc-converter/contract':
         specifier: workspace:*
-        version: link:packages/contract
+        version: link:../../packages/contract
+      '@doc-converter/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
+      '@doc-converter/queue':
+        specifier: workspace:*
+        version: link:../../packages/queue
+      '@doc-converter/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
       '@nestjs/common':
         specifier: ^12.0.3
         version: 12.0.3(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@8.1.1)
@@ -23,18 +74,9 @@ importers:
       '@nestjs/platform-express':
         specifier: ^12.0.3
         version: 12.0.3(@nestjs/common@12.0.3(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@8.1.1))(@nestjs/core@12.0.3)(supports-color@8.1.1)
-      bullmq:
-        specifier: ^5.1.0
-        version: 5.81.5(supports-color@8.1.1)
       express:
         specifier: ^4.18.2
         version: 4.22.3(supports-color@8.1.1)
-      ioredis:
-        specifier: ^5.3.2
-        version: 5.11.1(supports-color@8.1.1)
-      minio:
-        specifier: ^8.0.1
-        version: 8.0.7
       multer:
         specifier: ^2.0.0
         version: 2.4.0
@@ -54,58 +96,43 @@ importers:
         specifier: ^2.10.0
         version: 2.10.0
       zod:
-        specifier: ^4.6.5
+        specifier: 'catalog:'
         version: 4.6.5
     devDependencies:
-      '@swc/core':
-        specifier: ^1.16.2
-        version: 1.16.2
       '@types/express':
         specifier: ^4.17.25
         version: 4.17.25
       '@types/multer':
         specifier: ^2.0.0
         version: 2.2.0
-      '@types/node':
-        specifier: ^26.6.1
-        version: 26.6.1
       '@types/yauzl':
         specifier: ^2.10.3
         version: 2.10.3
-      concurrently:
-        specifier: ^8.2.2
-        version: 8.2.2
-      supertest:
-        specifier: ^6.3.3
-        version: 6.3.4(supports-color@8.1.1)
       typescript:
-        specifier: ^5.9.3
+        specifier: 'catalog:'
         version: 5.9.3
-      unplugin-swc:
-        specifier: ^1.6.0
-        version: 1.6.0(@swc/core@1.16.2)(rolldown@1.2.9)(vite@8.3.0(@types/node@26.6.1))
-      vitest:
-        specifier: ^5.0.1
-        version: 5.0.1(@types/node@26.6.1)(vite@8.3.0(@types/node@26.6.1))
-      yazl:
-        specifier: ^2.5.1
-        version: 2.5.1
 
-  packages/contract:
+  apps/autoscaler:
     dependencies:
-      zod:
-        specifier: ^4.6.5
-        version: 4.6.5
+      '@doc-converter/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@doc-converter/contract':
+        specifier: workspace:*
+        version: link:../../packages/contract
+      '@doc-converter/queue':
+        specifier: workspace:*
+        version: link:../../packages/queue
     devDependencies:
       typescript:
-        specifier: ^5.9.0
+        specifier: 'catalog:'
         version: 5.9.3
 
-  web:
+  apps/web:
     dependencies:
       '@doc-converter/contract':
         specifier: workspace:*
-        version: link:../packages/contract
+        version: link:../../packages/contract
       react:
         specifier: ^19.3.0
         version: 19.3.0
@@ -114,7 +141,7 @@ importers:
         version: 19.3.0(react@19.3.0)
     devDependencies:
       '@types/node':
-        specifier: ^26.6.1
+        specifier: 'catalog:'
         version: 26.6.1
       '@types/react':
         specifier: ^19.2.0
@@ -126,11 +153,94 @@ importers:
         specifier: ^6.1.1
         version: 6.1.1(vite@8.3.0(@types/node@26.6.1))
       typescript:
-        specifier: ^5.9.0
+        specifier: 'catalog:'
         version: 5.9.3
       vite:
         specifier: ^8.3.0
         version: 8.3.0(@types/node@26.6.1)
+
+  apps/worker:
+    dependencies:
+      '@doc-converter/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@doc-converter/contract':
+        specifier: workspace:*
+        version: link:../../packages/contract
+      '@doc-converter/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
+      '@doc-converter/queue':
+        specifier: workspace:*
+        version: link:../../packages/queue
+      '@doc-converter/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
+      bullmq:
+        specifier: ^5.1.0
+        version: 5.81.5(supports-color@8.1.1)
+    devDependencies:
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+
+  packages/config:
+    devDependencies:
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+
+  packages/contract:
+    dependencies:
+      zod:
+        specifier: 'catalog:'
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+
+  packages/observability:
+    dependencies:
+      pino:
+        specifier: ^8.17.2
+        version: 8.21.0
+    devDependencies:
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+
+  packages/queue:
+    dependencies:
+      '@doc-converter/config':
+        specifier: workspace:*
+        version: link:../config
+      '@doc-converter/contract':
+        specifier: workspace:*
+        version: link:../contract
+      bullmq:
+        specifier: ^5.1.0
+        version: 5.81.5(supports-color@8.1.1)
+      ioredis:
+        specifier: ^5.3.2
+        version: 5.11.1(supports-color@8.1.1)
+    devDependencies:
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+
+  packages/storage:
+    dependencies:
+      '@doc-converter/config':
+        specifier: workspace:*
+        version: link:../config
+      minio:
+        specifier: ^8.0.1
+        version: 8.0.7
+    devDependencies:
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
 
 packages:
 

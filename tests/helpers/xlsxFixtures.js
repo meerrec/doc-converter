@@ -120,4 +120,92 @@ export async function buildZipBomb(sizeBytes = 200 * 1024 * 1024, name = 'xl/wor
   return Buffer.concat(chunks);
 }
 
-export default { buildXlsx, buildZipBomb };
+/**
+ * Собирает архив с недостоверным central directory.
+ *
+ * В отличие от `buildZipBomb`, которая объявляет большой распакованный размер
+ * честно (и потому ловится проверкой коэффициента сжатия), здесь заявленный
+ * размер подменяется на сжатый. По метаданным запись выглядит безобидно —
+ * коэффициент сжатия 1, размеры в пределах лимитов, — а в deflate-потоке
+ * лежат данные, разворачивающиеся в сотни раз. Проверка, доверяющая central
+ * directory, такой архив пропускает.
+ *
+ * @param sizeBytes - фактический размер распакованных данных
+ * @param name - имя записи внутри архива
+ * @returns буфер архива
+ */
+export async function buildLyingZipBomb(sizeBytes = 4 * 1024 * 1024, name = 'xl/worksheets/sheet1.xml') {
+  const zip = new yazl.ZipFile();
+
+  // Нули сжимаются почти бесплатно: реальный коэффициент получается огромным,
+  // а заявленный мы подделаем
+  zip.addBuffer(Buffer.alloc(sizeBytes, 0), name);
+  zip.end();
+
+  const chunks = [];
+
+  for await (const chunk of zip.outputStream) {
+    chunks.push(chunk);
+  }
+
+  const buffer = Buffer.concat(chunks);
+
+  patchCentralDirectorySizes(buffer);
+
+  return buffer;
+}
+
+/** Сигнатура записи central directory. */
+const CD_SIGNATURE = 0x02014b50;
+
+/** Сигнатура конца central directory. */
+const EOCD_SIGNATURE = 0x06054b50;
+
+/** Смещение поля «распакованный размер» внутри записи central directory. */
+const CD_UNCOMPRESSED_SIZE_OFFSET = 24;
+
+/** Смещение поля «сжатый размер» внутри записи central directory. */
+const CD_COMPRESSED_SIZE_OFFSET = 20;
+
+/**
+ * Подменяет в central directory распакованный размер на сжатый.
+ *
+ * Правка идёт от записи End of central directory: поиск сигнатуры по всему
+ * буферу дал бы ложные срабатывания внутри сжатых данных.
+ *
+ * @param buffer - буфер архива (правится на месте)
+ */
+function patchCentralDirectorySizes(buffer) {
+  let eocd = -1;
+
+  for (let i = buffer.length - 22; i >= 0; i -= 1) {
+    if (buffer.readUInt32LE(i) === EOCD_SIGNATURE) {
+      eocd = i;
+      break;
+    }
+  }
+
+  if (eocd < 0) {
+    throw new Error('Не найден конец central directory — фикстура собрана неверно');
+  }
+
+  const entryCount = buffer.readUInt16LE(eocd + 10);
+  let cursor = buffer.readUInt32LE(eocd + 16);
+
+  for (let i = 0; i < entryCount; i += 1) {
+    if (buffer.readUInt32LE(cursor) !== CD_SIGNATURE) {
+      throw new Error(`Запись central directory ${i} не найдена по ожидаемому смещению`);
+    }
+
+    const compressed = buffer.readUInt32LE(cursor + CD_COMPRESSED_SIZE_OFFSET);
+    buffer.writeUInt32LE(compressed, cursor + CD_UNCOMPRESSED_SIZE_OFFSET);
+
+    const nameLength = buffer.readUInt16LE(cursor + 28);
+    const extraLength = buffer.readUInt16LE(cursor + 30);
+    const commentLength = buffer.readUInt16LE(cursor + 32);
+
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+}
+
+export default { buildXlsx, buildZipBomb, buildLyingZipBomb };

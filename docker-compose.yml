@@ -29,7 +29,7 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: apps/api/Dockerfile
     container_name: doc-converter-api
     restart: unless-stopped
     networks:
@@ -96,7 +96,7 @@ services:
       minio:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "node", "/app/dist/nest/health/health-check.js"]
+      test: ["CMD", "node", "/app/apps/api/dist/health/health-check.js"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -116,7 +116,7 @@ services:
   uno-worker-light: &uno-worker
     build:
       context: .
-      dockerfile: Dockerfile.uno-worker
+      dockerfile: apps/worker/Dockerfile
     # Имя образа задано явно: по умолчанию compose назвал бы его
     # по сервису (doc-converter-uno-worker-light), а autoscaler поднимает
     # реплики из AUTOSCALER_WORKER_IMAGE. Один образ на все три очереди —
@@ -223,12 +223,12 @@ services:
   autoscaler:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: apps/api/Dockerfile
     container_name: doc-converter-autoscaler
     restart: unless-stopped
     networks:
       - converter
-    command: ["node", "/app/dist/autoscaler/index.js"]
+    command: ["node", "/app/apps/autoscaler/dist/index.js"]
     environment:
       - NODE_ENV=production
       - REDIS_HOST=valkey
@@ -282,7 +282,7 @@ services:
   web:
     build:
       context: .
-      dockerfile: web/Dockerfile
+      dockerfile: apps/web/Dockerfile
     restart: unless-stopped
     networks:
       - converter

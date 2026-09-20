@@ -100,6 +100,35 @@ describe('POST /convert/xlsx-to-pdf: содержимое файла', () => {
     expect(response.body.error).toBe('magic_mismatch');
   });
 
+  it('старый формат .xls больше не принимается', async () => {
+    // OLE2-контейнер: сигнатура верная для .xls, но формат убран из allowlist
+    const ole = Buffer.concat([
+      Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+      Buffer.alloc(512, 0x00),
+    ]);
+
+    const response = await request(app)
+      .post('/convert/xlsx-to-pdf')
+      .attach('file', ole, 'report.xls');
+
+    expect(response.status).toBe(415);
+    expect(response.body.error).toBe('unsupported_format');
+  });
+
+  it('OLE-содержимое под именем .xlsx отвечает 415 magic_mismatch', async () => {
+    const ole = Buffer.concat([
+      Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+      Buffer.alloc(512, 0x00),
+    ]);
+
+    const response = await request(app)
+      .post('/convert/xlsx-to-pdf')
+      .attach('file', ole, 'report.xlsx');
+
+    expect(response.status).toBe(415);
+    expect(response.body.error).toBe('magic_mismatch');
+  });
+
   it('zip-бомба отсекается до конвертации', async () => {
     // Книга с огромной распакованной записью: соотношение сжатия выдаёт бомбу
     const bomb = await buildZipBomb(200 * 1024 * 1024);

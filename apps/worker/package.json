@@ -1,0 +1,24 @@
+{
+  "name": "@doc-converter/worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Воркер конвертации: BullMQ, soffice через UNO-бридж",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@doc-converter/config": "workspace:*",
+    "@doc-converter/contract": "workspace:*",
+    "@doc-converter/observability": "workspace:*",
+    "@doc-converter/queue": "workspace:*",
+    "@doc-converter/storage": "workspace:*",
+    "bullmq": "^5.1.0"
+  },
+  "devDependencies": {
+    "typescript": "catalog:"
+  }
+}

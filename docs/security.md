@@ -15,11 +15,11 @@
 
 | Слой | Что делает | Где |
 |---|---|---|
-| Ограничитель частоты | Ведро с токенами на IP: `RATE_BURST` ёмкость, `RATE_PER_SEC` пополнение | `src/nest/common/rate-limit.guard.ts` |
-| Лимит размера | `MAX_FILE_BYTES` (100 МиБ) на уровне multer и в сервисе | `src/nest/xlsx/xlsx.controller.ts` |
+| Ограничитель частоты | Ведро с токенами на IP: `RATE_BURST` ёмкость, `RATE_PER_SEC` пополнение | `apps/api/src/common/rate-limit.guard.ts` |
+| Лимит размера | `MAX_FILE_BYTES` (100 МиБ) на уровне multer и в сервисе | `apps/api/src/xlsx/xlsx.controller.ts` |
 | Схема параметров | zod: диапазоны, перечисления, длины | `packages/contract/src/conversion.ts` |
-| Сигнатура файла | PK-заголовок для XLSX, OLE для XLS — расширению верить нельзя | `src/security/magicBytes.ts` |
-| Zip-гард | Бомбы, path traversal, дубликаты записей, число записей | `src/security/zipGuard.ts` |
+| Сигнатура файла | PK-заголовок XLSX — расширению верить нельзя | `apps/api/src/security/magicBytes.ts` |
+| Zip-гард | Бомбы, path traversal, дубликаты записей, число записей | `apps/api/src/security/zipGuard.ts` |
 
 Zip-гард важен именно для XLSX: книга — это zip, который распаковывает
 LibreOffice, и делать это на архиве с соотношением сжатия 1000:1 поздно —

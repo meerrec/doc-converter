@@ -1,0 +1,21 @@
+{
+  // NestJS требует декораторов и метаданных о типах параметров, поэтому здесь
+  // неприменимо нативное стирание типов Node — нужен шаг сборки `tsc`.
+  //
+  // Строгость проверок и среда исполнения — в общей базе workspace.
+  // `declaration` выключен: приложение никто не импортирует.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": false,
+    "declarationMap": false,
+
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+
+    "esModuleInterop": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src"]
+}

@@ -1,0 +1,31 @@
+{
+  "name": "@doc-converter/queue",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Очереди BullMQ, соединения Valkey и состояние задач",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@doc-converter/config": "workspace:*",
+    "@doc-converter/contract": "workspace:*",
+    "bullmq": "^5.1.0",
+    "ioredis": "^5.3.2"
+  },
+  "devDependencies": {
+    "typescript": "catalog:"
+  }
+}

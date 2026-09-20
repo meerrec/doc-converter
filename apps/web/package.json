@@ -1,0 +1,26 @@
+{
+  "name": "@doc-converter/web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Веб-интерфейс сервиса конвертации документов",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@doc-converter/contract": "workspace:*",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "catalog:",
+    "vite": "^8.3.0"
+  }
+}

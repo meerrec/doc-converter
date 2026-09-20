@@ -21,7 +21,7 @@ export async function createServer() {
   process.env.API_PORT ??= '0';
   process.env.PORT ??= '0';
 
-  const { createServer: createNestServer } = await import('../../src/nest/bootstrap.js');
+  const { createServer: createNestServer } = await import('../../apps/api/src/bootstrap.js');
 
   return createNestServer();
 }

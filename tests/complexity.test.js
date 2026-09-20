@@ -9,7 +9,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildXlsx } from './helpers/xlsxFixtures.js';
 
-const { estimateComplexity } = await import('../src/nest/xlsx/complexity.js');
+const { estimateComplexity } = await import('../apps/api/src/xlsx/complexity.js');
 
 describe('Оценка сложности: число листов', () => {
   it('считает листы книги', async () => {
@@ -49,7 +49,9 @@ describe('Оценка сложности: число листов', () => {
 
 describe('Оценка сложности: устойчивость к мусору', () => {
   it('не-zip файл классифицируется по размеру, листы не считаются', async () => {
-    // OLE-контейнер старого формата .xls: это не zip, листов не посчитать
+    // OLE-контейнер (бывший входной формат .xls): это не zip, листов
+    // не посчитать. Формат больше не принимается, но оценка обязана
+    // оставаться устойчивой к любому буферу
     const buffer = Buffer.concat([
       Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
       Buffer.alloc(1024, 0x00),

@@ -1,23 +1,20 @@
 {
+  // Контракт собирается в JS и объявления: его `dist` — рантайм-зависимость
+  // сервера, а типы читает и веб-интерфейс.
+  //
+  // Строгость проверок и среда исполнения — в корневом `tsconfig.json`,
+  // общем для всех серверных пакетов и приложений.
+  "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["ES2022"],
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "strict": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": false,
-    "verbatimModuleSyntax": true,
-    "isolatedModules": true,
-    "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
     "outDir": "dist",
     "rootDir": "src",
-    "skipLibCheck": true
+
+    // Контракт потребляют обе стороны, поэтому сборка обязана быть
+    // предсказуемой для бандлера: `verbatimModuleSyntax` запрещает
+    // синтаксис, который по-разному понимают tsc и Vite
+    "exactOptionalPropertyTypes": false,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true
   },
   "include": ["src"]
 }

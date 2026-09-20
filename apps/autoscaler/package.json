@@ -1,0 +1,21 @@
+{
+  "name": "@doc-converter/autoscaler",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Масштабирование реплик воркеров по длине очередей (docker compose)",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@doc-converter/config": "workspace:*",
+    "@doc-converter/contract": "workspace:*",
+    "@doc-converter/queue": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:"
+  }
+}

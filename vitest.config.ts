@@ -12,10 +12,38 @@
  * из карты экспорта пакета.
  */
 
+import { fileURLToPath } from 'node:url';
 import swc from 'unplugin-swc';
 import { defineConfig } from 'vitest/config';
 
+/**
+ * Ссылка на исходники пакета.
+ *
+ * @param path - путь к `src/index.ts` относительно корня репозитория
+ * @returns абсолютный путь
+ */
+const src = (path: string): string => fileURLToPath(new URL(path, import.meta.url));
+
 export default defineConfig({
+  resolve: {
+    /**
+     * Пакеты workspace резолвятся в свои **исходники**, а не в собранный `dist`.
+     *
+     * Без этого тесты требовали бы предварительной сборки: импорт
+     * `@doc-converter/config` из проверяемого кода пошёл бы по `main`
+     * в `dist/index.js`, которого до `pnpm -r build` не существует. Тесты
+     * намеренно читают исходники — так прогон остаётся быстрым и не зависит
+     * от того, собирали ли проект перед ним.
+     */
+    alias: {
+      '@doc-converter/config': src('./packages/config/src/index.ts'),
+      '@doc-converter/contract': src('./packages/contract/src/index.ts'),
+      '@doc-converter/observability': src('./packages/observability/src/index.ts'),
+      '@doc-converter/queue': src('./packages/queue/src/index.ts'),
+      '@doc-converter/storage': src('./packages/storage/src/index.ts'),
+    },
+  },
+
   plugins: [
     /**
      * Транспиляция через SWC.
