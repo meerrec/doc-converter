@@ -1,372 +1,115 @@
 # Развёртывание и эксплуатация
 
-## Быстрый старт
+## Требования
+
+- Docker 24+ и Docker Compose v2 (используются `mem_limit`, `group_add`,
+  якоря YAML)
+- Для автомасштабирования в compose — доступ к `/var/run/docker.sock`
+  и GID его владельца в `.env`:
+
+  ```bash
+  # Linux
+  stat -c '%g' /var/run/docker.sock      # GID группы docker
+  # macOS (Docker Desktop) — сокет принадлежит root:root, нужно 0
+  ```
+
+  Без этого autoscaler перезапускается с ошибкой «Docker API недоступен».
+
+- Образы MinIO берутся с `quay.io`: MinIO прекратила публикацию на Docker Hub,
+  и `minio/minio` там больше не существует.
+
+## Запуск
 
 ```bash
 docker compose up --build
-curl http://localhost:3000/health    # API
-open http://localhost:8080           # веб-интерфейс
 ```
 
-Поднимаются четыре сервиса: `web` (nginx с интерфейсом), `api`, `worker`, `valkey`.
-Наружу открыты порт интерфейса (8080) и порт API (3000).
+Поднимаются `api`, `web`, три стартовых воркера, `autoscaler`, `minio`
+с `minio-init`, `valkey`. Первый запуск собирает два образа: `api`
+(лёгкий) и `uno-worker` (с LibreOffice, порядка 700 МБ).
 
-## Сервисы
+Проверка: `curl -s localhost:3000/health | jq` → `{ "status": "ok", ... }`.
 
-| Сервис | Контейнер | Роль | Порты | Ресурсы |
-|---|---|---|---|---|
-| `web` | `doc-converter-web` | Веб-интерфейс: nginx раздаёт SPA и проксирует API | `8080:80` | `mem_limit 128m`, `cpus 0.25`, `pids_limit 64` |
-| `api` | `doc-converter-api` | HTTP API: приём запросов, валидация, синхронная конвертация через fork-пул | `127.0.0.1:3000:3000` | `mem_limit 3g` (swap выключен), `cpus 1.0`, `pids_limit 256` |
-| `worker` | `doc-converter-worker` | BullMQ-воркер: асинхронные задачи через fork-пул | нет | `mem_limit 3g`, `cpus 2.0`, `pids_limit 512` |
-| `valkey` | `doc-converter-valkey` | Очередь, идемпотентность, статусы задач | нет | `mem_limit 512m`, `cpus 0.5`, `pids_limit 100` |
+## Ресурсы и память
 
-Интерфейс доступен на `http://localhost:8080`. Порт `3000` публикуется отдельно —
-он остаётся точкой входа для интеграций, которые обращаются к API напрямую.
-
-### Как устроена раздача интерфейса
-
-Контейнер `web` — это nginx с собранной статикой (`web/Dockerfile`, стадия сборки Vite +
-`nginx:alpine`). Конфигурация `web/nginx.conf`:
-
-- отдаёт статику из `/usr/share/nginx/html` со SPA-fallback на `index.html`;
-- проксирует `/(ConvertService.ashx|status|health|results|storage)` на `api:3000`;
-- `client_max_body_size 50m` — лимит интерфейса; у API потолок выше
-  (`BODY_LIMIT_BYTES = MAX_BODY_BYTES` = 100 МиБ), поэтому через веб документ крупнее
-  50 МБ не загрузить, хотя напрямую в API он пройдёт;
-- `proxy_read_timeout 60s` — больше `SYNC_TIMEOUT_MS` (30 с);
-- ассеты с хешем в имени кешируются на год, `index.html` — без кеша.
-
-Фронтенд и API оказываются на одном origin, поэтому CORS (который у сервиса включается
-только при `NODE_ENV=development`) не требуется, а CSP из `src/nest/common/http-defaults.ts`
-не мешает загрузке.
-
-Оба сервиса приложения собираются из одного `Dockerfile`; `worker` переопределяет команду
-на `node /app/dist/worker/index.js` (`docker-compose.yml`) и получает `SYNC_ENABLED=false` —
-синхронный режим обслуживает только `api`.
-
-Порядок запуска задан через `depends_on: condition: service_healthy`: `api` и `worker`
-стартуют после того, как `valkey` начнёт отвечать на `PING`.
-
-## Образ
-
-`Dockerfile` — двухстадийная сборка на `node:24-bookworm-slim`:
-
-1. **builder** — установка шрифтов (`fonts-dejavu-core`, `fonts-liberation`, `fonts-noto-cjk`,
-   `fonts-noto-core`), создание непривилегированного пользователя `conv`, установка
-   зависимостей через `pnpm ci --filter doc-converter...`, сборка контракта
-   (`pnpm --filter @doc-converter/contract build`) и сервера (`npm run build:server`).
-   Инструменты сборки нативных модулей (`python3`, `make`, `g++`) не нужны: нативных
-   зависимостей нет.
-2. **финал** — перенос `/app` целиком вместе с `node_modules` и собранным `dist`,
-   создание каталогов `/data/storage`, `/var/log/converter`, `/tmp` с правами `750`
-   и владельцем `conv:conv`.
-
-> **Сборка обязательна.** `.dockerignore` исключает `dist`, а сервер импортирует контракт
-> и стартует с `dist/nest/main.js`. Без шагов сборки в builder образ соберётся,
-> но упадёт на старте — проверять именно `docker compose build`, а не локальный `npm test`.
-
-Контейнер работает от пользователя `conv` (`USER conv`, продублировано в compose),
-слушает `3000`.
-
-WASM-движок отдельно не устанавливается: он приходит как npm-зависимость
-`@matbee/libreoffice-converter`. В версии 2.x внутри пакета лежат **распакованные**
-`soffice.wasm` (~147 МБ) и `soffice.data` (~100 МБ) — отсюда ~240 МБ каталога `wasm`
-против ~74 МБ сжатых `.gz` в 1.x. Шрифты нужны именно ему — от них зависит
-отрисовка текста в PDF.
-
-`NODE_OPTIONS` в образе (`ENV NODE_OPTIONS` в `Dockerfile`):
-
-```
---disable-wasm-trap-handler --max-old-space-size=1536 --unhandled-rejections=strict
-```
-
-`--disable-wasm-trap-handler` убирает 10-гигабайтный виртуальный резерв V8, иначе процесс
-не укладывается в `mem_limit: 3g`.
-
-## Ужесточение контейнера
-
-Для `api` и `worker` задано:
-
-```yaml
-user: conv
-read_only: true
-tmpfs: /tmp:size=512m,mode=1777
-cap_drop: [ALL]
-security_opt: [no-new-privileges:true]
-ulimits: { nofile: { soft: 4096, hard: 8192 } }
-```
-
-Корневая файловая система только для чтения; запись идёт в тома (`/data/storage`,
-`/var/log/converter`) и в `tmpfs` `/tmp` — там `fork-worker` держит профиль LibreOffice
-(`/tmp/libreoffice-profile`).
-
-`valkey` работает от root образа с `cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE]`
-и `--appendonly yes` (AOF-персистентность в том `valkey-data`).
-
-### Память Valkey
-
-```
---maxmemory 400mb --maxmemory-policy noeviction --maxmemory-clients 64mb --save ""
-```
-
-- `maxmemory` ниже `mem_limit` (512 МБ) на запас для фрагментации аллокатора и COW-страниц
-  перезаписи AOF: `used_memory` их не учитывает, а RSS учитывает. При увеличении `mem_limit`
-  держите ту же пропорцию (примерно 0,75).
-- Политика **`noeviction`** — единственная безопасная для очереди. `allkeys-lru` молча
-  вытеснил бы ключи BullMQ (потеря задач: клиент навсегда остался бы с `queued`),
-  `volatile-lru` — ключи статусов и результатов. С `noeviction` переполнение превращается
-  в ошибку записи, которую API отдаёт клиенту как `503 storage_unavailable` с `Retry-After`.
-- `maxmemory-clients` ограничивает буферы ответов: без него один клиент, запросивший много
-  ключей разом, выедает память в обход `maxmemory`.
-- `--save ""` отключает RDB-снимки: при включённом AOF они дублируют форк и его COW-страницы.
-
-## Сеть и тома
-
-Все сервисы — в одной bridge-сети `converter` с флагом `internal: true`.
-Контейнеры видят друг друга по именам сервисов (`REDIS_HOST=valkey`), наружу открыт
-только проброшенный порт API.
-
-> **Важно.** `internal: true` отключает исходящий трафик во внешнюю сеть для **всех** сервисов
-> сети, включая `api`, поэтому конвертация по внешнему `url` (`"url": "https://…"`)
-> в такой конфигурации не работает — скачивание из интернета заблокировано.
->
-> Внутренний адрес тоже не подойдёт: SSRF-защита (`urlGuard`) блокирует приватные
-> диапазоны и имена с подстроками `localhost`/`local`/`internal`/`private`/`intranet`,
-> так что соседний контейнер по `url` не забрать. Практический вывод: **в этой конфигурации
-> источник передаётся полем `data`** (base64), а не ссылкой. Если `url` нужен, придётся
-> снять `internal: true` (и ограничивать SSRF иначе) и использовать публичный хост.
-
-Тома:
-
-| Том | Точка монтирования | Содержимое |
+| Сервис | `mem_limit` | Почему |
 |---|---|---|
-| `doc-converter-storage-data` | `/data` у `api` и `worker` | `/data/storage` — результаты конвертации, `/data/incoming` — входные файлы очереди |
-| `doc-converter-audit-log` | `/var/log/converter` | `audit.log` |
-| `doc-converter-valkey-data` | `/data` (в контейнере valkey) | AOF-файлы Valkey |
+| `api` | 1 ГБ | Файлы до 100 МБ в памяти при загрузке в хранилище |
+| `uno-worker-*` | 2 ГБ | LibreOffice + документ + копия при экспорте |
+| `autoscaler` | 256 МБ | Только расчёт и вызовы Docker API |
+| `minio` | 512 МБ | Объекты до 100 МБ |
+| `valkey` | 512 МБ | `maxmemory 400mb` плюс запас на фрагментацию и COW |
 
-> **Общий том обязателен.** Асинхронный путь передаёт документ воркеру не через Redis,
-> а файлом: api пишет его в `INPUT_STORAGE_PATH`, воркер читает по пути из задачи. Реплики
-> `api` и `worker` обязаны видеть один и тот же каталог. В пределах одного хоста это named
-> volume; при разъезде по хостам потребуется NFS или объектное хранилище — иначе воркер
-> не найдёт входной файл и задача упадёт.
->
-> **Разовая чистка накопленного.** Упавшие задачи, оставшиеся от прежней версии
-> (`removeOnFail: false`), сами не удалятся — обрезка срабатывает только в момент
-> завершения очередной задачи. Пока очередь пуста (`waiting = 0`), удалите их порциями:
->
-> ```bash
-> docker compose exec valkey valkey-cli --scan --pattern 'bull:conversion:failed*' | head
-> # затем порциями через очередь (по 50), а не getFailed() целиком:
-> #   queue.clean(0, 50, 'failed')  — в цикле до пустого результата
-> ```
->
-> Порциями — потому что `getFailed()` читает каждую задачу целиком вместе с payload'ом
-> и вытянул бы все данные в память процесса.
->
-> **Миграция при обновлении.** Раньше том монтировался в `/data/storage`, поэтому
-> накопленные результаты лежат в его корне, а код ждёт их в `/data/storage`. Перед первым
-> запуском новой версии перенесите файлы:
->
-> ```bash
-> docker run --rm -v doc-converter-storage-data:/data alpine \
->   sh -c 'mkdir -p /data/storage && find /data -maxdepth 1 -type f -exec mv {} /data/storage/ \;'
-> ```
+`memswap_limit` равен `mem_limit` намеренно: swap выключен, и при нехватке
+памяти контейнер убивается OOM-killer'ом, а не деградирует. Менять значения
+только парой — при `mem_limit` больше `memswap_limit` контейнер не стартует.
 
-## Healthcheck
-
-В образе и в compose задан один и тот же healthcheck:
-
-```dockerfile
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD node /app/dist/nest/health/health-check.js
-```
-
-Скрипт (`src/nest/health/health-check.ts`) проверяет доступность Valkey и наличие пакета
-конвертера с WASM-ассетами. Полная инициализация движка в healthcheck не выполняется:
-она требует загрузки ~48 МБ и слишком дорога для проверки, запускаемой каждые 30 секунд.
-
-У сервиса `worker` healthcheck **отключён** (`healthcheck: disable: true`). Проверка
-запускается отдельным процессом, который создаёт новое соединение с Valkey, а статус
-контейнера воркера всё равно никем не читается — Docker не перезапускает контейнер
-по «unhealthy». Соединение healthcheck'а закрывается явно (`closeRedisClient`), иначе
-при нескольких репликах на Valkey копились бы сессии до истечения TCP-таймаутов.
-HTTP-эндпоинт `GET /health` (контроллер `src/nest/health/health.controller.ts`) возвращает:
-
-```json
-{ "status": "ok", "wasm": true, "version": "1.0.0" }
-```
+**Сколько реплик влезает.** Реплика воркера занимает 400–600 МБ в покое
+и до 2 ГБ на пике. Планируя `maxReplicaCount`, считайте по пику: три тяжёлые
+реплики — это до 6 ГБ.
 
 ## Масштабирование
 
-- **Синхронный путь** масштабируется репликами `api`. Каждая реплика держит собственный
-  пул из `FORK_POOL_SIZE` fork-процессов и семафор на `MAX_CONCURRENT` задач.
-- **Асинхронный путь** масштабируется репликами `worker`: BullMQ раздаёт задачи между
-  воркерами, конкуренция внутри процесса — `MAX_CONCURRENT`.
-- **Valkey** — общая точка состояния для идемпотентности и статусов; при нескольких
-  репликах `api` именно она обеспечивает уникальность `taskId`.
-- **Ограничитель частоты реплицируется плохо.** Ведро с токенами живёт в памяти процесса
-  (`nest/common/rate-limit.guard.ts`), поэтому каждая реплика считает запросы независимо,
-  а при рестарте счётчики обнуляются. При нескольких репликах лимит на клиента фактически
-  умножается на их число — если это неприемлемо, ограничивайте на входе (`limit_req`
-  в nginx), а не в приложении.
-- **`trust proxy`** должен быть выставлен (`TRUST_PROXY=1` в compose): без него `req.ip`
-  за прокси — адрес прокси-контейнера, и все клиенты делят одно ведро. Порт `api`
-  при этом публикуется только на loopback — иначе клиент подделает `X-Forwarded-For`.
+Правила и обоснование — в README, раздел «Масштабирование».
 
-### Память и прогрев пула
+### Kubernetes (KEDA)
 
-Память — основной ограничитель. Библиотека конвертера 2.x держит **около 1.16 ГБ RSS
-на fork-процесс** (замерено): WASM-ассеты в ней распакованы, против ~240 МБ на задачу
-в 1.x. Поэтому `FORK_POOL_SIZE` и `MAX_CONCURRENT` снижены до 2 — четыре процесса
-не укладываются в `mem_limit: 3g`. При увеличении значений пропорционально поднимайте
-`mem_limit`.
+Применяются `deploy/k8s/scaledobject-{light,medium,heavy}.yaml` плюс
+Deployment'ы приложения. KEDA читает длину списка `bull:xlsx2pdf.<tier>:wait`
+и меняет число реплик; доступ к Docker API не нужен.
 
-Воркер **прогревает пул при старте** (`warmupPool` в `worker/fork-pool.ts`) — создаёт
-конвертеры последовательно, по одному процессу. Это не оптимизация ради красоты,
-а необходимость: инициализация читает WASM-ассеты и сканирует шрифты, и если несколько
-процессов делают это одновременно, они конкурируют и не укладываются в `JOB_TIMEOUT_MS`.
-Замерено: две параллельные конвертации в непрогретом пуле занимали ~79 с и падали
-по таймауту, в прогретом — 2 с. В логе успешного старта видно `[WORKER] Пул прогрет`.
+При смене `QUEUE_PREFIX` поправьте `listName` в манифестах.
 
-Конвертер **переиспользуется между задачами** процесса: `convertDocument` из библиотеки
-создаёт и уничтожает его на каждый вызов, а инициализация — самая дорогая часть
-(создание ~0.8 с, первая конвертация ~0.3 с, каждая следующая ~12 мс), поэтому
-`fork-worker.ts` держит конвертер и сбрасывает его только после ошибки.
+### docker compose (autoscaler)
 
-`cpus` у `api` — **2.0**, а не 1.0: на одном ядре синхронная конвертация не укладывается
-в `SYNC_TIMEOUT_MS`, запросы падают с `sync_timeout`. Проверено: с 2.0 тот же запрос
-проходит за 3 с.
+Сервис `autoscaler` создаёт и удаляет контейнеры через Docker API:
 
-## Требования к reverse proxy
+- стартовые реплики compose (без метки `doc-converter.managed`) только
+  считаются — их удаление привело бы к борьбе с `restart: unless-stopped`;
+- созданные им самим (`doc-converter.managed=autoscaler`) — управляются
+  полностью;
+- шаг изменения не больше `AUTOSCALER_MAX_STEP` за цикл.
 
-`SYNC_TIMEOUT_MS` (по умолчанию 30 с) **обязан быть меньше** таймаута балансировщика:
-
-```nginx
-proxy_read_timeout 60s;   # > SYNC_TIMEOUT_MS
-```
-
-Иначе вместо аккуратного `504 sync_timeout` клиент получит оборванное соединение.
-Тот же принцип для `REQUEST_BODY_TIMEOUT_MS` (15 с) — приём тела запроса должен
-завершаться раньше, чем балансировщик потеряет терпение.
-
-## Логи
-
-- Основной поток логов — stdout/stderr контейнера (события старта, ошибки Redis, конвертации).
-- Аудит-лог пишется отдельным pino-инстансом в `AUDIT_LOG_PATH`
-  (`/var/log/converter/audit.log`) и хранится в томе `doc-converter-audit-log`.
-  Формат и события описаны в [security.md](security.md#аудит-лог).
-
-## Запуск без Docker
-
-```bash
-pnpm install
-npm run build:contract  # контракт — рантайм-зависимость сервера
-npm run build:server    # dist/nest/main.js и dist/worker/index.js
-export REDIS_HOST=localhost REDIS_PORT=6379
-npm run dev             # api + worker через concurrently, NODE_ENV=development
-```
-
-Сервер запускается только из собранного `dist`: декораторам NestJS нужен
-`emitDecoratorMetadata`, с которым нативное стирание типов Node 24 несовместимо.
-Скрипты `dev`/`start` сборку не выполняют — её нужно сделать до запуска (тесты собирают
-`dist` сами через `pretest`).
-
-Для локального запуска нужен доступный Valkey/Redis. `NODE_ENV=development` включает CORS
-со значением `*`.
-
-## Известные особенности сборки
-
-Это стоит знать до первого `docker compose up --build`:
-
-| Наблюдение | Последствие |
-|---|---|
-| Нативных модулей в зависимостях нет | Стадия builder обходится без `python3`/`make`/`g++` — соответствующий слой из `Dockerfile` удалён |
-| Зависимости ставятся без `--prod` | В production-образ попадают инструменты сборки и тестов: `typescript` (~23 МБ), `@swc/core` с платформенным бинарником (~25 МБ), `vitest` с Vite, `supertest`, `yazl`, `concurrently`. Образ — **1.17 ГБ** (шрифты 137 МБ, `node_modules` 271 МБ, каталог `wasm` конвертера 237 МБ) |
-| `pnpm install --prod` после сборки **не уменьшает образ** | Шаг снимает симлинки верхнего уровня, но пакеты остаются в виртуальном хранилище `node_modules/.pnpm` — откуда и берётся вес. Проверено: состав каталога меняется, размер не уменьшается. Настоящее решение — отдельная стадия установки в пустой каталог; не сделано осознанно |
-| Библиотека конвертера 2.x приносит **распакованные** WASM-ассеты | Каталог `wasm` — 237 МБ против 74 МБ сжатых `.gz` в 1.x, образ тяжелеет примерно на 170 МБ |
-| В `Dockerfile` есть самоссылка `ln -sf …/dejavu …/dejavu` с `\|\| true` | Никакого эффекта не даёт, ошибка глушится |
-
-Образ веб-интерфейса (`web/Dockerfile`) от этого не зависит и собирается отдельно:
-`docker build -f web/Dockerfile -t doc-converter-web .` — стадия сборки Vite на Node,
-финальная стадия на `nginx:alpine`, около 76 МБ.
-
-### Требование к версии Node: не ниже 24
-
-Базовый образ — `node:24-bookworm-slim`, в `package.json` стоит `engines.node: ">=24.0.0"`.
-
-Исторически это требование задавала зависимость `isolated-vm` (совместимые версии 6.x/7.x
-требуют Node 22+/24+, на Node 20 модуль падал с SIGSEGV при создании изолята).
-Сейчас модуль удалён, и жёсткой причины оставаться на 24 нет — Node 24 сохраняется
-как версия, на которой сервис разрабатывается и тестируется. Понижать её следует
-с прогоном всего набора тестов.
-
-Сборка образа больше не требует компилятора: нативных модулей в зависимостях нет.
+> Autoscaler монтирует docker.sock, что равносильно root-правам на хосте.
+> В продакшене за пределами compose используйте KEDA.
 
 ## Диагностика
 
-```bash
-docker compose ps                       # статусы и health
-docker compose logs -f api worker       # поток логов
-curl -s localhost:3000/health | jq      # готовность API
-docker compose exec valkey valkey-cli ping
-```
-
-Частые причины отказов:
-
-| Симптом | Вероятная причина |
+| Симптом | Причина и что смотреть |
 |---|---|
-| `503`/`500` при синхронной конвертации | Все слоты семафора заняты: либо задачи идут дольше `JOB_TIMEOUT_MS`, либо упал fork-процесс |
-| `504 sync_timeout` | Запрос не уложился в `SYNC_TIMEOUT_MS` — проверьте таймаут балансировщика и размер документа |
-| Контейнер `unhealthy`, но API отвечает | Healthcheck проверяет не HTTP, а доступность Valkey и наличие пакета конвертера — смотрите его вывод (`docker inspect --format '{{json .State.Health}}' doc-converter-api`) |
-| `Не удалось подключиться к Valkey/Redis` | `valkey` не поднялся или неверные `REDIS_HOST`/`REDIS_PORT` |
-| Ответы `503 storage_unavailable` | Valkey недоступен или упёрся в `maxmemory` (политика `noeviction`). Смотрите `docker compose exec valkey valkey-cli info memory`: `used_memory` против `maxmemory` |
-| Контейнер `valkey` перезапускается, в `dmesg` OOM-kill | Памяти не хватило вопреки `maxmemory`: проверьте `mem_limit` и размер значений. После перехода на передачу входных файлов через диск значения в Redis — сотни байт, поэтому рост памяти означает утечку ключей без TTL |
-| Задачи в очереди есть, но не выполняются | Воркер не видит входной файл: реплики `api` и `worker` должны делить том `storage-data`, а `INPUT_STORAGE_PATH` — существовать и быть записываемым |
-| `OOM command not allowed when used memory > 'maxmemory'` в логе воркера | Память Valkey выбрана; воркер уходит в паузу на `WORKER_OOM_PAUSE_MS`. Разбор — в разделе «Переполнение памяти Valkey» ниже |
-| Конвертация по `url` не работает | Сеть compose помечена `internal: true` |
+| `storage_unavailable` (503) | MinIO недоступен или нет бакета. `docker compose logs minio-init`, `mc ls local/conversions` |
+| Задача вечно в `queued` | Воркеры не слушают эту очередь: проверьте `WORKER_QUEUE` у реплики и имя очереди в `job:{id}` |
+| `uno_unavailable` | soffice не поднялся: `docker compose logs uno-worker-light` — ищите `[entrypoint]` |
+| `conversion_timeout` | Книга не уложилась в `CONVERSION_TIMEOUT_MS`: проверьте размер, число листов и память реплики |
+| `conversion_failed` | Ошибка самого документа; текст от LibreOffice — в `message` статуса и в логах воркера |
+| Ссылка на результат не открывается | `S3_PUBLIC_ENDPOINT` не совпадает с адресом, доступным клиенту |
+| Контейнеры воркеров копятся | Autoscaler не может обратиться к Docker API: проверьте `DOCKER_GID` и `docker compose logs autoscaler` |
+| Реплики постоянно перезапускаются | Падает soffice: смотрите логи entrypoint, чаще всего это нехватка памяти в `/tmp` (tmpfs) |
 
-### Переполнение памяти Valkey (`maxmemory`)
-
-При `maxmemory` и политике `noeviction` Valkey отвергает **запись**, но продолжает
-обслуживать чтение. Симптом в логе воркера — `OOM command not allowed when used memory
-> 'maxmemory'`, повторяющийся сотнями тысяч строк: каждая попытка записать что-либо
-(завершить задачу, обновить статус) получает отказ на ближайшем событии event loop.
-
-**Почему переполнение не рассасывается само.** Обрезка упавших задач
-(`FAILED_JOB_TTL_SEC`, `MAX_FAILED_JOBS`) выполняется в момент завершения очередной
-задачи — внутри `moveToFinished`. Но завершение само является записью в Redis, а она
-отвергается. Круг замыкается: OOM → задача не завершается → обрезка не срабатывает →
-память не освобождается. Разовый перезапуск воркера это не лечит. Воркер после
-`WORKER_OOM_PAUSE_MS` возобновляется, но если память не освободить, отказ повторится.
-
-**Как отличить наследство в томе от нового кода.** Смотрите две величины:
+Полезные команды:
 
 ```bash
-docker compose exec valkey valkey-cli info memory | grep -E 'used_memory:|maxmemory:'
-docker compose logs valkey | grep 'RDB memory usage when created'   # пишется при старте
-docker compose exec valkey valkey-cli memory usage bull:conversion:<id>
+# Состояние очередей
+docker compose exec valkey valkey-cli llen bull:xlsx2pdf.heavy:wait
+docker compose exec valkey valkey-cli llen bull:xlsx2pdf.heavy:active
+
+# Состояние задачи
+docker compose exec valkey valkey-cli hgetall job:<jobId>
+
+# Реплики под управлением autoscaler'а
+docker ps --filter label=doc-converter.role=uno-worker
+
+# Проверка UNO вручную
+docker compose exec uno-worker-light python3 /app/docker/uno/uno_convert.py --ping
 ```
 
-| Наблюдение | Причина |
-|---|---|
-| `used_memory` высок с первой секунды и не растёт; `RDB memory usage when created` близко к `maxmemory` | В томе данные от прежних версий (задачи старого формата с `inputBuffer` в base64). Новый код тут ни при чём |
-| `used_memory` растёт на глазах; `memory usage` ключа задачи — десятки мегабайт | Развёрнут старый код: документ по-прежнему едет в Redis. Нужен `docker compose up -d --build` |
+## Обновление
 
-В рабочем варианте ключ `bull:conversion:<id>` занимает килобайты (метаданные и путь
-к файлу), `task:{id}` — только статус, `task:{id}:result` — ссылку на файл.
+Порядок: сначала `api` (он совместим со старой и новой версиями задач,
+пока формат данных не менялся), затем воркеры. Задачи, взятые воркером
+в момент остановки, возвращаются в очередь stalled-механизмом BullMQ
+(`BULLMQ_STALLED_INTERVAL`), поэтому простоя для клиента не возникает —
+увеличивается только время ожидания.
 
-**Восстановление.** В тестовом окружении, где содержимое очереди не нужно, удаляется
-только том Valkey — целиком, вместе с временными `temp-*.rdb`, которые остаются от
-сорванных фоновых сохранений:
-
-```bash
-docker compose down
-docker volume rm doc-converter-valkey-data
-docker compose up -d
-```
-
-Именно `docker volume rm`, а не `docker compose down -v`: последний снёс бы заодно
-`storage-data` (результаты конвертации) и `audit-log`.
-
-В рабочем окружении том удалять нельзя — освобождайте память порциями, как описано
-в «Разовая чистка накопленного» выше, и следите за `used_memory` между порциями.
+При изменении формата задачи или имён очередей сначала останавливаются
+воркеры старой версии, иначе они будут разбирать задачи, которых не понимают.

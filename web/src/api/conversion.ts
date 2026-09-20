@@ -1,79 +1,85 @@
 /**
- * Обращение к эндпоинтам конвертации.
+ * Обращение к эндпоинтам конвертации XLSX → PDF.
  *
- * Интерфейс всегда работает в асинхронном режиме (async: true): синхронный
- * путь на сервере не сохраняет файл результата, поэтому скачать его было бы
- * нельзя. Постановка в очередь возвращает taskId, а готовность отслеживается
- * опросом GET /status.
+ * Постановка задачи — `POST /convert/xlsx-to-pdf` с файлом в multipart/form-data;
+ * файл уходит телом запроса, а не в base64, поэтому кодировать его в памяти
+ * вкладки больше не нужно. Идентификатор задачи выдаёт сервер: клиент его
+ * не придумывает и не может переиспользовать (как было с полем `key`,
+ * на котором держалась идемпотентность старого API).
  */
 
-import { request, UPLOAD_TIMEOUT_MS } from './client';
-import { STATUS_BATCH_SIZE, STATUS_CONCURRENCY } from '../config';
-import { createLimiter } from '../lib/limiter';
+import { convertAcceptedSchema, jobStatusResponseSchema } from '@doc-converter/contract';
 import type {
-  ConversionAcceptedResponse,
   ConversionOptions,
-  ConversionRequest,
-  TaskStatusResponse,
-  BatchStatusResponse,
+  ConvertAccepted,
+  JobStatusResponse,
 } from '@doc-converter/contract';
+import { request, UPLOAD_TIMEOUT_MS } from './client';
+import { STATUS_CONCURRENCY, STATUS_MIN_INTERVAL_MS } from '../config';
+import { createLimiter } from '../lib/limiter';
 
-/** Параметры постановки задачи в очередь. */
+/** Параметры постановки задачи. */
 export interface SubmitParams {
-  taskId: string;
-  filetype: string;
-  outputtype: string;
-  /** Содержимое файла в base64. */
-  data: string;
-  /** Имя файла — уходит в title для отображения в метаданных задачи. */
-  title?: string;
-  options?: ConversionOptions;
+  /** Исходная книга Excel. */
+  file: File;
+  /** Параметры конвертации. */
+  options: ConversionOptions;
 }
 
 /**
- * Убирает из опций пустые значения.
+ * Собирает тело multipart-запроса.
  *
- * Сервер отвергает null и пустые строки для объектных и строковых полей
- * (field_type_mismatch / region_invalid), поэтому незаполненные поля
- * не отправляются вовсе.
+ * Поля multipart — строки, поэтому числа и булевы значения приводятся
+ * к строкам: сервер разбирает их схемой контракта (`booleanField`
+ * и `integerField`).
  *
- * @param options - опции конвертации
- * @returns объект только с заполненными полями
+ * Пустые необязательные строки не отправляются вовсе: пустой водяной знак
+ * сервер принял бы как значение, а пустой пароль — как пароль из нуля
+ * символов, то есть PDF оказался бы защищённым «никаким» паролем.
+ *
+ * @param params - файл и параметры конвертации
+ * @returns тело запроса
  */
-function compactOptions(options: ConversionOptions): ConversionOptions {
-  const result: ConversionOptions = {};
+export function buildConversionForm(params: SubmitParams): FormData {
+  const { file, options } = params;
+  const form = new FormData();
 
-  if (typeof options.codePage === 'number') {
-    result.codePage = options.codePage;
+  form.append('file', file, file.name);
+
+  const watermark = options.watermark?.trim() ?? '';
+
+  if (watermark !== '') {
+    form.append('watermark', watermark);
   }
 
-  if (typeof options.delimiter === 'number') {
-    result.delimiter = options.delimiter;
+  form.append('watermarkMode', options.watermarkMode);
+  form.append('fitToOnePage', String(options.fitToOnePage));
+  form.append('pdfVersion', options.pdfVersion);
+  form.append('quality', String(options.quality));
+  form.append('reduceImageResolution', String(options.reduceImageResolution));
+  form.append('maxImageResolution', String(options.maxImageResolution));
+  form.append('exportBookmarks', String(options.exportBookmarks));
+  form.append('taggedPdf', String(options.taggedPdf));
+
+  if (options.userPassword) {
+    form.append('userPassword', options.userPassword);
   }
 
-  if (typeof options.region === 'string' && options.region.trim() !== '') {
-    result.region = options.region.trim();
+  if (options.ownerPassword) {
+    form.append('ownerPassword', options.ownerPassword);
   }
 
-  if (typeof options.password === 'string' && options.password !== '') {
-    result.password = options.password;
-  }
+  form.append('restrictPermissions', String(options.restrictPermissions));
+  form.append('allowPrinting', String(options.allowPrinting));
+  form.append('allowChanges', String(options.allowChanges));
 
-  if (options.documentLayout && Object.keys(options.documentLayout).length > 0) {
-    result.documentLayout = options.documentLayout;
-  }
-
-  if (options.spreadsheetLayout && Object.keys(options.spreadsheetLayout).length > 0) {
-    result.spreadsheetLayout = options.spreadsheetLayout;
-  }
-
-  return result;
+  return form;
 }
 
 /**
  * Ставит задачу конвертации в очередь.
  *
- * @param params - параметры задачи
+ * @param params - файл и параметры конвертации
  * @param signal - сигнал отмены
  * @returns ответ сервера с идентификатором задачи
  * @throws {ApiError} - если сервер отклонил запрос
@@ -81,89 +87,44 @@ function compactOptions(options: ConversionOptions): ConversionOptions {
 export async function submitConversion(
   params: SubmitParams,
   signal?: AbortSignal
-): Promise<ConversionAcceptedResponse> {
-  const body: ConversionRequest = {
-    filetype: params.filetype,
-    outputtype: params.outputtype,
-    data: params.data,
-    key: params.taskId,
-    async: true,
-    ...(params.title ? { title: params.title.slice(0, 255) } : {}),
-    ...compactOptions(params.options ?? {}),
-  };
-
-  return request<ConversionAcceptedResponse>('/ConvertService.ashx', {
+): Promise<ConvertAccepted> {
+  return request<ConvertAccepted>('/convert/xlsx-to-pdf', {
     method: 'POST',
-    body,
+    body: buildConversionForm(params),
+    parse: (value) => convertAcceptedSchema.parse(value),
     signal,
     timeoutMs: UPLOAD_TIMEOUT_MS,
   });
 }
 
 /**
- * Ограничитель одновременных запросов статусов.
+ * Ограничитель запросов статуса.
  *
- * Отдельный от лимитера отправки: пауза между стартами здесь не нужна —
- * опрос идёт по расписанию поллера, — а нужно лишь не выпускать все порции
- * разом. `clear()` у него не вызывается: лимитер живёт столько же, сколько
- * приложение, и отмена опроса идёт через сигнал запроса.
+ * Батча в новом API нет: статус запрашивается по каждой задаче отдельно,
+ * поэтому единственный способ не выйти за лимит частоты сервера — общая
+ * пауза между запусками. Живёт столько же, сколько приложение: отмена опроса
+ * идёт через сигнал конкретного запроса, а не через `clear()`.
  */
-const statusLimiter = createLimiter(STATUS_CONCURRENCY, 0);
+const statusLimiter = createLimiter(STATUS_CONCURRENCY, STATUS_MIN_INTERVAL_MS);
 
 /**
- * Запрашивает статусы задач одной пачкой.
+ * Запрашивает состояние одной задачи.
  *
- * Один запрос на всю пачку вместо запроса на задачу: каждый HTTP-запрос
- * расходует общий лимит частоты, поэтому пакетный опрос экономит бюджет
- * пропорционально числу активных задач.
- *
- * @param taskIds - идентификаторы задач
+ * @param jobId - идентификатор задачи, выданный сервером
  * @param signal - сигнал отмены
- * @returns статусы задач (порядок соответствует серверному)
- */
-export async function fetchStatuses(
-  taskIds: string[],
-  signal?: AbortSignal
-): Promise<TaskStatusResponse[]> {
-  if (taskIds.length === 0) {
-    return [];
-  }
-
-  const chunks: string[][] = [];
-
-  for (let offset = 0; offset < taskIds.length; offset += STATUS_BATCH_SIZE) {
-    chunks.push(taskIds.slice(offset, offset + STATUS_BATCH_SIZE));
-  }
-
-  // Пачки независимы, поэтому уходят параллельно: последовательный обход
-  // давал водопад — вторая пачка стартовала только после ответа на первую.
-  // Параллелизм ограничен лимитером: без него тысяча активных задач
-  // выпускала бы 25 одновременных запросов и упиралась в 429
-  const responses = await Promise.all(
-    chunks.map((chunk) => {
-      const query = chunk.map((id) => `taskIds=${encodeURIComponent(id)}`).join('&');
-
-      return statusLimiter.run(() =>
-        request<BatchStatusResponse>(`/status?${query}`, { signal })
-      );
-    })
-  );
-
-  // Promise.all сохраняет порядок ответов, но он и не важен: вызывающая
-  // сторона сопоставляет статусы по taskId, а не по позиции в массиве
-  return responses.flatMap((response) => response.tasks);
-}
-
-/**
- * Запрашивает статус одной задачи.
- *
- * @param taskId - идентификатор задачи
- * @param signal - сигнал отмены
- * @returns статус задачи
+ * @returns состояние задачи и ссылка на результат, если он готов
+ * @throws {ApiError} - если задача не найдена или сервер ответил ошибкой
  */
 export async function fetchStatus(
-  taskId: string,
+  jobId: string,
   signal?: AbortSignal
-): Promise<TaskStatusResponse> {
-  return request<TaskStatusResponse>(`/status/${encodeURIComponent(taskId)}`, { signal });
+): Promise<JobStatusResponse> {
+  return statusLimiter.run((limiterSignal) =>
+    request<JobStatusResponse>(`/convert/status/${encodeURIComponent(jobId)}`, {
+      // Сигналы объединяются: запрос прервётся и при уходе со страницы,
+      // и при очистке ограничителя
+      signal: signal ? AbortSignal.any([signal, limiterSignal]) : limiterSignal,
+      parse: (value) => jobStatusResponseSchema.parse(value),
+    })
+  );
 }

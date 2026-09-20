@@ -1,0 +1,92 @@
+# =============================================================================
+# Dockerfile API-сервиса (приём задач, выдача статусов и ссылок).
+#
+# LibreOffice здесь НЕ устанавливается: конвертация идёт в отдельных
+# контейнерах-воркерах (Dockerfile.uno-worker), а API только принимает файл,
+# кладёт его в объектное хранилище и ставит задачу в очередь. Так api
+# остаётся лёгким (десятки мегабайт памяти вместо сотен) и масштабируется
+# независимо от воркеров.
+#
+# Базовый образ: node:24-bookworm-slim — версия совпадает с engines.node
+# и с окружением разработки.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Стадия сборки
+# -----------------------------------------------------------------------------
+FROM node:24-bookworm-slim AS builder
+
+# Инструменты сборки нативных модулей не нужны: все зависимости приходят
+# либо чистым JS, либо готовыми бинарниками (msgpackr-extract — опциональный
+# ускоритель BullMQ с prebuild-сборками, при их отсутствии откатывается на JS).
+
+RUN groupadd -r conv && \
+    useradd -r -g conv -m -d /home/conv -s /bin/false conv
+
+# Манифесты всех участников workspace копируются до установки: pnpm читает
+# pnpm-workspace.yaml и без package.json каждого пакета отказывается ставить
+# зависимости. Отдельным слоем — чтобы кеш не сбрасывался на каждой правке
+# исходников.
+WORKDIR /app
+COPY pnpm*.yaml ./
+COPY package*.json ./
+COPY packages/contract/package.json ./packages/contract/
+COPY web/package.json ./web/
+
+# Фильтр отсекает React и Vite из web — в образе api они не нужны.
+# Многоточие добавляет зависимости пакета: контракт (@doc-converter/contract)
+# сервер импортирует в рантайме, поэтому нужны и его исходники, и его tsc.
+RUN npx pnpm ci --filter doc-converter...
+
+COPY . .
+
+# `.dockerignore` исключает `dist`, поэтому сборка обязательна: без неё
+# контейнер соберётся, но упадёт на старте — точка входа dist/nest/main.js
+# и импорт @doc-converter/contract. Контракт собирается первым.
+RUN npx pnpm --filter @doc-converter/contract build
+RUN npm run build:server
+
+# ЗАМЕЧАНИЕ О РАЗМЕРЕ ОБРАЗА.
+#
+# В runtime-образ попадают devDependencies (typescript, @swc/core, vitest,
+# supertest). Попытка `pnpm install --prod --frozen-lockfile` образ
+# не уменьшает: шаг снимает симлинки верхнего уровня, но пакеты остаются
+# в виртуальном хранилище node_modules/.pnpm. Настоящее решение — отдельная
+# стадия с установкой production-зависимостей в пустой каталог; выигрыш
+# около 100–150 МБ, и он не стоит усложнения, пока образ не стал проблемой.
+
+# -----------------------------------------------------------------------------
+# Финальный образ
+# -----------------------------------------------------------------------------
+FROM node:24-bookworm-slim
+
+COPY --from=builder /etc/group /etc/group
+COPY --from=builder /etc/passwd /etc/passwd
+
+RUN mkdir -p /app /var/log/converter /tmp
+
+WORKDIR /app
+
+COPY --chown=conv:conv --from=builder /app /app
+
+RUN chown -R conv:conv /app /var/log/converter /tmp && \
+    chmod -R 750 /var/log/converter /tmp
+
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOST=0.0.0.0 \
+    AUDIT_LOG_PATH=/var/log/converter/audit.log \
+    LOG_LEVEL=info
+
+# Потолок кучи V8. API не конвертирует, но принимает файлы до 100 МБ
+# и передаёт их в хранилище — 1 ГБ покрывает буфер и запас на фрагментацию.
+ENV NODE_OPTIONS=--max-old-space-size=1024
+
+USER conv
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD node /app/dist/nest/health/health-check.js || exit 1
+
+CMD ["node", "/app/dist/nest/main.js"]

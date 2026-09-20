@@ -109,15 +109,15 @@ export const DropZone = memo(function DropZone({
       />
 
       <label className="dropzone__label" htmlFor={inputId}>
-        <span className="dropzone__title">Перетащите файлы сюда</span>
+        <span className="dropzone__title">Перетащите книги Excel сюда</span>
         <span className="dropzone__subtitle">
           или нажмите, чтобы выбрать на диске
         </span>
       </label>
 
       <p className="dropzone__hint" id={hintId}>
-        Поддерживаются документы, таблицы, презентации и PDF. Размер файла — до{' '}
-        {maxSizeMb} МБ.
+        Поддерживаются файлы XLSX и XLS, каждый — до {maxSizeMb} МБ.
+        Результат конвертации — PDF.
       </p>
     </div>
   );

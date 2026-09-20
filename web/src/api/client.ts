@@ -3,12 +3,13 @@
  *
  * Отвечает за:
  * - единую точку обращения к API (базовый URL из VITE_API_BASE)
+ * - разбор ответа схемой контракта, переданной вызывающей стороной
  * - разбор ошибок сервера в тип ApiError
  * - таймауты и отмену запросов
  * - сквозной X-Request-Id для логов сервиса
  */
 
-import type { ApiErrorBody } from '@doc-converter/contract';
+import { apiErrorBodySchema } from '@doc-converter/contract';
 
 /**
  * Базовый адрес API.
@@ -18,23 +19,44 @@ import type { ApiErrorBody } from '@doc-converter/contract';
  */
 const API_BASE = import.meta.env.VITE_API_BASE ?? '';
 
-/** Таймаут обычного запроса (опрос статуса, health). */
+/** Таймаут обычного запроса (опрос статуса, проверка доступности). */
 const DEFAULT_TIMEOUT_MS = 15_000;
 
-/** Таймаут отправки файла: тело может быть крупным, а сеть — медленной. */
+/**
+ * Таймаут отправки файла: тело может быть крупным, а сеть — медленной.
+ *
+ * Обоснование: постановка задачи включает проверку zip-контейнера и оценку
+ * сложности книги, то есть сервер отвечает не мгновенно даже на быстрой сети.
+ * Две минуты — тот же порядок, что и у `CONVERSION_TIMEOUT_MS` на сервере.
+ */
 export const UPLOAD_TIMEOUT_MS = 120_000;
+
+/**
+ * Коды ошибок, которые ставит сам клиент.
+ *
+ * Их нет в контракте сервера: это сбои до или после HTTP-обмена (сеть,
+ * таймаут, неожиданная форма ответа). Лежат рядом с ApiError, чтобы
+ * `errors.ts` переводил их так же, как серверные.
+ */
+export const CLIENT_ERROR_CODES = {
+  network: 'network_error',
+  timeout: 'timeout',
+  invalidResponse: 'invalid_response',
+} as const;
 
 /** Ошибка обращения к API. */
 export class ApiError extends Error {
   constructor(
-    /** HTTP-статус ответа. */
+    /** HTTP-статус ответа; 0 — ответа не было. */
     readonly status: number,
     /** Код ошибки в snake_case из поля error. */
     readonly code: string,
     /** Сообщение сервера. */
     readonly serverMessage: string,
     /** Идентификатор задачи, если сервер его вернул. */
-    readonly taskId?: string,
+    readonly jobId?: string,
+    /** Идентификатор запроса для сверки с логами сервиса. */
+    readonly requestId?: string,
     /** Через сколько секунд повторять запрос (заголовок Retry-After). */
     readonly retryAfterSec?: number
   ) {
@@ -44,9 +66,22 @@ export class ApiError extends Error {
 }
 
 /** Опции запроса. */
-export interface RequestOptions {
+export interface RequestOptions<T> {
   method?: 'GET' | 'POST';
-  body?: unknown;
+  /**
+   * Тело запроса: `FormData` уходит как есть (multipart), объект —
+   * сериализуется в JSON.
+   */
+  body?: FormData | Record<string, unknown>;
+  /**
+   * Разбор успешного ответа схемой контракта.
+   *
+   * Схема передаётся вызывающей стороной, а не импортируется здесь: у каждого
+   * маршрута она своя, а клиент остаётся общим. Исключение из `parse`
+   * превращается в ApiError с кодом `invalid_response` — иначе расхождение
+   * контракта и сервера проявилось бы как «поле undefined» где-то в разметке.
+   */
+  parse: (value: unknown) => T;
   signal?: AbortSignal;
   timeoutMs?: number;
 }
@@ -73,14 +108,15 @@ function parseRetryAfter(response: Response): number | undefined {
  * Выполняет запрос к API и разбирает ответ.
  *
  * @param path - путь относительно базового адреса API
- * @param options - метод, тело, сигнал отмены и таймаут
+ * @param options - метод, тело, схема разбора, сигнал отмены и таймаут
  * @returns разобранное тело ответа
- * @throws {ApiError} - если сервер ответил ошибкой
+ * @throws {ApiError} - если сервер ответил ошибкой или ответ не разобрался
  */
-export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+export async function request<T>(path: string, options: RequestOptions<T>): Promise<T> {
   const {
     method = 'GET',
     body,
+    parse,
     signal,
     timeoutMs = DEFAULT_TIMEOUT_MS,
   } = options;
@@ -94,7 +130,11 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     'X-Request-Id': crypto.randomUUID(),
   };
 
-  if (body !== undefined) {
+  const isFormData = body instanceof FormData;
+
+  // Content-Type для multipart не задаём: браузер сам добавит его вместе
+  // с границей частей, а ручное значение границу потеряет
+  if (body !== undefined && !isFormData) {
     headers['Content-Type'] = 'application/json';
   }
 
@@ -104,19 +144,27 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     response = await fetch(`${API_BASE}${path}`, {
       method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: body === undefined ? undefined : isFormData ? body : JSON.stringify(body),
       signal: combinedSignal,
     });
   } catch (err) {
     if (err instanceof DOMException && err.name === 'TimeoutError') {
-      throw new ApiError(0, 'timeout', 'Превышено время ожидания ответа сервера');
+      throw new ApiError(
+        0,
+        CLIENT_ERROR_CODES.timeout,
+        'Превышено время ожидания ответа сервера'
+      );
     }
 
     if (err instanceof DOMException && err.name === 'AbortError') {
       throw err;
     }
 
-    throw new ApiError(0, 'network_error', 'Не удалось связаться с сервером');
+    throw new ApiError(
+      0,
+      CLIENT_ERROR_CODES.network,
+      'Не удалось связаться с сервером'
+    );
   }
 
   // Тело может быть не JSON (например, 502 от прокси) — читаем как текст
@@ -132,36 +180,57 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   }
 
   if (!response.ok) {
-    const errorBody = parsed as ApiErrorBody | null;
+    const errorBody = apiErrorBodySchema.safeParse(parsed);
 
     throw new ApiError(
       response.status,
-      errorBody?.error ?? 'unknown_error',
-      errorBody?.message ?? `Сервер ответил ошибкой ${response.status}`,
-      errorBody?.taskId,
+      errorBody.success ? errorBody.data.error : 'unknown_error',
+      errorBody.success
+        ? errorBody.data.message
+        : `Сервер ответил ошибкой ${response.status}`,
+      errorBody.success ? errorBody.data.jobId : undefined,
+      errorBody.success ? errorBody.data.requestId : undefined,
       parseRetryAfter(response)
     );
   }
 
-  return parsed as T;
+  try {
+    return parse(parsed);
+  } catch (err) {
+    // Подробности разбора (путь до поля, ожидаемый тип) полезны в консоли,
+    // а пользователю показывается общее сообщение из errors.ts
+    console.error('Ответ сервера не соответствует контракту', err);
+
+    throw new ApiError(
+      response.status,
+      CLIENT_ERROR_CODES.invalidResponse,
+      'Ответ сервера не соответствует ожидаемому формату'
+    );
+  }
 }
 
 /**
- * Собирает URL скачивания результата.
+ * Запускает скачивание готового PDF по presigned-ссылке.
  *
- * Сервер отдаёт файлы по /results/{taskId}.{ext}; адрес из ответа
- * используется как есть, чтобы не дублировать правила именования.
+ * Ссылка ведёт в объектное хранилище, а не в API, поэтому `download`
+ * работает только когда хранилище доступно с того же origin; в остальных
+ * случаях браузер откроет PDF в новой вкладке (атрибут `download`
+ * для чужого origin игнорируется). Альтернатива — качать файл через fetch
+ * и отдавать blob-ссылкой — требует CORS от хранилища и лишает пользователя
+ * возможности отменить загрузку.
  *
- * @param fileUrl - значение fileUrl из ответа API
- * @param downloadName - желаемое имя файла для пользователя
- * @returns путь с параметром name
+ * @param url - presigned-ссылка из ответа статуса
+ * @param fileName - имя файла для сохранения
  */
-export function buildDownloadUrl(fileUrl: string, downloadName?: string): string {
-  const path = `${API_BASE}${fileUrl}`;
+export function downloadFromUrl(url: string, fileName: string): void {
+  const link = document.createElement('a');
 
-  if (!downloadName) {
-    return path;
-  }
+  link.href = url;
+  link.download = fileName;
+  link.rel = 'noopener';
+  link.target = '_blank';
 
-  return `${path}?name=${encodeURIComponent(downloadName)}`;
+  document.body.append(link);
+  link.click();
+  link.remove();
 }

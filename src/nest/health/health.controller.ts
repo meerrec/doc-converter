@@ -1,31 +1,30 @@
 /**
  * Проверка доступности сервиса: GET /health.
  *
- * Ответ остаётся дословно таким же, как в Express-версии: `wasm` здесь всегда
- * `true`, потому что реальная проверка готовности WASM требует загрузки десятков
- * мегабайт ассетов и инициализации движка — это слишком дорого для проверки,
- * запускаемой каждые 30 секунд. Готовность движка проверяет docker healthcheck
- * (`dist/nest/health/health-check.js`) по доступности Valkey и наличию пакета
- * конвертера.
+ * Ответ быстрый и не поднимает LibreOffice: готовность конвертера проверяет
+ * healthcheck контейнера-воркера, который подключается к UNO-бриджу
+ * (`uno-healthcheck.ts`). Здесь проверяется только хранилище — то, без чего
+ * API не примет ни одной задачи.
  */
 
 import { Controller, Get } from '@nestjs/common';
 import type { HealthResponse } from '@doc-converter/contract';
 import { CONVERTER_VERSION } from '../../config/index.js';
+import { checkStorageHealth } from '../../storage/s3.js';
 
 /** Маршрут проверки доступности. */
 @Controller('health')
 export class HealthController {
   /**
-   * @returns состояние сервиса, готовность WASM и версия конвертера
+   * @returns состояние сервиса, доступность хранилища и версия
    */
   @Get()
-  check(): HealthResponse {
-    const wasmReady = true;
+  async check(): Promise<HealthResponse> {
+    const storage = await checkStorageHealth();
 
     return {
-      status: wasmReady ? 'ok' : 'initializing',
-      wasm: wasmReady,
+      status: storage.healthy ? 'ok' : 'degraded',
+      storage: storage.healthy,
       version: CONVERTER_VERSION,
     };
   }

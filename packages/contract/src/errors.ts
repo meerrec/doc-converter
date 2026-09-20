@@ -11,34 +11,26 @@ import { z } from 'zod';
 /** Коды ошибок, которые сервис отдаёт клиенту. */
 export const ERROR_CODES = [
   // --- Схема запроса ---------------------------------------------------------
-  'unknown_field',
-  'field_type_mismatch',
-  'exactly_one_source_required',
-  // Отсутствие обязательного поля: сервер формирует код как `${field}_required`
-  'filetype_required',
-  'outputtype_required',
-  'input_format_not_allowed',
-  'output_format_not_allowed',
-  'key_invalid_chars',
-  'title_too_long',
-  'region_invalid',
-  'codePage_not_allowed',
-  'delimiter_not_allowed',
-  'data_invalid_base64',
-  'data_too_large',
+  'file_required',
   'file_too_large',
   'invalid_request',
+  'unknown_field',
+  'field_type_mismatch',
   'invalid_option_value',
+  'invalid_watermark',
+  'invalid_pdf_version',
+  'invalid_quality',
+  'invalid_resolution',
 
   // --- Содержимое файла ------------------------------------------------------
   'magic_mismatch',
   'magic_buffer_empty',
   'magic_buffer_too_small',
   'magic_unsupported_type',
-  'magic_type_missing',
   'content_validation_failed',
+  'unsupported_format',
 
-  // --- Архивы ----------------------------------------------------------------
+  // --- Архивы (XLSX — это zip-контейнер) -------------------------------------
   'archive_forbidden_name',
   'archive_forbidden_extension',
   'archive_ratio_exceeded',
@@ -50,42 +42,25 @@ export const ERROR_CODES = [
   'archive_empty',
   'archive_corrupt',
 
-  // --- Источник по URL (SSRF) ------------------------------------------------
-  'url_malformed',
-  'url_no_host',
-  'url_scheme_forbidden',
-  'url_credentials_forbidden',
-  'url_private_ip',
-  'url_too_long',
-
-  // --- Ход выполнения --------------------------------------------------------
-  'conversion_failed',
+  // --- Ход выполнения задачи -------------------------------------------------
+  'job_not_found',
   'job_processing_failed',
-  'job_validation_failed',
-  'sync_timeout',
-  'sync_disabled',
-  'key_conflict',
-  'body_timeout',
-  'client_disconnected',
-
-  // --- Задачи и результаты ---------------------------------------------------
-  'task_not_found',
-  'status_check_failed',
-  'batch_status_check_failed',
-  'result_not_found',
-  'result_read_failed',
-  'invalid_result_name',
-  'not_found',
+  'conversion_failed',
+  'conversion_timeout',
+  /**
+   * UNO-бридж недоступен: soffice не запущен или не отвечает на сокете.
+   *
+   * Отдаётся, когда воркер не смог подключиться к LibreOffice. Задача при
+   * этом не «сломана» — она упадёт и будет повторена после перезапуска воркера.
+   */
+  'uno_unavailable',
+  'storage_unavailable',
+  'upload_failed',
 
   // --- Прочее -----------------------------------------------------------------
+  /** Запрошен неизвестный маршрут. */
+  'not_found',
   'rate_limited',
-  /**
-   * Хранилище состояния временно недоступно (Valkey или каталог входных файлов).
-   *
-   * Отдаётся со статусом 503 и заголовком `Retry-After`: в отличие от
-   * `internal`, это состояние клиент может пережить повтором.
-   */
-  'storage_unavailable',
   'internal',
 ] as const;
 
@@ -113,14 +88,13 @@ export function isErrorCode(value: unknown): value is ErrorCode {
 /**
  * Тело ответа об ошибке.
  *
- * `taskId` присутствует не всегда: его добавляют только ошибки, привязанные
- * к конкретной задаче конвертации. `requestId` сервер добавляет для сверки
- * с логами. Схема «свободная» — новые поля не должны ломать разбор у клиента.
+ * `jobId` присутствует не всегда: его добавляют только ошибки, привязанные
+ * к конкретной задаче. `requestId` сервер добавляет для сверки с логами.
  */
 export const apiErrorBodySchema = z.looseObject({
   error: z.string(),
   message: z.string(),
-  taskId: z.string().optional(),
+  jobId: z.string().optional(),
   requestId: z.string().optional(),
 });
 

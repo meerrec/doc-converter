@@ -1,18 +1,18 @@
 /**
  * Аудит-логгер.
  *
- * Отдельный pino-инстанс пишет подозрительные события в `AUDIT_LOG_PATH`
+ * Отдельный pino-инстанс пишет события в `AUDIT_LOG_PATH`
  * (в Docker — `/var/log/converter/audit.log`, отдельный том). Если путь
  * не задан, события уходят в stdout: писать в `/var/log` без прав root нельзя.
  *
- * Раньше модуль был реэкспортом логгера из Express-слоя; после его удаления
- * реализация переехала сюда. DI не подходит: логгер создаётся на уровне модуля
- * и вызывается в том числе из домена (`worker/sandbox.ts`) вне Nest-контекста.
+ * DI не подходит: логгер создаётся на уровне модуля и вызывается в том числе
+ * из воркера (`worker/uno/processor.ts`) вне Nest-контекста.
  *
- * Логируются:
- * - отказы по любой причине (`logRejection`)
- * - успешные конвертации (`logSuccess`) и ошибки конвертации (`logConversionError`)
- * - события безопасности: SSRF, zip-бомбы, XML-атаки
+ * Логируются: отказы (проверка файла, параметры), успешные конвертации
+ * и ошибки конвертации. Набор сужен вместе с переходом на XLSX → PDF:
+ * функции для SSRF и XML-атак удалены вместе с путями, которые они защищали.
+ *
+ * Все комментарии на русском языке.
  */
 
 import { createRequire } from 'node:module';
@@ -60,13 +60,10 @@ const auditLogger = pinoFactory({
       }
     : {}),
   formatters: {
-    log: (object: Record<string, unknown>) => {
-      // Добавляем timestamp в ISO формате
-      return {
-        ts: new Date().toISOString(),
-        ...object,
-      };
-    },
+    log: (object: Record<string, unknown>) => ({
+      ts: new Date().toISOString(),
+      ...object,
+    }),
   },
 });
 
@@ -78,7 +75,7 @@ export type AuditLogger = typeof auditLogger;
  *
  * Описана структурно, а не через тип Express: модуль фреймворк-агностичен,
  * и этой формы достаточно, чтобы принять как запрос Nest, так и объект
- * с полями события.
+ * с полями события из воркера.
  */
 export interface AuditRequest {
   headers?: Record<string, unknown>;
@@ -97,9 +94,9 @@ export type AuditFields = Record<string, unknown>;
  * Логирует событие отказа.
  *
  * Поддерживает две формы вызова:
- * - `logRejection(req, code, message, fields)` — когда запрос доступен
- * - `logRejection({ requestId, ip, ua, code, message })` — когда доступны
- *   только поля события (обработчики очереди, домен)
+ * - `logRejection(req, code, message, fields)` — когда доступен запрос;
+ * - `logRejection({ requestId, jobId, code, message })` — когда доступны
+ *   только поля события (воркер, домен).
  *
  * @param req - запрос или объект с полями события
  * @param code - код ошибки (при вызове с запросом)
@@ -113,126 +110,55 @@ export function logRejection(
   additionalFields: AuditFields = {}
 ): void {
   // Различаем формы вызова по наличию headers у запроса
-  const isRequest =
-    req != null && typeof req === 'object' && typeof (req as AuditRequest).headers === 'object';
+  const isRequest = Boolean(req && (req as AuditRequest).headers !== undefined);
 
-  if (!isRequest) {
-    const fields = (req ?? {}) as AuditFields;
+  const base = isRequest
+    ? {
+        requestId: (req as AuditRequest).requestId,
+        ip: (req as AuditRequest).ip,
+        method: (req as AuditRequest).method,
+        url: (req as AuditRequest).originalUrl ?? (req as AuditRequest).url,
+        code,
+        message,
+      }
+    : (req as AuditFields | null | undefined) ?? {};
 
-    auditLogger.warn({
-      event: 'rejected',
-      ...fields,
-    });
-    return;
-  }
-
-  const request = req as AuditRequest;
-  const auditLog = request.auditLog ?? auditLogger;
-
-  auditLog.warn({
-    event: 'rejected',
-    code,
-    message,
-    ip: request.ip,
-    ua: request.headers?.['user-agent'],
-    requestId: request.requestId,
-    method: request.method,
-    url: request.originalUrl,
-    ...additionalFields,
-  });
+  auditLogger.warn({ ...base, ...additionalFields }, 'rejected');
 }
 
 /**
- * Логирует успешное завершение конвертации.
+ * Логирует успешную конвертацию.
  *
- * @param fields - поля события (requestId, taskId, fileType, size, durationMs)
+ * @param fields - поля события (jobId, tier, size, durationMs)
  */
 export function logSuccess(fields: AuditFields = {}): void {
-  auditLogger.info({
-    event: 'conversion_success',
-    ...fields,
-  });
+  auditLogger.info({ ...fields }, 'conversion_succeeded');
 }
 
 /**
  * Логирует ошибку конвертации.
  *
- * @param fields - поля события (requestId, taskId, code, message, durationMs)
+ * @param fields - поля события (jobId, tier, code, message, durationMs)
  */
 export function logConversionError(fields: AuditFields = {}): void {
-  auditLogger.error({
-    event: 'conversion_error',
-    ...fields,
-  });
+  auditLogger.error({ ...fields }, 'conversion_failed');
 }
 
 /**
- * Логирует попытку SSRF.
+ * Логирует отсечение архива zip-гардом.
  *
- * @param req - запрос или объект с полями события
- * @param url - подозрительный URL
- * @param reason - причина блокировки
+ * Отдельная функция, а не `logRejection`: попытка протащить zip-бомбу —
+ * это событие безопасности, и искать его в логе удобнее по своему имени.
+ *
+ * @param fields - поля события (requestId, ip, violationCode, details)
  */
-export function logSsrfAttempt(
-  req: AuditRequest | AuditFields,
-  url: string,
-  reason: string
-): void {
-  const auditLog = (req as AuditRequest).auditLog ?? auditLogger;
-
-  auditLog.warn({
-    event: 'ssrf_attempt',
-    blockedUrl: url,
-    reason,
-    ip: (req as AuditRequest).ip,
-    requestId: (req as AuditRequest).requestId,
-  });
+export function logZipBomb(fields: AuditFields = {}): void {
+  auditLogger.warn({ ...fields }, 'zip_bomb_rejected');
 }
 
-/**
- * Логирует обнаружение zip-бомбы.
- *
- * @param req - запрос или объект с полями события
- * @param violationCode - код нарушения
- * @param details - детали нарушения
- */
-export function logZipBomb(
-  req: AuditRequest | AuditFields,
-  violationCode: string,
-  details: unknown
-): void {
-  const auditLog = (req as AuditRequest).auditLog ?? auditLogger;
-
-  auditLog.warn({
-    event: 'zip_bomb_detected',
-    code: violationCode,
-    details,
-    ip: (req as AuditRequest).ip,
-    requestId: (req as AuditRequest).requestId,
-  });
-}
-
-/**
- * Логирует обнаружение XML-атаки.
- *
- * @param req - запрос или объект с полями события
- * @param violationCode - код нарушения
- * @param details - детали нарушения
- */
-export function logXmlAttack(
-  req: AuditRequest | AuditFields,
-  violationCode: string,
-  details: unknown
-): void {
-  const auditLog = (req as AuditRequest).auditLog ?? auditLogger;
-
-  auditLog.warn({
-    event: 'xml_attack_detected',
-    code: violationCode,
-    details,
-    ip: (req as AuditRequest).ip,
-    requestId: (req as AuditRequest).requestId,
-  });
-}
-
-export { auditLogger };
+export default {
+  logRejection,
+  logSuccess,
+  logConversionError,
+  logZipBomb,
+};

@@ -91,6 +91,12 @@ body {
   color: var(--text-muted);
 }
 
+.page__footer {
+  margin-top: 2rem;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
 .page__main {
   display: grid;
   gap: 1.5rem;
@@ -262,6 +268,15 @@ select {
   color: var(--text-muted);
 }
 
+/* Ссылка на готовый PDF: оформлена как кнопка, но остаётся ссылкой —
+   так работают контекстное меню, копирование адреса и открытие в новой вкладке */
+.button--link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
 /* ==========================================================================
    Сообщения
    ========================================================================== */
@@ -407,16 +422,14 @@ select {
   color: var(--success);
 }
 
-.badge--failed,
-.badge--not_found {
+.badge--failed {
   background: color-mix(in srgb, var(--danger) 15%, transparent);
   color: var(--danger);
 }
 
 .badge--processing,
 .badge--queued,
-.badge--uploading,
-.badge--encoding {
+.badge--submitting {
   background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);
 }

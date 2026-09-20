@@ -20,12 +20,12 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import type { Server } from 'node:http';
 import type { Express } from 'express';
 import { AppModule } from './app.module.js';
-import { R7ExceptionFilter } from './common/r7-exception.filter.js';
+import { ApiExceptionFilter } from './common/exception.filter.js';
 import { requestIdMiddleware, type RequestWithId } from './common/request-id.middleware.js';
 import { PinoLoggerService, createLogger } from './common/logger.js';
 import { resolvePort, resolveTrustProxy } from './config/env.js';
 import { closeRedisClient } from '../queue/connection.js';
-import { resetConversionQueue } from '../queue/conversionQueue.js';
+import { closeQueues } from '../queue/queues.js';
 import {
   BODY_LIMIT_BYTES,
   applyCors,
@@ -109,7 +109,7 @@ export async function createApp(): Promise<INestApplication> {
   // strict: true — только объекты, не массивы (как в Express-версии)
   app.use(express.json({ limit: BODY_LIMIT_BYTES, strict: true }));
 
-  app.useGlobalFilters(new R7ExceptionFilter());
+  app.useGlobalFilters(new ApiExceptionFilter());
 
   return app;
 }
@@ -159,7 +159,7 @@ export async function startServer(): Promise<Server> {
         // Очередь и соединение с Valkey закрываются явно: оборванное вместе
         // с процессом соединение оставляет на стороне Valkey висящие
         // блокировки задач и незакрытые клиентские сессии
-        await resetConversionQueue();
+        await closeQueues();
         await closeRedisClient();
         await nest.close();
 

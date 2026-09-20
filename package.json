@@ -1,15 +1,15 @@
 {
   "name": "doc-converter",
   "version": "1.0.0",
-  "description": "Сервис конвертации документов, совместимый с Р7-Офис API. Работает исключительно через WASM-сборку LibreOffice.",
+  "description": "Сервис конвертации электронных таблиц XLSX → PDF через LibreOffice + UNO API",
   "type": "module",
   "main": "dist/nest/main.js",
   "scripts": {
     "start:api": "node dist/nest/main.js",
-    "start:worker": "node dist/worker/index.js",
-    "start": "concurrently \"npm run start:api\" \"npm run start:worker\"",
+    "start:worker": "WORKER_QUEUE=${WORKER_QUEUE:-light} node dist/worker/uno/index.js",
+    "start:autoscaler": "node dist/autoscaler/index.js",
     "dev:api": "NODE_ENV=development node dist/nest/main.js",
-    "dev:worker": "NODE_ENV=development node dist/worker/index.js",
+    "dev:worker": "NODE_ENV=development node dist/worker/uno/index.js",
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:worker\"",
     "test": "NODE_ENV=test LOG_LEVEL=silent AUDIT_LOG_LEVEL=error vitest run",
     "test:watch": "NODE_ENV=test LOG_LEVEL=silent AUDIT_LOG_LEVEL=error vitest",
@@ -24,16 +24,15 @@
   "keywords": [
     "document-converter",
     "libreoffice",
-    "wasm",
-    "r7-office",
-    "conversion",
-    "pdf"
+    "uno",
+    "xlsx",
+    "pdf",
+    "conversion"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "@doc-converter/contract": "workspace:*",
-    "@matbee/libreoffice-converter": "^2.7.2",
     "@nestjs/common": "^12.0.3",
     "@nestjs/config": "^12.0.0",
     "@nestjs/core": "^12.0.3",
@@ -41,6 +40,8 @@
     "bullmq": "^5.1.0",
     "express": "^4.18.2",
     "ioredis": "^5.3.2",
+    "minio": "^8.0.1",
+    "multer": "^2.0.0",
     "pino": "^8.17.2",
     "pino-http": "^8.6.1",
     "reflect-metadata": "^0.2.2",
@@ -51,6 +52,7 @@
   "devDependencies": {
     "@swc/core": "^1.16.2",
     "@types/express": "^4.17.25",
+    "@types/multer": "^2.0.0",
     "@types/node": "^26.6.1",
     "@types/yauzl": "^2.10.3",
     "concurrently": "^8.2.2",

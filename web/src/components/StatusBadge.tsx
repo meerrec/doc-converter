@@ -11,33 +11,18 @@ import type { QueueItemStatus } from '../hooks/useConversionQueue';
 /**
  * Тексты состояний.
  *
- * Состояния очереди BullMQ (`waiting`, `active`, `delayed` и прочие) попадают
- * сюда потому, что сервер отдаёт их как есть, когда задачи нет в Valkey,
- * но она есть в очереди. Показывать пользователю английские имена нельзя,
- * поэтому для них заведены подписи. Правильнее было бы не выпускать
- * внутренние состояния очереди наружу — это задача серверной стороны.
+ * Серверных состояний ровно четыре (`queued`, `processing`, `completed`,
+ * `failed`), остальные — локальные: файл ждёт отправки, отправляется
+ * или его отправка отменена.
  */
-const STATUS_LABELS: Record<QueueItemStatus, string> = {
-  pending: 'В очереди',
-  encoding: 'Подготовка',
-  uploading: 'Отправка',
-  queued: 'Ожидает обработки',
+const STATUS_LABELS: Readonly<Record<QueueItemStatus, string>> = {
+  pending: 'Ожидает отправки',
+  submitting: 'Отправка',
+  queued: 'В очереди',
   processing: 'Конвертация',
   completed: 'Готово',
   failed: 'Ошибка',
-  unknown: 'Ожидание',
-  not_found: 'Не найдена',
-  error: 'Ошибка',
   cancelled: 'Отменена',
-
-  // Состояния очереди BullMQ
-  waiting: 'Ожидает обработки',
-  active: 'Конвертация',
-  delayed: 'Отложена',
-  paused: 'Приостановлена',
-  prioritized: 'В очереди',
-  'waiting-children': 'Ожидает зависимостей',
-  stuck: 'Зависла',
 };
 
 interface StatusBadgeProps {
@@ -47,7 +32,7 @@ interface StatusBadgeProps {
 export const StatusBadge = memo(function StatusBadge({ status }: StatusBadgeProps) {
   return (
     <span className={`badge badge--${status}`} data-status={status}>
-      {STATUS_LABELS[status] ?? status}
+      {STATUS_LABELS[status]}
     </span>
   );
 });

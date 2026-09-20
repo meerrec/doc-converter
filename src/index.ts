@@ -8,6 +8,5 @@
 
 export * from './queue/index.js';
 export * from './security/index.js';
-export * from './storage/index.js';
-export * from './worker/index.js';
+export * from './storage/s3.js';
 export * from './config/index.js';

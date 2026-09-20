@@ -1,54 +1,40 @@
 # =============================================================================
-# docker-compose.yml для сервиса конвертации документов
+# docker-compose.yml сервиса конвертации XLSX → PDF.
 #
 # Архитектура:
-#   - API сервер (NestJS) на порту 3000
-#   - Worker процесс для асинхронной обработки
-#   - Valkey как брокер очереди и хранилище идемпотентности
+#   - api         — приём файлов, постановка задач, выдача статусов и ссылок
+#   - uno-worker  — контейнеры с LibreOffice Calc и UNO-бриджем (по одному
+#                   soffice на контейнер, concurrency: 1)
+#   - autoscaler  — поднимает и гасит реплики воркеров по длине очередей
+#   - minio       — объектное хранилище входных файлов и результатов
+#   - valkey      — очередь BullMQ и состояние задач
+#   - web         — интерфейс и реверс-прокси к api
 #
-# Сеть:
-#   - converter: внутренняя сеть (internal: true)
-#   - Нет доступа наружу для worker и valkey
-#
-# Безопасность:
-#   - Все контейнеры non-root
-#   - cap_drop: ALL
-#   - read_only: true
-#   - no-new-privileges: true
-#   - tmpfs для временных файлов
+# Воркеры по уровням сложности: light / medium / heavy. Одна реплика
+# обслуживает одну очередь — иначе разделение по сложности теряет смысл,
+# а параллелизм внутри реплики невозможен (UNO не потокобезопасен).
 #
 # Память:
-#   - memswap_limit == mem_limit => swap ВЫКЛЮЧЕН. Это осознанно: при
-#     нехватке памяти контейнер убивается OOM-killer'ом, а не деградирует
-#     в swap. Значения менять ТОЛЬКО парой — если mem_limit окажется
-#     больше memswap_limit, контейнер не стартует с ошибкой
-#     "Minimum memoryswap limit should be larger than memory limit".
-#   - tmpfs учитывается в mem_limit (shmem в memory cgroup), т.е.
-#     /tmp:size=512m съедает до 512 МБ из лимита контейнера.
-#   - Потолок памяти родительского процесса задаёт fork-пул: каждый форк
-#     получает свой --max-old-space-size, то есть MAX_CONCURRENT x 1536 МБ
-#     heap. Отдельного бюджета на изолят больше нет — от isolated-vm
-#     отказались, оба пути (sync и async) идут через fork-пул.
-#   - version: '3.8' убран намеренно: поле obsolete в Compose v2, а в схеме
-#     v3 mem_limit/memswap_limit МОЛЧА игнорируются при docker stack deploy.
-#     Для Swarm-деплоя нужен deploy.resources.limits.memory (не дублировать
-#     оба ключа в одном файле — какой из них победит, не документировано).
+#   - memswap_limit == mem_limit => swap ВЫКЛЮЧЕН. При нехватке памяти
+#     контейнер убивается OOM-killer'ом, а не деградирует в swap.
+#     Значения менять ТОЛЬКО парой.
+#   - Реплика воркера держит LibreOffice: 400–600 МБ в покое и заметно
+#     больше на пике конвертации большой книги (см. WORKER_MEMORY_LIMIT_MB).
 # =============================================================================
 
 services:
   # ---------------------------------------------------------------------------
-  # API Server
+  # API
   # ---------------------------------------------------------------------------
   api:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.api
     container_name: doc-converter-api
     restart: unless-stopped
     networks:
       - converter
     environment:
-      # Общие настройки
       - NODE_ENV=production
       - PORT=3000
       - HOST=0.0.0.0
@@ -56,238 +42,330 @@ services:
       # Valkey / Redis
       - REDIS_HOST=valkey
       - REDIS_PORT=6379
-      - REDIS_DB=0
-      - REDIS_CONNECTION_STRING=redis://valkey:6379/0
 
-      # Storage
-      # Том монтируется в /data целиком, а каталоги разделены: результаты —
-      # /data/storage, входные файлы очереди — /data/incoming. Разделение
-      # обязательно: имена результатов собираются как {taskId}.{ext}, где
-      # taskId — клиентский `key`, поэтому входной документ в общем каталоге
-      # стал бы доступен по GET /results/{key}.{ext}
-      - STORAGE_PATH=/data/storage
-      - INPUT_STORAGE_PATH=/data/incoming
+      # Объектное хранилище
+      - S3_ENDPOINT=minio
+      - S3_PORT=9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+      - S3_BUCKET=conversions
+      # Presigned-ссылка подписывается вместе с хостом, поэтому клиенту
+      # отдаётся публичный адрес: имя `minio` резолвится только внутри сети
+      # compose, и браузер по такой ссылке не пошёл бы
+      - S3_PUBLIC_ENDPOINT=localhost
+      - S3_PUBLIC_PORT=9000
 
-      # WASM и конвертация
-      - SYNC_ENABLED=true
+      # Таймауты и лимиты
+      - MAX_FILE_BYTES=104857600
+      - CONVERSION_TIMEOUT_MS=120000
+      - PRESIGN_EXPIRY_SEC=3600
+      - JOB_TTL_SEC=86400
 
-      # Таймауты
-      - SYNC_TIMEOUT_MS=30000
-      - SYNC_QUEUE_WAIT_MS=5000
-      - REQUEST_BODY_TIMEOUT_MS=15000
-      - FETCH_TIMEOUT_MS=30000
-      - VALIDATION_TIMEOUT_MS=10000
-      - STORAGE_WRITE_TIMEOUT_MS=5000
-      - JOB_TIMEOUT_MS=60000
-
-      # Rate Limiting
+      # Ограничитель частоты
       - RATE_PER_SEC=5
       - RATE_BURST=20
       # Перед api ровно один прокси (nginx) — доверяем его заголовку
       # X-Forwarded-For. Без этого req.ip у всех клиентов равен адресу
-      # контейнера nginx, и все они делят одно ведро ограничителя частоты
+      # контейнера nginx, и все они делят одно ведро ограничителя
       - TRUST_PROXY=1
-
-      # Fork Pool.
-      # 2 — предел по памяти: библиотека конвертера 2.x держит ~1.16 ГБ на
-      # процесс, а контейнеру отведено 3 ГБ (см. mem_limit ниже)
-      - FORK_POOL_SIZE=2
-      - MAX_CONCURRENT=2
-
-      # BullMQ
-      - BULLMQ_LOCK_DURATION=120000
-      - BULLMQ_STALLED_INTERVAL=60000
-      - BULLMQ_MAX_STALLED_COUNT=1
 
       # Логирование
       - LOG_LEVEL=info
       - AUDIT_LOG_PATH=/var/log/converter/audit.log
-
-      # Идемпотентность
-      - IDEMPOTENCY_TTL_SEC=3600
-
-      # Node.js опции
-      - NODE_OPTIONS=--disable-wasm-trap-handler --max-old-space-size=1536 --unhandled-rejections=strict
     volumes:
-      # Том общий с worker: через него передаётся входной файл очереди
-      - storage-data:/data
       - audit-log:/var/log/converter
     ports:
-      # Только на loopback: при TRUST_PROXY=1 клиент, дотянувшийся до порта
+      # Только loopback: при TRUST_PROXY=1 клиент, дотянувшийся до порта
       # напрямую, подставил бы в X-Forwarded-For чужой адрес и обошёл
       # ограничитель частоты. Наружу API отдаёт nginx (сервис web)
       - "127.0.0.1:3000:3000"
-    # Hardening
-    user: conv
     read_only: true
     tmpfs:
-      - /tmp:size=512m,mode=1777
+      - /tmp:size=256m,mode=1777
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     pids_limit: 256
-    # 3g — паритет с worker. api обслуживает sync-конвертацию через тот же
-    # fork-пул (http/convert.controller.ts -> sandbox.js), и конфигурация пулов
-    # идентична: FORK_POOL_SIZE=2, MAX_CONCURRENT=2 — по ~1.16 ГБ на процесс.
-    # mem_limit и memswap_limit держать равными (swap off, см. заголовок).
-    mem_limit: 3g
-    memswap_limit: 3g
-    # 2.0 — паритет с worker. При одном ядре синхронная конвертация не
-    # укладывается в SYNC_TIMEOUT_MS: инициализация WASM (чтение ассетов и
-    # сканирование шрифтов) на одном ядре занимает больше 30 с, и запрос
-    # падает с sync_timeout. Проверено: с 2.0 тот же запрос проходит за 3 с
-    cpus: "2.0"
-    ulimits:
-      nofile:
-        soft: 4096
-        hard: 8192
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: "1.0"
     depends_on:
       valkey:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "/app/dist/nest/health/health-check.js"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 30s
 
   # ---------------------------------------------------------------------------
-  # Web Interface
+  # Воркеры по уровням сложности
   # ---------------------------------------------------------------------------
-  # nginx раздаёт собранный интерфейс и проксирует API на сервис api.
-  # Благодаря общему origin (порт 8080) CORS не нужен: у сервиса он
-  # включается только при NODE_ENV=development.
-  web:
+  # Стартовые реплики: по одной на очередь. Их поднимает compose, а
+  # дополнительные создаёт autoscaler через Docker API — помеченные меткой
+  # `doc-converter.managed`, поэтому он никогда не удалит контейнеры compose
+  # (иначе `restart: unless-stopped` возвращал бы их обратно, и autoscaler
+  # бесконечно боролся бы с compose).
+  #
+  # Отдельный якорь на общие настройки воркера — три сервиса отличаются
+  # только очередью.
+  uno-worker-light: &uno-worker
     build:
       context: .
-      dockerfile: web/Dockerfile
-
-    restart: unless-stopped
-    networks:
-      - converter
-    ports:
-      # 8080, чтобы не конфликтовать с опубликованным портом API (3000)
-      - "8080:8080"
-    depends_on:
-      # Условие service_healthy здесь не нужно: интерфейс — статика, запросы
-      # nginx проксирует лениво, и здоровье API к моменту первого запроса
-      # не требуется. Healthcheck API при этом рабочий (см. сервис api).
-      - api
-
-  # ---------------------------------------------------------------------------
-  # Worker Process
-  # ---------------------------------------------------------------------------
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.uno-worker
+    # Имя образа задано явно: по умолчанию compose назвал бы его
+    # по сервису (doc-converter-uno-worker-light), а autoscaler поднимает
+    # реплики из AUTOSCALER_WORKER_IMAGE. Один образ на все три очереди —
+    # они отличаются только переменной WORKER_QUEUE
+    image: doc-converter-uno-worker:latest
     restart: unless-stopped
     networks:
       - converter
     environment:
-      # Общие настройки
       - NODE_ENV=production
-
-      # Valkey / Redis
+      - WORKER_QUEUE=light
       - REDIS_HOST=valkey
       - REDIS_PORT=6379
-      - REDIS_DB=0
-      - REDIS_CONNECTION_STRING=redis://valkey:6379/0
-
-      # Storage
-      - STORAGE_PATH=/data/storage
-      - INPUT_STORAGE_PATH=/data/incoming
-
-      # WASM и конвертация
-      - SYNC_ENABLED=false
-
-      # Таймауты
-      - JOB_TIMEOUT_MS=60000
-
-      # Fork Pool.
-      # 2 — предел по памяти: библиотека конвертера 2.x держит ~1.16 ГБ на
-      # процесс, а контейнеру отведено 3 ГБ (см. mem_limit ниже)
-      - FORK_POOL_SIZE=2
-      - MAX_CONCURRENT=2
-
-      # BullMQ
-      - BULLMQ_LOCK_DURATION=120000
-      - BULLMQ_STALLED_INTERVAL=60000
-      - BULLMQ_MAX_STALLED_COUNT=1
-
-      # Логирование
+      - S3_ENDPOINT=minio
+      - S3_PORT=9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+      - S3_BUCKET=conversions
+      - UNO_PORT=2002
+      - CONVERSION_TIMEOUT_MS=120000
       - LOG_LEVEL=info
-      - AUDIT_LOG_PATH=/var/log/converter/audit.log
-
-      # Node.js опции для worker
-      # --max-old-space-size=1536: лимит heap V8
-      # --disable-wasm-trap-handler: совместимость с mem_limit
-      - NODE_OPTIONS=--disable-wasm-trap-handler --max-old-space-size=1536 --unhandled-rejections=strict
-    volumes:
-      # Тот же том, что у api: воркер читает входной файл по пути из задачи
-      - storage-data:/data
-      - audit-log:/var/log/converter
-    # Hardening
-    user: conv
+      # Домашний каталог в tmpfs: fontconfig пишет кэш шрифтов в ~/.cache,
+      # а корневая ФС только для чтения — без этого он ругается на каждой
+      # конвертации и каждый раз пересканирует шрифты
+      - HOME=/tmp
+    labels:
+      # Метки нужны autoscaler'у: по ним он видит стартовые реплики compose
+      doc-converter.role: uno-worker
+      doc-converter.tier: light
     read_only: true
     tmpfs:
-      - /tmp:size=512m,mode=1777
+      # Профиль LibreOffice и временные файлы задач живут здесь: корневая
+      # ФС только для чтения, а soffice обязан писать в профиль
+      - /tmp:size=1g,mode=1777
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 512
-    # ВНИМАНИЕ: fork-pool.js задаёт КАЖДОМУ форку --max-old-space-size=1536,
-    # а библиотека конвертера 2.x добавляет к этому ~1.16 ГБ RSS на процесс
-    # (замерено). 3g покрывает 2 одновременные задачи (MAX_CONCURRENT=2);
-    # при насыщении пула сработает OOM-killer. Это осознанный backstop
-    # (fork-pool.js: "Ограничение по памяти будет через Docker cgroups"),
-    # но при разборе OOM в первую очередь смотреть на MAX_CONCURRENT,
-    # а не на mem_limit.
-    # mem_limit и memswap_limit держать равными (swap off, см. заголовок).
-    mem_limit: 3g
-    memswap_limit: 3g
-    cpus: "2.0"
-    ulimits:
-      nofile:
-        soft: 4096
-        hard: 8192
+    pids_limit: 256
+    # Пик конвертации большой книги: сам процесс LibreOffice, документ
+    # в памяти и копия при экспорте
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: "1.0"
     depends_on:
       valkey:
         condition: service_healthy
-    # Worker запускает отдельный процесс (собранный: исходники на TypeScript)
-    command: ["node", "/app/dist/worker/index.js"]
-    # HEALTHCHECK из образа воркеру не нужен: он проверяет доступность Valkey,
-    # но запускается отдельным процессом, который каждые 30 секунд поднимает
-    # новое соединение. Доступность Valkey и так видна по самому воркеру
+      minio:
+        condition: service_healthy
+
+  uno-worker-medium:
+    <<: *uno-worker
+    environment:
+      - NODE_ENV=production
+      - WORKER_QUEUE=medium
+      - REDIS_HOST=valkey
+      - REDIS_PORT=6379
+      - S3_ENDPOINT=minio
+      - S3_PORT=9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+      - S3_BUCKET=conversions
+      - UNO_PORT=2002
+      - CONVERSION_TIMEOUT_MS=120000
+      - LOG_LEVEL=info
+      - HOME=/tmp
+    labels:
+      doc-converter.role: uno-worker
+      doc-converter.tier: medium
+
+  uno-worker-heavy:
+    <<: *uno-worker
+    environment:
+      - NODE_ENV=production
+      - WORKER_QUEUE=heavy
+      - REDIS_HOST=valkey
+      - REDIS_PORT=6379
+      - S3_ENDPOINT=minio
+      - S3_PORT=9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+      - S3_BUCKET=conversions
+      - UNO_PORT=2002
+      # Тяжёлым книгам даётся вдвое больший бюджет: одна такая конвертация
+      # занимает реплику целиком, и таймаут на них срабатывал бы ложно
+      - CONVERSION_TIMEOUT_MS=300000
+      - LOG_LEVEL=info
+      - HOME=/tmp
+    labels:
+      doc-converter.role: uno-worker
+      doc-converter.tier: heavy
+
+  # ---------------------------------------------------------------------------
+  # Autoscaler (локальная замена KEDA)
+  # ---------------------------------------------------------------------------
+  # В Kubernetes эту роль играет KEDA (см. deploy/k8s/scaledobject-*.yaml),
+  # и этот сервис там не нужен. В compose масштабировать сервис по метрике
+  # нечем, поэтому реплики создаются через Docker API.
+  #
+  # ВНИМАНИЕ: монтирование docker.sock даёт контейнеру root-эквивалент
+  # на хосте — через API можно создать привилегированный контейнер
+  # с корневой ФС хоста. Это осознанная плата за автомасштабирование
+  # в compose; в K8s доступ к сокету не нужен вовсе.
+  autoscaler:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: doc-converter-autoscaler
+    restart: unless-stopped
+    networks:
+      - converter
+    command: ["node", "/app/dist/autoscaler/index.js"]
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=valkey
+      - REDIS_PORT=6379
+      - S3_ENDPOINT=minio
+      - S3_PORT=9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+      - S3_BUCKET=conversions
+      - DOCKER_SOCKET_PATH=/var/run/docker.sock
+      # Образ и сеть, из которых поднимаются реплики
+      - AUTOSCALER_WORKER_IMAGE=doc-converter-uno-worker:latest
+      - AUTOSCALER_NETWORK=doc-converter_converter
+      - AUTOSCALER_POLL_INTERVAL_MS=15000
+      - AUTOSCALER_MAX_STEP=1
+      # Бюджеты конвертации для создаваемых реплик: должны совпадать
+      # со значениями у сервисов воркеров выше
+      - CONVERSION_TIMEOUT_MS=120000
+      - CONVERSION_TIMEOUT_MS_HEAVY=300000
+      - WORKER_MEMORY_LIMIT_MB=2048
+      - LOG_LEVEL=info
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Пользователь conv не входит в группу docker хоста: без этого
+    # обращение к сокету отвергается по правам. GID задаётся в .env
+    # (`DOCKER_GID`), потому что он платформенно-зависим
+    # GID сокета зависит от платформы: на Linux это группа docker (обычно 998
+    # или 999), на macOS в Docker Desktop сокет принадлежит root:root.
+    # Значение задаётся в .env (см. .env.example)
+    group_add:
+      - "${DOCKER_GID:-999}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    memswap_limit: 256m
+    depends_on:
+      valkey:
+        condition: service_healthy
     healthcheck:
       disable: true
 
   # ---------------------------------------------------------------------------
-  # Valkey (Redis-compatible)
+  # Web-интерфейс и реверс-прокси
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    restart: unless-stopped
+    networks:
+      - converter
+    ports:
+      - "8080:8080"
+    depends_on:
+      # Условие service_healthy не нужно: интерфейс — статика, запросы nginx
+      # проксирует лениво, и здоровье API к первому запросу не требуется
+      - api
+
+  # ---------------------------------------------------------------------------
+  # Объектное хранилище
+  # ---------------------------------------------------------------------------
+  minio:
+    # Образ берётся с quay.io: MinIO прекратила публикацию на Docker Hub,
+    # и `minio/minio` там больше не существует (pull завершается
+    # «pull access denied»). Зеркало на quay.io — официальное
+    image: quay.io/minio/minio:latest
+    container_name: doc-converter-minio
+    restart: unless-stopped
+    networks:
+      - converter
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio-data:/data
+    ports:
+      # 9000 — API (нужен клиенту, чтобы открыть presigned-ссылку),
+      # 9001 — консоль
+      - "9000:9000"
+      - "127.0.0.1:9001:9001"
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    memswap_limit: 512m
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Одноразовый сервис: создаёт бакет и завершается. Отдельным сервисом,
+  # а не проверкой внутри api, потому что бакет нужен и воркерам, а гонка
+  # «создать при первом обращении» в нескольких процессах даёт ошибку
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: doc-converter-minio-init
+    networks:
+      - converter
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/conversions &&
+        echo "Бакет conversions готов"
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Valkey (Redis-совместимый)
   # ---------------------------------------------------------------------------
   valkey:
     image: valkey/valkey:8.1
+    container_name: doc-converter-valkey
     restart: unless-stopped
     networks:
       - converter
     volumes:
       - valkey-data:/data
-    # maxmemory 400mb при mem_limit 512m: запас на фрагментацию и COW-страницы
-    # перезаписи AOF (см. обоснование лимита памяти ниже).
-    # Политика именно noeviction, а не allkeys-lru: вытеснение ключей BullMQ —
-    # это молчаливая потеря задач. С noeviction Valkey вернёт ошибку на запись,
+    # Политика noeviction, а не вытеснение: потеря ключей BullMQ — это
+    # молчаливая потеря задач. С noeviction Valkey вернёт ошибку на запись,
     # и API отдаст 503 — видимая деградация вместо OOM-kill, уносящего очередь.
-    #
-    # maxmemory-clients 64mb — страховка от одного жадного читателя: без неё
-    # клиент, запросивший разом много ключей, выедает память в обход maxmemory
-    # (буферы ответов в этот счёт не входят). --save "" отключает RDB-снимки:
-    # при включённом AOF они дублируют форк и его COW-страницы.
+    # --save "" отключает RDB-снимки: при включённом AOF они дублируют форк
+    # и его COW-страницы.
     command: ["valkey-server", "--appendonly", "yes", "--protected-mode", "no",
               "--maxmemory", "400mb", "--maxmemory-policy", "noeviction",
               "--maxmemory-clients", "64mb", "--save", ""]
-    # Valkey требует дополнительных capabilities для сохранения данных
     cap_add:
       - CHOWN
       - SETUID
@@ -299,16 +377,9 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 100
-    # 512m при appendonly yes: перезапись AOF форкается, и COW-страницы
-    # прибавляются к этому же лимиту, внутри которого уже лежит tmpfs на 100m.
-    # mem_limit и memswap_limit держать равными (swap off, см. заголовок).
     mem_limit: 512m
     memswap_limit: 512m
     cpus: "0.5"
-    ulimits:
-      nofile:
-        soft: 1024
-        hard: 2048
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
@@ -321,6 +392,9 @@ services:
 # ---------------------------------------------------------------------------
 networks:
   converter:
+    # Явное имя: autoscaler подключает к этой сети создаваемые им реплики,
+    # а имя по умолчанию зависит от имени каталога проекта
+    name: doc-converter_converter
 
 # ---------------------------------------------------------------------------
 # Volumes
@@ -328,7 +402,7 @@ networks:
 volumes:
   valkey-data:
     name: doc-converter-valkey-data
-  storage-data:
-    name: doc-converter-storage-data
+  minio-data:
+    name: doc-converter-minio-data
   audit-log:
     name: doc-converter-audit-log

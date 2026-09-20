@@ -1,208 +1,327 @@
-# doc-converter
+# doc-converter: XLSX → PDF через LibreOffice + UNO
 
-Сервис конвертации документов с HTTP API, совместимым с **Р7-Офис** (`POST /ConvertService.ashx`).
+Сервис конвертации электронных таблиц в PDF. Конвертация выполняется
+**нативным LibreOffice Calc**, которым управляет Python-скрипт через
+**UNO API** — без CLI-обёрток вида `soffice --convert-to` и без `unoconv`.
 
-Конвертация выполняется **исключительно через WASM-сборку LibreOffice**
-(`@matbee/libreoffice-converter`) — нативного LibreOffice в образе нет и добавлять его не следует.
-
-- ESM, Node.js ≥ 20
-- Два независимых пути выполнения: синхронный (fork-пул) и асинхронный (BullMQ)
-- Состояние — в Valkey/Redis, результаты — в файловом хранилище
-- Веб-интерфейс в `web/` (Vite + React + TypeScript), раздаётся отдельным контейнером nginx
+- NestJS + TypeScript для API и воркеров
+- BullMQ + Valkey — очередь задач, три уровня сложности
+- MinIO (S3) — входные файлы и результаты, отдаются presigned-ссылкой
+- Docker Compose для локального запуска, KEDA — для Kubernetes
 - Все комментарии, JSDoc и сообщения в коде — на русском языке
 
-## Возможности
+## Как это работает
 
-| | |
-|---|---|
-| **Синхронный режим** | `async: false` — конвертация в рамках HTTP-запроса, ответ содержит готовый `fileUrl` |
-| **Асинхронный режим** | `async: true` — задача ставится в очередь BullMQ, ответ `202` с `taskId` |
-| **Идемпотентность** | Поле `key` резервируется в Valkey через `SET NX EX`; повторный запрос с тем же ключом не запускает вторую конвертацию |
-| **Два источника** | `url` (файл скачивается сервисом, только публичный http/https-хост) или `data` (base64 в теле запроса) — ровно одно из двух. В конфигурации compose внешняя сеть закрыта, поэтому там работает только `data` |
-| **Опции Р7-Офис** | `codePage`, `delimiter`, `region`, `documentLayout`, `spreadsheetLayout`, `documentRenderer`, `password` |
-| **Защита** | rate limit, SSRF-guard, проверка сигнатур файлов, zip-guard, изоляция выполнения |
+```
+POST /convert/xlsx-to-pdf (multipart: файл + параметры)
+   │
+   ├─ проверка сигнатуры файла и zip-контейнера
+   ├─ оценка сложности: размер файла + число листов из xl/workbook.xml
+   ├─ вход в MinIO: incoming/{jobId}.xlsx
+   └─ задача в очередь light | medium | heavy → 202 { jobId, tier, queue }
+                                   │
+                    uno-worker-<tier> (BullMQ, concurrency: 1)
+                                   │
+                    python3 uno_convert.py ──UNO──> soffice --headless
+                                   │
+                    результат в MinIO: results/{jobId}.pdf
+
+GET /convert/status/:id → queued | processing | completed | failed
+                          + presigned URL, когда готово
+```
+
+Одна реплика воркера — **один процесс soffice и одна конвертация
+одновременно**. Это требование корректности, а не оптимизация: UNO
+не потокобезопасен, и вторая параллельная конвертация в том же процессе
+портит документ и роняет бридж. Параллелизм достигается только репликами.
 
 ## Быстрый старт
 
 ```bash
 docker compose up --build
-curl http://localhost:3000/health    # API
-open http://localhost:8080           # веб-интерфейс
 ```
 
-Поднимаются `web` (nginx с интерфейсом), `api`, `worker` и `valkey`.
-Наружу открыты порты `8080` (интерфейс) и `3000` (API).
+Поднимаются: `api`, `web` (интерфейс и реверс-прокси), `uno-worker-light`,
+`uno-worker-medium`, `uno-worker-heavy`, `autoscaler`, `minio`, `valkey`.
 
-Для локального запуска без Docker понадобится доступный Valkey/Redis:
+Порты: `8080` — интерфейс, `3000` — API (только loopback), `9000` — MinIO.
+
+### Проверка конвертации
+
+```bash
+# 1. Отправить файл и получить идентификатор задачи
+curl -s -X POST http://localhost:3000/convert/xlsx-to-pdf \
+  -F "file=@report.xlsx" \
+  -F "watermark=CONFIDENTIAL" \
+  -F "watermarkMode=tiled" \
+  -F "fitToOnePage=true" \
+  -F "pdfVersion=default" \
+  -F "quality=90" \
+  -F "maxImageResolution=300" \
+  | jq
+
+# Ответ:
+# {
+#   "jobId": "9f1c2f5e-...",
+#   "status": "queued",
+#   "tier": "light",
+#   "queue": "xlsx2pdf.light",
+#   "sheets": 3,
+#   "sizeBytes": 48211,
+#   "createdAt": "2026-09-20T10:15:00.000Z"
+# }
+
+# 2. Опросить состояние
+curl -s http://localhost:3000/convert/status/<jobId> | jq
+
+# Ответ при готовности:
+# {
+#   "jobId": "9f1c2f5e-...",
+#   "status": "completed",
+#   "tier": "light",
+#   "createdAt": "...",
+#   "startedAt": "...",
+#   "finishedAt": "...",
+#   "result": {
+#     "url": "http://localhost:9000/conversions/results/9f1c2f5e-....pdf?X-Amz-...",
+#     "expiresAt": "2026-09-20T11:15:00.000Z",
+#     "sizeBytes": 152340
+#   }
+# }
+
+# 3. Скачать PDF (ссылка живёт ограниченное время)
+curl -s -o result.pdf "<url из ответа>"
+
+# 4. Проверить результат
+pdfinfo result.pdf | grep Pages    # таблица умещена на одну страницу
+# Водяной знак записан глифами CID-шрифта, текстовым поиском он не находится —
+# смотрите страницу визуально (или отрендерите в изображение)
+```
+
+### Параметры конвертации
+
+Все параметры необязательны и передаются полями формы (строками).
+
+| Параметр | Значения | По умолчанию | Что делает |
+|---|---|---|---|
+| `watermark` | текст до 200 символов | — | Водяной знак на каждой странице |
+| `watermarkMode` | `single`, `tiled` | `single` | Один по центру или мозаикой |
+| `fitToOnePage` | `true`, `false` | `true` | Уместить лист на одну страницу (`ScaleToPagesX/Y = 1`) |
+| `pdfVersion` | `default`, `pdfa-1a`, `pdfa-2b`, `pdfa-3b` | `default` | Версия PDF (`SelectPdfVersion`) |
+| `quality` | 1–100 | 90 | Качество JPEG-сжатия изображений |
+| `reduceImageResolution` | `true`, `false` | `true` | Понижать разрешение изображений |
+| `maxImageResolution` | 50–1200 | 300 | Предельное разрешение, DPI |
+| `exportBookmarks` | `true`, `false` | `true` | Закладки по листам |
+| `taggedPdf` | `true`, `false` | `false` | Теги структуры (нужны для PDF/A) |
+| `userPassword` | строка | — | Пароль на открытие PDF |
+| `ownerPassword` | строка | — | Пароль владельца |
+| `restrictPermissions` | `true`, `false` | `false` | Включить ограничения прав |
+| `allowPrinting` | `true`, `false` | `true` | Разрешить печать |
+| `allowChanges` | `true`, `false` | `false` | Разрешить изменение |
+
+Пример с шифрованием и PDF/A:
+
+```bash
+curl -s -X POST http://localhost:3000/convert/xlsx-to-pdf \
+  -F "file=@report.xlsx" \
+  -F "pdfVersion=pdfa-2b" \
+  -F "taggedPdf=true" \
+  -F "userPassword=secret" \
+  -F "ownerPassword=owner-secret" \
+  -F "restrictPermissions=true" \
+  -F "allowPrinting=true" \
+  -F "allowChanges=false" | jq
+```
+
+### Прочие маршруты
+
+```bash
+curl -s http://localhost:3000/health | jq
+# { "status": "ok", "storage": true, "version": "1.0.0" }
+```
+
+Некорректный запрос отвечает единообразно:
+
+```bash
+curl -s -X POST http://localhost:3000/convert/xlsx-to-pdf | jq
+# { "error": "file_required", "message": "В запросе нет файла в поле «file»" }
+```
+
+## Уровни сложности и очереди
+
+Задача попадает в очередь по **старшему** из двух признаков — размеру файла
+и числу листов (листы читаются из `xl/workbook.xml` внутри zip, без запуска
+LibreOffice):
+
+| Очередь | Условие | Почему так |
+|---|---|---|
+| `light` | ≤ 2 МиБ **и** ≤ 3 листов | Открытие книги занимает больше времени, чем сам экспорт |
+| `medium` | ≤ 20 МиБ **и** ≤ 20 листов | Десятки секунд на конвертацию |
+| `heavy` | Всё остальное | Минуты; каждая задача занимает реплику целиком |
+
+Разделение нужно потому, что одна конвертация занимает воркер целиком:
+в общей очереди крупная книга задерживала бы мелкие файлы, которые прошли бы
+за секунды.
+
+## Масштабирование
+
+### Правила
+
+Одна реплика = один soffice = одна конвертация, поэтому «задач на реплику» —
+это не параллелизм, а допустимая длина очереди ожидания.
+
+| Очередь | min | max | `listLength` | `cooldownPeriod` |
+|---|---|---|---|---|
+| light | 0 (KEDA) / 1 (compose) | 10 | 5 | 120 с |
+| medium | 1 | 6 | 2 | 300 с |
+| heavy | 1 | 3 | 1 | 600 с |
+
+Обоснование:
+
+- **`listLength` растёт от тяжёлых к лёгким.** Лёгкая конвертация длится
+  секунды: держать под каждую задачу отдельный LibreOffice дороже, чем
+  подождать, поэтому пять задач на реплику. Тяжёлая занимает минуты, и две
+  таких задачи в очереди означают, что вторая прождёт минуты, — значит,
+  `listLength: 1`.
+- **Активные задачи считаются вместе с ожидающими.** Реплика, занятая
+  конвертацией, для очереди недоступна; если считать только `waiting`,
+  масштабирование будет вечно догонять нагрузку.
+- **`minReplicaCount`.** Для `light` в KEDA ноль: холодный старт (~3 с)
+  незаметен на фоне ожидания, а в простое реплики не нужны. Для `medium`
+  и `heavy` единица: поднимать LibreOffice «с нуля» дороже, чем держать
+  прогретую реплику, а конвертация и так идёт десятки секунд.
+  В compose `min` для всех уровней — единица, потому что стартовые реплики
+  объявлены сервисами и существуют независимо от autoscaler'а.
+- **`maxReplicaCount`** ограничен памятью узла: реплика с LibreOffice
+  занимает 400–600 МБ в покое и заметно больше на пике конвертации
+  большой книги. При 2 ГБ на реплику (см. `mem_limit` в compose) три
+  тяжёлых реплики — это 6 ГБ.
+- **`cooldownPeriod`** тем больше, чем дороже задача: погасить и снова
+  поднять тяжёлую реплику дороже, чем подождать. 120 с для лёгких,
+  300 с для средних, 600 с для тяжёлых.
+- **`pollingInterval` 15 с** — компромисс между задержкой появления
+  свободного воркера и нагрузкой на Redis и Docker API.
+- **`activationListLength: 1`** — не поднимать реплику с нуля из-за
+  единственной задачи в моменте (защита от дребезга).
+
+### В Kubernetes — KEDA
+
+Манифесты: `deploy/k8s/scaledobject-{light,medium,heavy}.yaml`. Масштабирование
+идёт по длине списка BullMQ (`bull:xlsx2pdf.<tier>:wait`), доступ к Docker
+не нужен.
+
+### В docker compose — сервис autoscaler
+
+В compose нет ничего, что умеет масштабировать сервис по внешней метрике,
+поэтому реплики создаются сервисом `autoscaler` через Docker API.
+
+Autoscaler различает реплики по меткам:
+
+- стартовые реплики compose (метки без `doc-converter.managed`) он только
+  считает — удалять их нельзя, иначе `restart: unless-stopped` вернёт
+  контейнер и autoscaler начнёт бесконечно бороться с compose;
+- созданные им самим (`doc-converter.managed=autoscaler`) — поднимает
+  и гасит по правилам выше.
+
+За один цикл число реплик меняется не более чем на `AUTOSCALER_MAX_STEP`:
+реплика поднимается несколько секунд и занимает сотни мегабайт, поэтому
+скачок «1 → 10» выедает память быстрее, чем приходят задачи.
+
+Реплики получают тот же бюджет конвертации, что и стартовые
+(`CONVERSION_TIMEOUT_MS` зависит от уровня: 120 с для light и medium,
+300 с для heavy): иначе поведение зависело бы от того, кто поднял контейнер.
+
+> **Внимание.** Autoscaler монтирует `/var/run/docker.sock`, что даёт
+> контейнеру root-эквивалент на хосте. Это осознанная плата за
+> автомасштабирование в compose; в Kubernetes доступ к сокету не нужен.
+
+## Разработка
 
 ```bash
 pnpm install
-npm run build:contract   # контракт — рантайм-зависимость сервера
-npm run build:server     # dist/ — сервер запускается только из сборки
-npm run dev              # api + worker через concurrently
-npm run health           # curl http://localhost:3000/health | jq
+pnpm --filter @doc-converter/contract build   # контракт — рантайм-зависимость
+npm run build:server                          # сервер запускается из dist/
+npm run dev                                   # api + воркер через concurrently
 ```
 
-## Веб-интерфейс
-
-В каталоге `web/` — SPA на Vite + React + TypeScript: выбор файлов перетаскиванием,
-параметры конвертации, очередь задач с прогрессом и скачиванием результата.
-Интерфейс работает через асинхронный режим API (`async: true`) и опрашивает
-`GET /status` одной пачкой на все активные задачи.
-
-Интерфейс входит в общий pnpm-workspace, поэтому ставится и запускается из корня:
+Локальный запуск требует доступных Valkey и MinIO (проще всего —
+`docker compose up valkey minio minio-init`).
 
 ```bash
-pnpm install
-pnpm --filter doc-converter-web dev   # http://localhost:5173, прокси Vite
+npm test              # весь набор (Redis и MinIO не нужны)
+npm run test:watch    # то же в режиме наблюдения
+npm run typecheck:server
 ```
 
-В production статику раздаёт отдельный контейнер nginx (см. `web/nginx.conf`),
-который проксирует API на сервис `api` — фронтенд и API оказываются на одном origin,
-поэтому CORS не нужен.
+Тесты читают исходники на TypeScript, сборка перед прогоном не нужна.
+Проверяются оценка сложности, правила автомасштабирования, маршруты API
+и каркас приложения — всё, что не требует живой инфраструктуры.
 
-```bash
-pnpm --filter @doc-converter/contract build   # контракт — до сборки интерфейса
-pnpm --filter doc-converter-web typecheck     # tsc --noEmit
-pnpm --filter doc-converter-web build         # tsc --noEmit + vite build → web/dist
-```
-
-## Контракт API
-
-`packages/contract` — zod-схемы и выведенные из них типы, общие для сервера
-и веб-интерфейса: формы запросов и ответов, списки форматов, кодировки,
-разделители и коды ошибок. Из одной схемы получаются и тип для TypeScript,
-и рантайм-проверка, поэтому серверная и клиентская стороны не могут разойтись.
-
-## Пример использования
-
-Синхронная конвертация DOCX в PDF:
-
-```bash
-curl -X POST http://localhost:3000/ConvertService.ashx \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "async": false,
-        "filetype": "docx",
-        "outputtype": "pdf",
-        "url": "http://storage.internal/files/report.docx",
-        "key": "task-123"
-      }'
-```
-
-```json
-{
-  "status": "success",
-  "fileUrl": "/storage/results/task-123.pdf",
-  "fileType": "pdf",
-  "taskId": "task-123"
-}
-```
-
-Асинхронная конвертация и опрос статуса:
-
-```bash
-curl -X POST http://localhost:3000/ConvertService.ashx \
-  -H 'Content-Type: application/json' \
-  -d '{"async": true, "filetype": "xlsx", "outputtype": "pdf", "data": "<base64>", "key": "task-456"}'
-
-curl http://localhost:3000/status/task-456
-```
-
-Полное описание полей, ответов и кодов ошибок — в [docs/api.md](docs/api.md).
-
-## Форматы
-
-**Вход:** `doc`, `docx`, `xls`, `xlsx`, `ppt`, `pptx`, `odt`, `ods`, `odp`, `rtf`, `txt`,
-`html`, `htm`, `csv`, `pdf`, `epub`
-
-**Выход:** `pdf`, `pdfa`, `docx`, `xlsx`, `csv`, `txt`, `html`, `png`, `jpg`, `jpeg`,
-`svg`, `odt`, `ods`, `odp`, `rtf`, `epub`
-
-Матрицы попарной совместимости нет: проверяется, что входной формат есть в списке входных,
-а выходной — в списке выходных. Подробности — в [docs/architecture.md](docs/architecture.md#форматы-и-опции).
-
-## Документация
-
-| Документ | О чём |
-|---|---|
-| [docs/api.md](docs/api.md) | Справочник API: эндпоинты, схема запроса, форматы ответов, коды ошибок |
-| [docs/architecture.md](docs/architecture.md) | Внутреннее устройство: два пути выполнения, поток данных, где что менять |
-| [docs/security.md](docs/security.md) | Слои защиты: SSRF, сигнатуры файлов, zip-guard, изоляция, аудит-лог |
-| [docs/configuration.md](docs/configuration.md) | Все переменные окружения и лимиты с обоснованиями |
-| [docs/deployment.md](docs/deployment.md) | Docker, compose, ресурсы, healthcheck, диагностика |
-
-`CLAUDE.md` — краткая инструкция для работы с репозиторием (команды, соглашения, архитектурные акценты).
-
-## Архитектура в двух словах
+## Структура
 
 ```
-POST /ConvertService.ashx
-  → nest/http/convert.controller.ts  схема, SSRF, magic bytes, zip guard, запись результата
-  → worker/sandbox.ts                семафор MAX_CONCURRENT + таймаут SYNC_QUEUE_WAIT_MS
-  → worker/fork-pool.ts              пул child_process.fork
-  → worker/fork-worker.ts            конвертация в дочернем процессе
-  → @matbee/libreoffice-converter
+src/
+  config/index.ts           все таймауты и лимиты с обоснованиями
+  nest/
+    xlsx/                   контроллер, сервис, оценка сложности
+    common/                 логгер, фильтр ошибок, ограничитель частоты
+    health/                 /health и healthcheck-скрипты
+  worker/uno/               воркер: процессор, вызов Python, healthcheck
+  queue/                    соединения Redis, очереди, состояние задач
+  storage/s3.ts             MinIO: загрузка, скачивание, presigned-ссылки
+  security/                 лимиты, сигнатуры файлов, zip-гард
+  autoscaler/               правила масштабирования и клиент Docker API
+docker/uno/
+  worker-entrypoint.sh      запуск soffice и ожидание готовности UNO
+  uno_convert.py            конвертация: PageStyle, FilterData, экспорт
+deploy/k8s/                 KEDA ScaledObject для трёх очередей
+docs/                       справочники: API, конфигурация, развёртывание
+tests/                      Vitest: сложность, скейлинг, маршруты
 ```
 
-Асинхронный путь — та же конвертация, но запускаемая из очереди:
+## Известные ограничения и подводные камни
 
-```
-POST /ConvertService.ashx → 202 + задача в очереди 'conversion'
-  → queue/conversionQueue.ts  BullMQ
-  → worker/index.ts           BullMQ Worker
-  → worker/processor.ts       подготовка, валидация, сохранение результата
-  → worker/sandbox.ts         тот же fork-пул
-  → worker/fork-worker.ts     конвертация в дочернем процессе
-```
-
-Оба режима используют один механизм конвертации — fork-пул с изоляцией на уровне ОС
-и принудительным завершением процесса по таймауту. Разница только в том, кто её
-запускает: обработчик HTTP-запроса или обработчик задачи очереди.
-
-## Команды
-
-```bash
-pnpm install                 # Dockerfile ставит зависимости через pnpm ci
-
-npm run build:contract       # контракт: обязателен до сборки сервера и веба
-npm run build:server         # tsc → dist/ (сервер запускается только из сборки)
-
-npm run dev                  # API + worker вместе (NODE_ENV=development, включает CORS)
-npm run dev:api              # только API
-npm run dev:worker           # только BullMQ worker
-
-npm run start                # то же, но NODE_ENV=production
-npm run health               # curl http://localhost:3000/health | jq
-```
-
-## Тесты
-
-```bash
-npm test                     # весь набор
-npm run test:watch           # режим наблюдения
-npm run test:e2e             # то же с E2E=1
-
-# Один файл / один тест
-NODE_ENV=test npx vitest run tests/security.test.js
-NODE_ENV=test npx vitest run -t "should reject ZIP bomb"
-```
-
-Раннер — Vitest; тесты работают с исходниками на TypeScript, сборка перед прогоном
-не требуется.
-
-Фикстур-атаки не лежат в `tests/fixtures/` — они генерируются кодом в
-`tests/helpers/attackFixtures.js` (zip-бомбы, path traversal, XML-бомбы, валидные DOCX/PDF).
-
-## Требования
-
-- Node.js ≥ 20
-- Доступный Valkey или Redis (`REDIS_HOST`/`REDIS_PORT`)
-- Для полного стека — Docker и Docker Compose
-
-`SYNC_TIMEOUT_MS` обязан быть меньше таймаута балансировщика (nginx `proxy_read_timeout`),
-иначе клиент получит оборванное соединение вместо 504.
-
-## Лицензия
-
-MIT — см. [LICENSE](LICENSE).
+1. **`fitToOnePage` может сделать большую таблицу нечитаемой.** Масштаб
+   подбирает LibreOffice; для «простыни» на сотни строк шрифт станет
+   микроскопическим. Это ожидаемое поведение режима «на одну страницу»,
+   и параметр можно отключить.
+2. **Водяной знак — текст или URL.** FilterData `Watermark`/`TiledWatermark`
+   принимает и то и другое; сервис передаёт текст. Если текст похож на URL,
+   LibreOffice попытается загрузить ресурс — поэтому длинные значения
+   ограничены 200 символами, но экзотические строки всё равно стоит
+   проверять на своей версии LibreOffice. В готовом PDF текст знака записан
+   глифами CID-шрифта, поэтому поиск по строкам (`pdftotext | grep`) его
+   не найдёт — проверяйте визуально.
+3. **Версии PDF 1.4–1.7 выбрать нельзя.** Проверено перебором значений
+   `SelectPdfVersion` на LibreOffice 7.4: поддерживаются только «по умолчанию»
+   (PDF 1.6) и три варианта PDF/A — 1a, 2b и 3b. Коды 4 и выше дают тот же
+   файл, что и 0, поэтому в API этих вариантов нет.
+4. **UNO не потокобезопасен.** `concurrency: 1` в воркере — не настройка,
+   а требование. Увеличение приведёт к порче документов и падениям бриджа.
+5. **Падение soffice роняет воркер.** Ретраев внутри процесса нет: контейнер
+   перезапускается (`restart: unless-stopped`), а задача возвращается
+   в очередь stalled-механизмом BullMQ — но **не мгновенно**, а в пределах
+   `BULLMQ_STALLED_INTERVAL` (2 минуты у лёгкой и средней очереди, 5 минут
+   у тяжёлой). Проверено: после `docker kill` воркера задача вернулась
+   в очередь и была выполнена другой репликой. `maxStalledCount: 1`
+   ограничивает число таких повторов, чтобы «ядовитый» файл не крутился вечно.
+6. **Образ воркера тяжёлый** (LibreOffice Calc, python3-uno, шрифты —
+   порядка 700 МБ). Это влияет на скорость холодного старта реплики:
+   в KEDA с `minReplicaCount: 0` первая задача после простоя ждёт
+   и подъёма контейнера, и старта soffice.
+7. **Presigned-ссылка подписывается вместе с хостом.** В compose ссылки
+   формируются для `S3_PUBLIC_ENDPOINT` (по умолчанию `localhost:9000`):
+   изнутри сети MinIO доступен как `minio:9000`, но браузер такого имени
+   не знает. В K8s нужен ingress на MinIO или внешний S3.
+8. **Autoscaler требует доступа к Docker API.** Сокет даёт root-эквивалент
+   на хосте — в K8s используйте KEDA и не монтируйте сокет.
+9. **Ключи BullMQ в Redis.** KEDA и autoscaler читают список
+   `bull:<queue>:wait`; при смене `QUEUE_PREFIX` нужно поправить и манифесты
+   KEDA.
+10. **Исходный документ с паролем.** Параметры `userPassword`/`ownerPassword`
+   относятся к PDF на выходе. Если сама книга защищена паролем, его нужно
+   передать отдельно — сейчас API такого поля не имеет, и такая книга
+   упадёт с `conversion_failed`.
+11. **Файлы `.xls`** (старый OLE-формат) принимаются, но классифицируются
+    только по размеру: число листов из них так же дёшево не прочитать,
+    как из zip-контейнера.

@@ -2,15 +2,19 @@
  * Состояние очереди конвертации и опрос статусов.
  *
  * Единственное место, где живёт список задач: компоненты получают готовые
- * данные и колбэки. Отправка идёт через ограничитель параллелизма, а статусы
- * запрашиваются одной пачкой на все активные задачи.
+ * данные и колбэки.
+ *
+ * Отправка идёт через ограничитель параллелизма, а статусы опрашиваются
+ * по каждой незавершённой задаче отдельно: батча в новом API нет, поэтому
+ * поток запросов ограничивает не размер пачки, а пауза между запусками
+ * (см. `STATUS_MIN_INTERVAL_MS`) и то, что задача опрашивается не чаще
+ * одного раза в секунду и только пока она в очереди или в работе.
  */
 
 import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
-import { fetchStatuses, submitConversion } from '../api/conversion';
-import { ApiError, buildDownloadUrl } from '../api/client';
-import { describeError } from '../api/errors';
-import { fileToBase64 } from '../lib/base64';
+import { fetchStatus, submitConversion } from '../api/conversion';
+import { ApiError, downloadFromUrl } from '../api/client';
+import { describeError, describeJobError } from '../api/errors';
 import { createLimiter, type Limiter } from '../lib/limiter';
 import { detectInputFormat, stripExtension } from '../lib/format';
 import {
@@ -20,24 +24,30 @@ import {
   POLL_DEADLINE_MS,
   POLL_INTERVAL_MS,
   POLL_MAX_INTERVAL_MS,
+  RESULT_EXTENSION,
 } from '../config';
 import type {
+  ComplexityTier,
   ConversionOptions,
-  TaskResult,
-  TaskStatus,
-  TaskStatusResponse,
+  JobResult,
+  JobStatus,
+  JobStatusResponse,
 } from '@doc-converter/contract';
 
-/** Состояние задачи в интерфейсе. */
+/**
+ * Состояние задачи в интерфейсе.
+ *
+ * Кроме серверных состояний (`queued`, `processing`, `completed`, `failed`)
+ * есть локальные: файл ещё не отправлен, отправляется или отправка отменена.
+ */
 export type QueueItemStatus =
   /** Файл добавлен, отправка ещё не начата. */
   | 'pending'
-  /** Файл кодируется в base64. */
-  | 'encoding'
-  /** Запрос отправлен, ждём ответа. */
-  | 'uploading'
-  /** Сервер принял задачу. */
-  | TaskStatus
+  /** Файл отправляется на сервер. */
+  | 'submitting'
+  /** Состояние с сервера. */
+  | JobStatus
+  /** Отправка прервана пользователем; на сервере задачи нет. */
   | 'cancelled';
 
 /** Задача в очереди. */
@@ -45,18 +55,22 @@ export interface QueueItem {
   /** Клиентский идентификатор — ключ списка React. */
   id: string;
   file: File;
-  /** Идентификатор задачи на сервере (он же key в запросе). */
-  taskId: string;
-  /** Формат результата, выбранный на момент запуска. */
-  outputType: string;
-  /** Опции, применённые на момент запуска. */
+  /** Идентификатор задачи на сервере; появляется после постановки. */
+  jobId?: string;
+  /** Уровень сложности, назначенный сервером. */
+  tier?: ComplexityTier;
+  /** Число листов книги, если сервер его определил. */
+  sheets?: number | null;
+  /** Параметры, зафиксированные на момент запуска. */
   options: ConversionOptions;
   /** Имя файла для скачивания. */
   downloadName: string;
   size: number;
   status: QueueItemStatus;
-  progress: number;
-  result?: TaskResult;
+  /** Когда задача была поставлена — для показа, сколько она идёт. */
+  submittedAt?: number;
+  /** Ссылка на готовый PDF и срок её жизни. */
+  result?: JobResult;
   errorText?: string;
 }
 
@@ -65,8 +79,7 @@ type Action =
   | { type: 'add'; items: QueueItem[] }
   | { type: 'patch'; id: string; patch: Partial<QueueItem> }
   | { type: 'remove'; id: string }
-  | { type: 'clearFinished' }
-  | { type: 'reset' };
+  | { type: 'clearFinished' };
 
 /**
  * Применяет действие к очереди.
@@ -90,39 +103,51 @@ function reducer(state: QueueItem[], action: Action): QueueItem[] {
 
     case 'clearFinished':
       return state.filter(
-        (item) => item.status !== 'completed' && item.status !== 'cancelled'
+        (item) =>
+          item.status !== 'completed' &&
+          item.status !== 'failed' &&
+          item.status !== 'cancelled'
       );
-
-    case 'reset':
-      return [];
 
     default:
       return state;
   }
 }
 
-/** Статусы, при которых задача ещё не завершена. */
+/** Состояния, при которых задача ещё не завершена. */
 function isActiveStatus(status: QueueItemStatus): boolean {
   return (
     status === 'pending' ||
-    status === 'encoding' ||
-    status === 'uploading' ||
+    status === 'submitting' ||
     status === 'queued' ||
-    status === 'processing' ||
-    status === 'unknown'
+    status === 'processing'
   );
 }
 
-/** Статусы, при которых опрос задачи больше не нужен. */
-function isTerminalStatus(status: QueueItemStatus): boolean {
-  return status === 'completed' || status === 'failed' || status === 'cancelled';
+/**
+ * Проверяет, что задачу нужно опрашивать.
+ *
+ * @param item - задача очереди
+ * @returns true, если у задачи есть идентификатор и незавершённое состояние
+ */
+function isPollable(item: QueueItem): boolean {
+  return (
+    item.jobId !== undefined && (item.status === 'queued' || item.status === 'processing')
+  );
 }
+
+/**
+ * Минимальная пауза между циклами опроса (мс).
+ *
+ * Нужна как страховка от «горячего» цикла: если сроки всех задач уже прошли,
+ * следующий цикл без паузы крутился бы на setTimeout(0), сжигая процессор
+ * на переборе списка задач.
+ */
+const MIN_TICK_DELAY_MS = 50;
 
 /** Параметры хука. */
 export interface UseConversionQueueOptions {
-  /** Формат результата, применяемый к новым задачам. */
-  outputType: string;
-  /** Опции конвертации, применяемые к новым задачам. */
+  /** Параметры конвертации, применяемые к новым задачам. */
   options: ConversionOptions;
 }
 
@@ -136,7 +161,6 @@ export interface ConversionQueue {
   startAll: () => void;
   cancelAll: () => void;
   retryItem: (id: string) => void;
-  downloadItem: (id: string) => void;
   downloadAll: () => void;
   stats: {
     total: number;
@@ -144,32 +168,31 @@ export interface ConversionQueue {
     active: number;
     completed: number;
     failed: number;
+    cancelled: number;
   };
 }
 
 /**
  * Управляет очередью конвертации.
  *
- * @param hookOptions - формат результата и опции для новых задач
+ * @param hookOptions - параметры конвертации для новых задач
  * @returns состояние очереди и операции над ней
  */
 export function useConversionQueue({
-  outputType,
   options,
 }: UseConversionQueueOptions): ConversionQueue {
   const [items, dispatch] = useReducer(reducer, []);
 
   // Актуальные настройки нужны внутри колбэков, которые не должны
   // пересоздаваться при каждом изменении формы
-  const settingsRef = useRef({ outputType, options });
-  settingsRef.current = { outputType, options };
+  const settingsRef = useRef(options);
+  settingsRef.current = options;
 
-  // Зеркало списка задач для чтения внутри колбэков и таймера опроса.
+  // Зеркало списка задач для чтения внутри колбэков и цикла опроса.
   //
   // Читать состояние напрямую нельзя: колбэк, зависящий от items, получает
-  // новую идентичность на каждом обновлении прогресса. Для memo(TaskRow) это
-  // критично — нестабильные пропсы обнуляют сравнение и перерисовывают все
-  // строки таблицы на каждом тике опроса (см. TaskTable).
+  // новую идентичность на каждом обновлении, а для memo(TaskRow) это значит
+  // перерисовку всех строк таблицы на каждом тике опроса (см. TaskTable).
   const itemsRef = useRef(items);
   itemsRef.current = items;
 
@@ -177,8 +200,8 @@ export function useConversionQueue({
   // значение нужно читать в момент вызова, а не в момент создания
   const limiterRef = useRef<Limiter | null>(null);
 
-  // Таймеры отложенных скачиваний: их нужно снимать при размонтировании и
-  // при повторном запуске, иначе клики по скрытым ссылкам продолжат
+  // Таймеры отложенных скачиваний: их нужно снимать при размонтировании
+  // и при повторном запуске, иначе клики по скрытым ссылкам продолжат
   // срабатывать после ухода со страницы
   const downloadTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
 
@@ -187,8 +210,7 @@ export function useConversionQueue({
    *
    * Создание ленивое намеренно: аргумент useRef вычисляется на каждом
    * рендере, поэтому ограничитель — объект с очередью, множеством
-   * контроллеров и замыканиями — создавался и сразу уходил в мусор на
-   * каждом обновлении прогресса.
+   * контроллеров и замыканиями — создавался и сразу уходил в мусор.
    *
    * @returns ограничитель, актуальный на момент вызова
    */
@@ -216,66 +238,50 @@ export function useConversionQueue({
   }, []);
 
   /**
-   * Отправляет одну задачу: кодирует файл и ставит его в очередь сервиса.
+   * Отправляет одну задачу и запоминает выданный сервером идентификатор.
    */
-  const sendItem = useCallback(async (item: QueueItem, signal: AbortSignal) => {
-    dispatch({ type: 'patch', id: item.id, patch: { status: 'encoding' } });
+  const sendItem = useCallback(
+    async (item: QueueItem, signal: AbortSignal) => {
+      dispatch({ type: 'patch', id: item.id, patch: { status: 'submitting' } });
 
-    try {
-      const data = await fileToBase64(item.file, signal);
+      try {
+        const accepted = await submitConversion(
+          { file: item.file, options: item.options },
+          signal
+        );
 
-      dispatch({ type: 'patch', id: item.id, patch: { status: 'uploading' } });
-
-      const response = await submitConversion(
-        {
-          taskId: item.taskId,
-          filetype: detectInputFormat(item.file.name) ?? '',
-          outputtype: item.outputType,
-          data,
-          title: item.downloadName,
-          options: item.options,
-        },
-        signal
-      );
-
-      // Сервер мог ответить готовым результатом, если задача с таким key
-      // уже выполнялась ранее — тогда опрос не нужен
-      if (response.result) {
         dispatch({
           type: 'patch',
           id: item.id,
           patch: {
-            status: 'completed',
-            progress: 100,
-            result: response.result,
+            status: accepted.status,
+            jobId: accepted.jobId,
+            tier: accepted.tier,
+            sheets: accepted.sheets,
+            submittedAt: Date.now(),
+            errorText: undefined,
           },
         });
-        return;
-      }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          dispatch({ type: 'patch', id: item.id, patch: { status: 'cancelled' } });
+          return;
+        }
 
-      dispatch({
-        type: 'patch',
-        id: item.id,
-        patch: { status: 'queued', progress: 0 },
-      });
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        dispatch({ type: 'patch', id: item.id, patch: { status: 'cancelled' } });
-        return;
-      }
+        // Сервер ограничил частоту — приостанавливаем остальные отправки
+        if (error instanceof ApiError && error.status === 429 && error.retryAfterSec) {
+          getLimiter().pause(error.retryAfterSec * 1000);
+        }
 
-      // Сервер ограничил частоту — приостанавливаем остальные отправки
-      if (error instanceof ApiError && error.status === 429 && error.retryAfterSec) {
-        getLimiter().pause(error.retryAfterSec * 1000);
+        dispatch({
+          type: 'patch',
+          id: item.id,
+          patch: { status: 'failed', errorText: describeError(error) },
+        });
       }
-
-      dispatch({
-        type: 'patch',
-        id: item.id,
-        patch: { status: 'failed', errorText: describeError(error) },
-      });
-    }
-  }, [getLimiter]);
+    },
+    [getLimiter]
+  );
 
   /**
    * Добавляет файлы в очередь, отсеивая неподдерживаемые и слишком крупные.
@@ -292,27 +298,18 @@ export function useConversionQueue({
         continue;
       }
 
-      const format = detectInputFormat(file.name);
-
-      if (!format) {
-        rejected.push(`«${file.name}»: формат не поддерживается`);
+      if (!detectInputFormat(file.name)) {
+        rejected.push(`«${file.name}»: поддерживаются только файлы XLSX и XLS`);
         continue;
       }
-
-      const { outputType: currentOutput, options: currentOptions } = settingsRef.current;
 
       accepted.push({
         id: crypto.randomUUID(),
         file,
-        // Идентификатор задачи: UUID укладывается в ограничение сервера
-        // в 64 символа и проходит проверку допустимых символов
-        taskId: crypto.randomUUID(),
-        outputType: currentOutput,
-        options: currentOptions,
-        downloadName: `${stripExtension(file.name)}.${currentOutput}`,
+        options: settingsRef.current,
+        downloadName: `${stripExtension(file.name)}.${RESULT_EXTENSION}`,
         size: file.size,
         status: 'pending',
-        progress: 0,
       });
     }
 
@@ -325,8 +322,6 @@ export function useConversionQueue({
 
   /** Запускает все ожидающие задачи через ограничитель. */
   const startAll = useCallback(() => {
-    const { outputType: currentOutput, options: currentOptions } = settingsRef.current;
-
     for (const item of itemsRef.current) {
       if (item.status !== 'pending') {
         continue;
@@ -334,16 +329,21 @@ export function useConversionQueue({
 
       const prepared: QueueItem = {
         ...item,
-        outputType: currentOutput,
-        options: currentOptions,
-        downloadName: `${stripExtension(item.file.name)}.${currentOutput}`,
+        options: settingsRef.current,
+        downloadName: `${stripExtension(item.file.name)}.${RESULT_EXTENSION}`,
       };
 
       void getLimiter().run((signal) => sendItem(prepared, signal));
     }
   }, [sendItem, getLimiter]);
 
-  /** Отменяет отправку: прерывает запросы и помечает задачи отменёнными. */
+  /**
+   * Отменяет отправку: прерывает запросы и помечает задачи отменёнными.
+   *
+   * Задачи, уже принятые сервером (`queued`, `processing`), отмене не подлежат:
+   * их доведёт до конца воркер, и результат появится в списке сам. Поэтому
+   * отменяются только те, что ещё не ушли.
+   */
   const cancelAll = useCallback(() => {
     getLimiter().clear();
     // Ограничитель одноразовый: после clear() он навсегда помечен очищенным
@@ -351,7 +351,7 @@ export function useConversionQueue({
     limiterRef.current = createLimiter(BATCH_CONCURRENCY, BATCH_MIN_INTERVAL_MS);
 
     for (const item of itemsRef.current) {
-      if (isActiveStatus(item.status)) {
+      if (item.status === 'pending' || item.status === 'submitting') {
         dispatch({ type: 'patch', id: item.id, patch: { status: 'cancelled' } });
       }
     }
@@ -360,8 +360,11 @@ export function useConversionQueue({
   /**
    * Повторяет задачу с новым идентификатором.
    *
-   * Новый key обязателен: повторный запрос с прежним ключом сервер считает
-   * идемпотентным и не запускает конвертацию заново.
+   * Прежний jobId не переиспользуется: сервер выдаёт новый на каждый запрос,
+   * а состояние прежней задачи остаётся в хранилище до истечения срока.
+   * Параметры берутся из формы, а не из прежнего снимка, — так же, как
+   * при обычном запуске: пользователь видит панель и ожидает, что применится
+   * именно она.
    */
   const retryItem = useCallback(
     (id: string) => {
@@ -373,22 +376,26 @@ export function useConversionQueue({
 
       const restarted: QueueItem = {
         ...item,
-        taskId: crypto.randomUUID(),
+        options: settingsRef.current,
+        downloadName: `${stripExtension(item.file.name)}.${RESULT_EXTENSION}`,
         status: 'pending',
-        progress: 0,
+        jobId: undefined,
         result: undefined,
         errorText: undefined,
+        submittedAt: undefined,
       };
 
       dispatch({
         type: 'patch',
         id,
         patch: {
-          taskId: restarted.taskId,
+          options: restarted.options,
+          downloadName: restarted.downloadName,
           status: 'pending',
-          progress: 0,
+          jobId: undefined,
           result: undefined,
           errorText: undefined,
+          submittedAt: undefined,
         },
       });
 
@@ -397,26 +404,13 @@ export function useConversionQueue({
     [sendItem, getLimiter]
   );
 
-  /** Скачивает готовый результат. */
-  const downloadItem = useCallback(
-    (id: string) => {
-      const item = itemsRef.current.find((entry) => entry.id === id);
-
-      if (!item?.result) {
-        return;
-      }
-
-      const link = document.createElement('a');
-      link.href = buildDownloadUrl(item.result.fileUrl, item.downloadName);
-      link.download = item.downloadName;
-      document.body.append(link);
-      link.click();
-      link.remove();
-    },
-    []
-  );
-
-  /** Скачивает все готовые результаты по очереди. */
+  /**
+   * Скачивает все готовые результаты по очереди.
+   *
+   * Одиночное скачивание идёт по обычной ссылке в строке задачи, а здесь
+   * ссылки открываются программно — с паузой, потому что браузеры
+   * ограничивают число одновременных загрузок.
+   */
   const downloadAll = useCallback(() => {
     // Повторное нажатие начинает batch заново, а не добавляет второй поверх
     for (const timer of downloadTimersRef.current) {
@@ -424,24 +418,23 @@ export function useConversionQueue({
     }
 
     const ready = itemsRef.current.filter(
-      (item) => item.status === 'completed' && item.result
+      (item) => item.status === 'completed' && item.result !== undefined
     );
 
     downloadTimersRef.current = ready.map((item, index) =>
-      // Небольшая задержка между загрузками: браузеры ограничивают
-      // количество одновременных скачиваний
-      setTimeout(() => downloadItem(item.id), index * 300)
+      setTimeout(() => {
+        if (item.result) {
+          downloadFromUrl(item.result.url, item.downloadName);
+        }
+      }, index * 300)
     );
-  }, [downloadItem]);
+  }, []);
 
   // Признак «есть что опрашивать».
   //
-  // Раньше зависимостью была строка из идентификаторов активных задач, поэтому
-  // каждое завершение задачи перезапускало эффект: опрос обрывался, накопленный
-  // интервал сбрасывался и немедленно уходил внеочередной запрос. При сорока
-  // завершающихся подряд задачах это давало сорок лишних запросов. Актуальный
-  // список задач и так читается через itemsRef, поэтому зависеть достаточно
-  // от самого факта наличия активных
+  // Зависимость — только сам факт наличия незавершённых задач: список задач
+  // читается через itemsRef, иначе цепочка таймеров перезапускалась бы
+  // на каждом завершении задачи и сбрасывала накопленный интервал
   const hasActive = items.some((item) => isActiveStatus(item.status));
 
   useEffect(() => {
@@ -454,69 +447,64 @@ export function useConversionQueue({
     let interval = POLL_INTERVAL_MS;
     let stopped = false;
 
-    // Дедлайн ведётся на задачу, а не на эффект: при постоянном потоке задач
-    // общий дедлайн истекал бы и «падал» на только что добавленные задачи,
-    // которым ждать ещё пять минут
+    // Сроки ведутся по задаче, а не по эффекту: при постоянном потоке файлов
+    // общий срок истёк бы и «упал» на только что добавленные задачи, которым
+    // ждать ещё пятнадцать минут
+    const nextPollAt = new Map<string, number>();
     const deadlines = new Map<string, number>();
 
+    // Задачи, по которым запрос уже отправлен. Без этого набора задача,
+    // ждущая своей очереди в ограничителе, опрашивалась бы повторно:
+    // её срок следующего опроса ещё не отмечен, а цикл уже наступил
+    const inFlight = new Set<string>();
+
     /**
-     * Применяет ответ сервера к очереди.
+     * Помечает задачу проваленной.
      */
-    const applyStatuses = (statuses: TaskStatusResponse[]) => {
-      // Индекс строится один раз на пачку: поиск через find внутри цикла
-      // давал O(n·m) на каждом тике опроса
-      const byTaskId = new Map(itemsRef.current.map((entry) => [entry.taskId, entry]));
+    const fail = (item: QueueItem, errorText: string) => {
+      dispatch({ type: 'patch', id: item.id, patch: { status: 'failed', errorText } });
+    };
 
-      for (const status of statuses) {
-        const item = byTaskId.get(status.taskId);
+    /**
+     * Применяет ответ сервера к задаче.
+     */
+    const applyStatus = (item: QueueItem, response: JobStatusResponse) => {
+      if (response.status === 'failed') {
+        fail(
+          item,
+          response.error
+            ? describeJobError(response.error)
+            : 'Не удалось сконвертировать документ'
+        );
+        return;
+      }
 
-        if (!item) {
-          continue;
-        }
-
-        if (status.status === 'completed') {
-          dispatch({
-            type: 'patch',
-            id: item.id,
-            patch: { status: 'completed', progress: 100, result: status.result },
-          });
-          continue;
-        }
-
-        if (status.status === 'failed') {
-          dispatch({
-            type: 'patch',
-            id: item.id,
-            patch: {
-              status: 'failed',
-              errorText:
-                status.error?.message ?? 'Не удалось сконвертировать документ',
-            },
-          });
-          continue;
-        }
-
-        if (status.status === 'not_found') {
-          dispatch({
-            type: 'patch',
-            id: item.id,
-            patch: {
-              status: 'failed',
-              errorText: 'Задача не найдена — возможно, истёк срок её хранения',
-            },
-          });
-          continue;
+      if (response.status === 'completed') {
+        // Готовый статус без ссылки означает, что результат не сохранился
+        // или срок его хранения истёк: скачивать нечего, и обещать
+        // пользователю кнопку «Скачать» нельзя
+        if (!response.result) {
+          fail(item, 'Результат не найден — возможно, истёк срок его хранения');
+          return;
         }
 
         dispatch({
           type: 'patch',
           id: item.id,
           patch: {
-            status: status.status as QueueItemStatus,
-            progress: status.progress ?? item.progress,
+            status: 'completed',
+            result: response.result,
+            tier: response.tier,
           },
         });
+        return;
       }
+
+      dispatch({
+        type: 'patch',
+        id: item.id,
+        patch: { status: response.status, tier: response.tier },
+      });
     };
 
     /**
@@ -529,82 +517,140 @@ export function useConversionQueue({
 
       const now = Date.now();
 
-      const activeIds = itemsRef.current
-        .filter((item) => isActiveStatus(item.status) && item.status !== 'pending')
-        .map((item) => item.taskId);
+      const pollable = itemsRef.current.filter(isPollable);
+      const pollableIds = new Set(pollable.map((item) => item.jobId));
 
-      // Дедлайн новой задачи отсчитывается с момента, когда её стало можно
-      // опрашивать, а не с запуска эффекта
-      for (const taskId of activeIds) {
-        if (!deadlines.has(taskId)) {
-          deadlines.set(taskId, now + POLL_DEADLINE_MS);
+      // Память о завершённых задачах больше не нужна
+      for (const jobId of deadlines.keys()) {
+        if (!pollableIds.has(jobId)) {
+          deadlines.delete(jobId);
         }
       }
 
-      const active = new Set(activeIds);
-
-      // Завершившиеся задачи перестают занимать память
-      for (const taskId of deadlines.keys()) {
-        if (!active.has(taskId)) {
-          deadlines.delete(taskId);
+      for (const jobId of nextPollAt.keys()) {
+        if (!pollableIds.has(jobId)) {
+          nextPollAt.delete(jobId);
         }
       }
 
-      // Задачи, ждущие дольше дедлайна, снимаются с опроса. Статус проверяется
-      // заново: пока шёл предыдущий запрос, задача могла завершиться
-      for (const item of itemsRef.current) {
-        const expiresAt = deadlines.get(item.taskId);
+      // Пары «задача — её идентификатор»: держать два параллельных массива
+      // нельзя, их индексы разошлись бы при первой же пропущенной задаче
+      const due: { item: QueueItem; jobId: string }[] = [];
 
-        if (expiresAt !== undefined && expiresAt <= now && isActiveStatus(item.status)) {
-          deadlines.delete(item.taskId);
-          active.delete(item.taskId);
+      for (const item of pollable) {
+        const jobId = item.jobId;
 
-          dispatch({
-            type: 'patch',
-            id: item.id,
-            patch: {
-              status: 'failed',
-              errorText: 'Превышено время ожидания обработки',
-            },
-          });
+        if (jobId === undefined || inFlight.has(jobId)) {
+          continue;
+        }
+
+        if (!deadlines.has(jobId)) {
+          deadlines.set(jobId, now + POLL_DEADLINE_MS);
+        }
+
+        const deadline = deadlines.get(jobId);
+
+        if (deadline !== undefined && deadline <= now) {
+          deadlines.delete(jobId);
+          nextPollAt.delete(jobId);
+          fail(item, 'Превышено время ожидания обработки');
+          continue;
+        }
+
+        if ((nextPollAt.get(jobId) ?? 0) <= now) {
+          due.push({ item, jobId });
         }
       }
 
-      if (active.size === 0) {
-        // Опрашивать пока нечего: все задачи ещё в pending. Цепочку таймеров
-        // обрывать нельзя — статусы сменятся на encoding/uploading/queued,
-        // но признак hasActive от этого не изменится, эффект не перезапустится,
-        // и опрос не заведётся уже никогда. Поэтому ждём и проверяем снова
-        timer = setTimeout(() => void tick(), interval);
-        return;
-      }
+      if (due.length > 0) {
+        for (const entry of due) {
+          inFlight.add(entry.jobId);
+        }
 
-      try {
-        const statuses = await fetchStatuses([...active], controller.signal);
-        applyStatuses(statuses);
-        interval = POLL_INTERVAL_MS;
-      } catch (error) {
-        if (error instanceof DOMException && error.name === 'AbortError') {
+        const results = await Promise.allSettled(
+          due.map((entry) => fetchStatus(entry.jobId, controller.signal))
+        );
+
+        // Эффект снят (задачи завершились или страница закрывается) —
+        // результат никому не нужен
+        if (stopped) {
           return;
         }
 
-        // Превышен лимит частоты или хранилище временно недоступно — ждём
-        // столько, сколько просит сервер (оба ответа несут Retry-After)
-        if (
-          error instanceof ApiError &&
-          (error.status === 429 || error.status === 503)
-        ) {
-          interval = Math.min(
-            (error.retryAfterSec ?? 1) * 1000,
-            POLL_MAX_INTERVAL_MS * 4
-          );
-        } else {
-          // Прочие сбои: постепенно снижаем частоту опроса
-          interval = Math.min(interval * 2, POLL_MAX_INTERVAL_MS);
+        let roundFailed = false;
+        const settledAt = Date.now();
+
+        results.forEach((result, index) => {
+          const entry = due[index];
+
+          if (entry === undefined) {
+            return;
+          }
+
+          const { item, jobId } = entry;
+
+          inFlight.delete(jobId);
+
+          if (result.status === 'fulfilled') {
+            nextPollAt.set(jobId, settledAt + POLL_INTERVAL_MS);
+            applyStatus(item, result.value);
+            return;
+          }
+
+          const error: unknown = result.reason;
+
+          if (error instanceof DOMException && error.name === 'AbortError') {
+            return;
+          }
+
+          // Задача исчезла или идентификатор отвергнут: повторять бессмысленно,
+          // а пользователю нужно сказать, что именно случилось
+          if (error instanceof ApiError && (error.status === 404 || error.status === 400)) {
+            nextPollAt.delete(jobId);
+            fail(item, describeError(error));
+            return;
+          }
+
+          // Прочие сбои — временные: задачу не «роняем», а откладываем
+          // следующий опрос, иначе одна сетевая ошибка выглядела бы
+          // как проваленная конвертация
+          roundFailed = true;
+
+          const backoff =
+            error instanceof ApiError && (error.status === 429 || error.status === 503)
+              ? (error.retryAfterSec ?? 1) * 1000
+              : interval;
+
+          nextPollAt.set(jobId, Date.now() + backoff);
+        });
+
+        // Успешный цикл возвращает базовый ритм, сбойный — постепенно
+        // снижает частоту опроса
+        interval = roundFailed ? Math.min(interval * 2, POLL_MAX_INTERVAL_MS) : POLL_INTERVAL_MS;
+      }
+
+      // Следующий цикл — к ближайшему сроку; если опрашивать пока нечего
+      // (все задачи в pending или отправляются), проверяем очередь снова
+      // через базовый интервал: признак hasActive от смены состояния
+      // не изменится, и эффект не перезапустится
+      let nextAt = Date.now() + interval;
+
+      for (const item of itemsRef.current) {
+        if (!isPollable(item) || item.jobId === undefined) {
+          continue;
+        }
+
+        const at = nextPollAt.get(item.jobId);
+
+        if (at !== undefined && at < nextAt) {
+          nextAt = at;
         }
       }
 
-      timer = setTimeout(() => void tick(), interval);
+      timer = setTimeout(
+        () => void tick(),
+        Math.max(MIN_TICK_DELAY_MS, nextAt - Date.now())
+      );
     };
 
     void tick();
@@ -618,7 +664,8 @@ export function useConversionQueue({
       }
     };
     // items намеренно не в зависимостях: актуальное состояние читается
-    // через itemsRef, иначе таймер перезапускался бы на каждом обновлении
+    // через itemsRef, иначе цепочка таймеров перезапускалась бы на каждом
+    // изменении списка задач
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasActive]);
 
@@ -627,20 +674,23 @@ export function useConversionQueue({
     let active = 0;
     let completed = 0;
     let failed = 0;
+    let cancelled = 0;
 
     for (const item of items) {
-      if (item.status === 'pending') {
+      if (item.status === 'pending' || item.status === 'submitting') {
         pending += 1;
       } else if (item.status === 'completed') {
         completed += 1;
       } else if (item.status === 'failed') {
         failed += 1;
-      } else if (!isTerminalStatus(item.status)) {
+      } else if (item.status === 'cancelled') {
+        cancelled += 1;
+      } else {
         active += 1;
       }
     }
 
-    return { total: items.length, pending, active, completed, failed };
+    return { total: items.length, pending, active, completed, failed, cancelled };
   }, [items]);
 
   return {
@@ -651,7 +701,6 @@ export function useConversionQueue({
     startAll,
     cancelAll,
     retryItem,
-    downloadItem,
     downloadAll,
     stats,
   };

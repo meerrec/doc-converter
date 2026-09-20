@@ -1,9 +1,10 @@
 /**
- *Экспорт модулей очереди.
+ * Слой очереди и состояния задач.
  *
- * Все комментарии на русском языке.
+ * Точка сборки для модулей, которым нужен Redis: соединение, очереди
+ * по уровням сложности и записи о состоянии задач.
  */
 
 export * from './connection.js';
-export * from './conversionQueue.js';
-export * from './idempotency.js';
+export * from './queues.js';
+export * from './jobStatus.js';

@@ -1,23 +1,20 @@
 /**
- * Скрипт проверки здоровья сервиса.
+ * Скрипт проверки здоровья API.
  *
- * Используется Docker healthcheck (`HEALTHCHECK` в Dockerfile и сервис `api`
- * в docker-compose.yml) — запускается как обычный процесс и завершается
+ * Используется Docker healthcheck (`HEALTHCHECK` в Dockerfile.api и сервис
+ * `api` в docker-compose.yml) — запускается как обычный процесс и завершается
  * кодом 0 или 1, а не поднимает сервер.
  *
- * Проверяет:
- * - подключение к Valkey
- * - наличие пакета конвертера (WASM-ассеты внутри образа)
+ * Проверяет две зависимости, без которых сервис не работает:
+ * - Valkey/Redis — очередь и состояние задач;
+ * - объектное хранилище и наличие бакета — входные файлы и результаты.
  *
- * Полная проверка WASM здесь намеренно не выполняется: она требует загрузки
- * ~48 МБ ассетов и инициализации движка, что слишком дорого для проверки,
- * запускаемой каждые 30 секунд.
+ * Готовность LibreOffice здесь не проверяется: конвертация идёт в отдельных
+ * контейнерах-воркерах, у них свой healthcheck (`uno-healthcheck.ts`).
  */
 
-import { createRequire } from 'node:module';
 import { checkRedisHealth, closeRedisClient } from '../../queue/connection.js';
-
-const require = createRequire(import.meta.url);
+import { checkStorageHealth } from '../../storage/s3.js';
 
 /**
  * Завершает процесс, закрывая соединение с Valkey.
@@ -39,20 +36,17 @@ async function exitWith(code: number): Promise<never> {
  */
 async function runHealthCheck(): Promise<void> {
   try {
-    // Проверяем Redis.
-    // checkRedisHealth возвращает объект { healthy, error }, а не boolean
     const redisHealth = await checkRedisHealth();
 
     if (!redisHealth.healthy) {
-      console.error('Redis connection failed:', redisHealth.error);
+      console.error('Valkey недоступен:', redisHealth.error);
       await exitWith(1);
     }
 
-    // Проверяем, что пакет конвертера и его WASM-ассеты на месте
-    try {
-      require.resolve('@matbee/libreoffice-converter/package.json');
-    } catch {
-      console.error('Конвертер недоступен: пакет @matbee/libreoffice-converter не найден');
+    const storageHealth = await checkStorageHealth();
+
+    if (!storageHealth.healthy) {
+      console.error('Хранилище недоступно:', storageHealth.error);
       await exitWith(1);
     }
 

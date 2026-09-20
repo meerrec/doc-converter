@@ -7,7 +7,7 @@
 
 import type { INestApplication } from '@nestjs/common';
 import type { NextFunction, Request, Response } from 'express';
-import { MAX_BODY_BYTES, CONVERTER_VERSION } from '../../config/index.js';
+import { CONVERTER_VERSION } from '../../config/index.js';
 
 /**
  * Заголовки безопасности и версии конвертера.
@@ -82,12 +82,11 @@ export function applyCors(app: INestApplication, isDevelopment: boolean): void {
 }
 
 /**
- * Предельный размер тела запроса в байтах.
+ * Предельный размер JSON-тела запроса в байтах.
  *
- * Значение совпадает с глобальным лимитом Express-версии. Там на маршруте
- * конвертации стоял ещё один `express.json({ limit: '50mb' })`, но он никогда
- * не срабатывал: глобальный разборщик обрабатывал тело первым, а body-parser
- * пропускает уже разобранное тело (`req._body`). Реальный потолок приложения —
- * этот лимит; 50 МиБ обеспечивает nginx своим `client_max_body_size`.
+ * Файлы приходят в multipart/form-data, который разбирает multer со своим
+ * лимитом (MAX_FILE_BYTES). Этот лимит относится к JSON-запросам, которых
+ * у сервиса почти нет, поэтому значение небольшое: 1 МиБ с запасом
+ * покрывает любой служебный запрос и не даёт держать в памяти лишнее.
  */
-export const BODY_LIMIT_BYTES = MAX_BODY_BYTES;
+export const BODY_LIMIT_BYTES = 1024 * 1024;

@@ -9,18 +9,14 @@ import type { ConversionQueue } from '../hooks/useConversionQueue';
 
 interface TaskTableProps {
   queue: ConversionQueue;
-  /** Отключает действия, пока идёт отправка. */
-  busy: boolean;
 }
 
-export function TaskTable({ queue, busy }: TaskTableProps) {
-  const { items, stats, downloadItem, retryItem, removeItem } = queue;
+export function TaskTable({ queue }: TaskTableProps) {
+  const { items, stats, retryItem, removeItem } = queue;
 
   // Зависимости — отдельные функции, а не объект queue: сам объект
   // создаётся заново на каждом рендере, и колбэки на его основе теряли бы
   // идентичность, обнуляя memo у строк таблицы
-  const handleDownload = useCallback((id: string) => downloadItem(id), [downloadItem]);
-
   const handleRetry = useCallback((id: string) => retryItem(id), [retryItem]);
 
   const handleRemove = useCallback((id: string) => removeItem(id), [removeItem]);
@@ -40,6 +36,7 @@ export function TaskTable({ queue, busy }: TaskTableProps) {
           {stats.active > 0 ? <span>В работе: {stats.active}</span> : null}
           {stats.pending > 0 ? <span>Ожидают: {stats.pending}</span> : null}
           {stats.completed > 0 ? <span>Готово: {stats.completed}</span> : null}
+          {stats.cancelled > 0 ? <span>Отменено: {stats.cancelled}</span> : null}
           {stats.failed > 0 ? <span className="tasks__failed">Ошибок: {stats.failed}</span> : null}
         </div>
 
@@ -48,9 +45,9 @@ export function TaskTable({ queue, busy }: TaskTableProps) {
             type="button"
             className="button button--secondary"
             onClick={queue.clearFinished}
-            disabled={stats.completed === 0}
+            disabled={stats.completed + stats.failed + stats.cancelled === 0}
           >
-            Очистить готовые
+            Очистить завершённые
           </button>
 
           <button
@@ -81,7 +78,6 @@ export function TaskTable({ queue, busy }: TaskTableProps) {
             <TaskRow
               key={item.id}
               item={item}
-              onDownload={handleDownload}
               onRetry={handleRetry}
               onRemove={handleRemove}
             />
@@ -89,7 +85,7 @@ export function TaskTable({ queue, busy }: TaskTableProps) {
         </tbody>
       </table>
 
-      {busy ? (
+      {stats.pending > 0 ? (
         <p className="tasks__notice" role="status">
           Идёт отправка файлов. Закрытие страницы прервёт загрузку.
         </p>

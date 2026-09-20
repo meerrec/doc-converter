@@ -1,0 +1,36 @@
+# =============================================================================
+# KEDA ScaledObject для очереди «средних» задач.
+#
+# Отличия от лёгкой очереди: одна реплика живёт постоянно (minReplicaCount: 1),
+# а задач на реплику меньше. Средняя конвертация занимает десятки секунд,
+# поэтому поднимать воркер «с нуля» дороже, чем держать прогрев, а очередь
+# из трёх задач уже копит заметное ожидание.
+# =============================================================================
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: uno-worker-medium
+  namespace: doc-converter
+spec:
+  scaleTargetRef:
+    name: uno-worker-medium
+
+  pollingInterval: 15
+  cooldownPeriod: 300
+
+  # Одна реплика всегда готова: холодный старт на фоне многосекундной
+  # конвертации смысла не имеет
+  minReplicaCount: 1
+  # Потолок задан памятью узла: реплика с LibreOffice — 400–600 МБ
+  maxReplicaCount: 6
+
+  triggers:
+    - type: redis
+      metadata:
+        address: valkey:6379
+        listName: "bull:xlsx2pdf.medium:wait"
+        # Две задачи на реплику: третья в очереди означает, что первая
+        # ещё конвертируется, а вторая ждёт — это уже задержка для клиента
+        listLength: "2"
+        activationListLength: "1"
+        enableTLS: "false"

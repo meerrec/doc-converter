@@ -2,7 +2,8 @@
  * Вспомогательные функции форматирования и разбора имён файлов.
  */
 
-import { INPUT_FORMATS } from '@doc-converter/contract';
+import { isInputFormat } from '@doc-converter/contract';
+import type { InputFormat } from '@doc-converter/contract';
 
 /** Единицы измерения размера файла. */
 const SIZE_UNITS = ['Б', 'КБ', 'МБ', 'ГБ'] as const;
@@ -49,15 +50,34 @@ export function formatDuration(seconds: number): string {
 }
 
 /**
+ * Форматирует момент времени для показа пользователю.
+ *
+ * @param isoDate - момент в формате ISO 8601
+ * @returns время в виде «14:05» или null, если дата не разобралась
+ */
+export function formatClockTime(isoDate: string): string | null {
+  const timestamp = Date.parse(isoDate);
+
+  if (Number.isNaN(timestamp)) {
+    return null;
+  }
+
+  return new Intl.DateTimeFormat('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(timestamp);
+}
+
+/**
  * Определяет формат файла по его расширению.
  *
  * Проверка нужна только для раннего сообщения пользователю: настоящую
  * проверку содержимого делает сервер по сигнатурам файлов.
  *
  * @param fileName - имя файла
- * @returns расширение в нижнем регистре или null, если формат не поддерживается
+ * @returns формат в нижнем регистре или null, если формат не поддерживается
  */
-export function detectInputFormat(fileName: string): string | null {
+export function detectInputFormat(fileName: string): InputFormat | null {
   const dotIndex = fileName.lastIndexOf('.');
 
   if (dotIndex === -1 || dotIndex === fileName.length - 1) {
@@ -66,7 +86,7 @@ export function detectInputFormat(fileName: string): string | null {
 
   const extension = fileName.slice(dotIndex + 1).toLowerCase();
 
-  return (INPUT_FORMATS as readonly string[]).includes(extension) ? extension : null;
+  return isInputFormat(extension) ? extension : null;
 }
 
 /**

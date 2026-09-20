@@ -1,5 +1,5 @@
 /**
- * Общий контракт API сервиса конвертации документов.
+ * Общий контракт API сервиса конвертации XLSX → PDF.
  *
  * Единственный источник правды по формам запросов, ответов, форматов
  * и кодов ошибок. Пакет потребляют обе стороны: сервер (`src/`) валидирует
@@ -11,8 +11,7 @@
  */
 
 export * from './formats.js';
-export * from './options.js';
 export * from './errors.js';
-export * from './status.js';
+export * from './jobs.js';
 export * from './conversion.js';
 export * from './health.js';

@@ -1,174 +1,253 @@
 /**
- * Контракт маршрута POST /ConvertService.ashx.
+ * Контракт маршрутов конвертации XLSX → PDF.
  *
- * Схема повторяет правила из `src/api/middleware/validate.js`: только известные
- * поля (иначе `unknown_field`), ровно один источник (`url` или `data`), allowlist
- * форматов, шаблон ключа и длины. Порядок проверок сохранён — от него зависит,
- * какой код ошибки увидит клиент при нескольких нарушениях сразу.
+ * `POST /convert/xlsx-to-pdf` принимает файл в multipart/form-data, поэтому
+ * все необязательные параметры приходят строками. Схемы это учитывают:
+ * булевы и числовые поля разбираются из строк явно, а не через `z.coerce`,
+ * который превратил бы строку `"false"` в `true` (любая непустая строка
+ * для него истинна).
  */
 
 import { z } from 'zod';
-import {
-  codePageSchema,
-  delimiterSchema,
-  regionSchema,
-  documentLayoutSchema,
-  documentRendererSchema,
-  spreadsheetLayoutSchema,
-  thumbnailSchema,
-} from './options.js';
-import { inputFormatSet, outputFormatSet } from './formats.js';
-import { taskResultSchema } from './status.js';
+import { COMPLEXITY_TIERS, JOB_STATUSES } from './jobs.js';
+
+// ===========================================================================
+// Версии PDF
+// ===========================================================================
 
 /**
- * Максимальная длина названия документа.
+ * Версии PDF, доступные клиенту.
  *
- * Обоснование: 255 — предел, после которого имя перестаёт помещаться
- * в большинство файловых систем и в поле title Р7-Офис.
+ * Список ограничен тем, что реально умеет `SelectPdfVersion` в LibreOffice:
+ * версия по умолчанию (1.6) и три варианта PDF/A. Выбор PDF 1.4–1.7 через
+ * FilterData невозможен — проверено перебором значений на LibreOffice 7.4:
+ * коды 4 и выше дают тот же файл, что и 0. Обещать в API то, чего экспортёр
+ * не делает, хуже, чем не предлагать вариант вовсе.
+ *
+ * Имена — то, что видит пользователь; числа для FilterData заданы отдельной
+ * картой ниже.
  */
-export const TITLE_MAX_LENGTH = 255;
+export const PDF_VERSIONS = ['default', 'pdfa-1a', 'pdfa-2b', 'pdfa-3b'] as const;
+
+/** Версия PDF. */
+export type PdfVersion = (typeof PDF_VERSIONS)[number];
 
 /**
- * Шаблон ключа задачи: буквы, цифры, точка, подчёркивание и дефис.
+ * Числовые коды `SelectPdfVersion` для FilterData экспортёра PDF.
  *
- * Обоснование: ключ попадает в имя файла результата и в ключи Valkey,
- * поэтому разделители путей и спецсимволы запрещены.
- *
- * Внимание: схема допускает 128 символов, тогда как `reserveTaskId`
- * в `queue/idempotency.js` отвергает всё длиннее 64 — ключ длиной 65–128
- * проходит валидацию и падает с 500. Расхождение известно и должно быть
- * устранено на стороне сервера, а не сужением контракта.
+ * Соответствие проверено на LibreOffice 7.4: 0 — версия по умолчанию,
+ * 1 — PDF/A-1a, 2 — PDF/A-2b, 3 — PDF/A-3b. Прочие значения экспортёр
+ * игнорирует.
  */
-export const KEY_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+export const PDF_VERSION_CODES: Readonly<Record<PdfVersion, number>> = {
+  default: 0,
+  'pdfa-1a': 1,
+  'pdfa-2b': 2,
+  'pdfa-3b': 3,
+};
 
-/** Схема входного формата: только значения из allowlist, без учёта регистра. */
-export const inputFormatSchema = z
-  .string()
-  .refine((value) => inputFormatSet.has(value.toLowerCase()), {
-    error: 'input_format_not_allowed',
-  });
-
-/** Схема формата результата: только значения из allowlist, без учёта регистра. */
-export const outputFormatSchema = z
-  .string()
-  .refine((value) => outputFormatSet.has(value.toLowerCase()), {
-    error: 'output_format_not_allowed',
-  });
-
-/** Схема ключа задачи. */
-export const keySchema = z.string().regex(KEY_PATTERN, { error: 'key_invalid_chars' });
-
-/** Схема названия документа. */
-export const titleSchema = z
-  .string()
-  .max(TITLE_MAX_LENGTH, { error: 'title_too_long' });
+// ===========================================================================
+// Разбор полей multipart
+// ===========================================================================
 
 /**
- * Тело запроса POST /ConvertService.ashx.
+ * Разбирает булево значение, пришедшее строкой.
  *
- * ## Расхождения с текущим поведением сервера
- *
- * Схема строже серверной в трёх местах. Это осознанно: перечисленные случаи —
- * следствие проверок по «истинности» значения в `validate.js`, а не задуманное
- * правило. При переходе сервера на контракт (этап переноса на NestJS) поведение
- * изменится, и это нужно подтвердить отдельно, потому что контракт Р7 внешний.
- *
- * 1. `async` объявлен как `default: false`, но значение по умолчанию нигде
- *    не применяется, а ветвление идёт по истинности. Опущенное поле равносильно
- *    `false` **кроме** проверки `async === false && !SYNC_ENABLED`: при
- *    `SYNC_ENABLED=false` запрос без поля уходит в синхронный путь, хотя
- *    синхронный режим выключен. Здесь поля нет в значении по умолчанию —
- *    решение остаётся за сервером.
- * 2. `key: ''` проходит серверную проверку: условие `body.key && …` ложно для
- *    пустой строки, поэтому шаблон не применяется, а `validated.key || randomUUID()`
- *    подставляет сгенерированный идентификатор. Схема пустую строку отвергает.
- * 3. `codePage: 0` и `delimiter: 0` проходят серверную проверку по той же
- *    причине и падают позже — уже в `optionsMapper`. Схема отвергает их сразу.
+ * Понимает формы, которые встречаются в реальных запросах: `true/false`,
+ * `1/0`, `yes/no`, `on/off`. Пустая строка считается `false`: браузерные
+ * формы присылают её для снятого флажка.
  */
-export const conversionRequestSchema = z
-  .strictObject({
-    /** Формат входного файла. */
-    filetype: inputFormatSchema,
-    /** Формат результата. */
-    outputtype: outputFormatSchema,
-    /** Ссылка на файл; взаимоисключающе с `data`. */
-    url: z.string().optional(),
-    /** Содержимое файла в base64; взаимоисключающе с `url`. */
-    data: z.string().optional(),
-    /** true — конвертация через очередь, false или пусто — синхронно. */
-    async: z.boolean().optional(),
-    /** Идентификатор задачи; он же ключ идемпотентности. */
-    key: keySchema.optional(),
-    /** Имя документа. */
-    title: titleSchema.optional(),
-
-    codePage: codePageSchema.optional(),
-    delimiter: delimiterSchema.optional(),
-    region: regionSchema.optional(),
-    password: z.string().nullable().optional(),
-    documentLayout: documentLayoutSchema.optional(),
-    spreadsheetLayout: spreadsheetLayoutSchema.optional(),
-    documentRenderer: documentRendererSchema.optional(),
-    thumbnail: thumbnailSchema.optional(),
-  })
-  .superRefine((value, ctx) => {
-    const hasUrl = value.url !== undefined;
-    const hasData = value.data !== undefined;
-
-    if (hasUrl === hasData) {
-      ctx.addIssue({
-        code: 'custom',
-        message: 'exactly_one_source_required',
-        path: [],
-      });
+export const booleanField = z
+  .union([z.boolean(), z.string()])
+  .transform((value, ctx) => {
+    if (typeof value === 'boolean') {
+      return value;
     }
+
+    const normalized = value.trim().toLowerCase();
+
+    if (['true', '1', 'yes', 'on'].includes(normalized)) {
+      return true;
+    }
+
+    if (['false', '0', 'no', 'off', ''].includes(normalized)) {
+      return false;
+    }
+
+    ctx.addIssue({
+      code: 'custom',
+      message: `Ожидалось булево значение, получено «${value}»`,
+    });
+
+    return z.NEVER;
   });
 
-/** Тело запроса POST /ConvertService.ashx. */
-export type ConversionRequest = z.infer<typeof conversionRequestSchema>;
+/**
+ * Разбирает целое число из строки.
+ *
+ * @param min - минимальное допустимое значение
+ * @param max - максимальное допустимое значение
+ */
+function integerField(min: number, max: number) {
+  return z
+    .union([z.number(), z.string()])
+    .transform((value, ctx) => {
+      const parsed = typeof value === 'number' ? value : Number(value.trim());
+
+      if (!Number.isInteger(parsed)) {
+        ctx.addIssue({ code: 'custom', message: `Ожидалось целое число, получено «${value}»` });
+        return z.NEVER;
+      }
+
+      if (parsed < min || parsed > max) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `Значение должно быть в диапазоне ${min}–${max}, получено ${parsed}`,
+        });
+        return z.NEVER;
+      }
+
+      return parsed;
+    });
+}
+
+// ===========================================================================
+// Параметры конвертации
+// ===========================================================================
 
 /**
- * Все поля, допустимые в запросе.
+ * Параметры конвертации — то, что клиент может попросить у экспортёра PDF.
  *
- * Нужен серверу для проверки «неизвестного поля» до разбора схемой: zod
- * сообщает о лишних ключах последними, а сервис исторически отвечает
- * `unknown_field` первым — раньше, чем о недостающих или неверных типах.
- * Порядок проверок — часть внешнего контракта, поэтому список вынесен явно.
+ * Все они необязательны: без них сервис отдаёт PDF с версией по умолчанию,
+ * закладками и таблицей, умещённой на одну страницу.
  */
-export const CONVERSION_REQUEST_FIELDS = [
-  'filetype',
-  'outputtype',
-  'url',
-  'data',
-  'async',
-  'key',
-  'title',
-  'codePage',
-  'delimiter',
-  'region',
-  'password',
-  'documentLayout',
-  'spreadsheetLayout',
-  'documentRenderer',
-  'thumbnail',
-] as const;
+export const conversionOptionsSchema = z.object({
+  /**
+   * Текст водяного знака. Пустая строка или отсутствие поля — без знака.
+   *
+   * Ограничение в 200 символов — от экспортёра: длинный текст он разбивает
+   * по странице целиком, и знак перестаёт читаться.
+   */
+  watermark: z.string().max(200, { message: 'invalid_watermark' }).optional(),
 
-/** Обязательные поля запроса. */
-export const CONVERSION_REQUIRED_FIELDS = ['filetype', 'outputtype'] as const;
+  /**
+   * Как наносить водяной знак: один по центру страницы или мозаикой.
+   *
+   * `single` соответствует FilterData `Watermark`, `tiled` — `TiledWatermark`.
+   */
+  watermarkMode: z.enum(['single', 'tiled']).default('single'),
 
-/**
- * Ответ в асинхронном режиме.
- *
- * `status` не всегда `queued`: если задача с таким ключом уже выполнялась,
- * сервер возвращает её текущий статус. Если результат готов — он приходит
- * сразу, и опрашивать статус не нужно.
- */
-export const conversionAcceptedSchema = z.looseObject({
-  status: z.string(),
-  taskId: z.string(),
-  message: z.string().optional(),
-  result: taskResultSchema.optional(),
+  /**
+   * Умещать содержимое листа на одну страницу.
+   *
+   * Реализуется через `ScaleToPagesX = ScaleToPagesY = 1` в страничном стиле:
+   * LibreOffice сам подбирает масштаб. Для очень больших таблиц это делает
+   * текст нечитаемым — параметр отключаемый.
+   */
+  fitToOnePage: booleanField.default(true),
+
+  /** Версия PDF (в том числе PDF/A). */
+  pdfVersion: z.enum(PDF_VERSIONS).default('default'),
+
+  /**
+   * Качество JPEG-сжатия изображений, 1–100.
+   *
+   * Действует только при включённом сжатии изображений: без него экспортёр
+   * сохраняет изображения без потерь.
+   */
+  quality: integerField(1, 100).default(90),
+
+  /** Пережимать изображения с понижением разрешения. */
+  reduceImageResolution: booleanField.default(true),
+
+  /**
+   * Предельное разрешение изображений в DPI, 50–1200.
+   *
+   * Значение выше исходного не увеличивает картинку: экспортёр только
+   * понижает разрешение.
+   */
+  maxImageResolution: integerField(50, 1200).default(300),
+
+  /** Экспортировать закладки по листам книги. */
+  exportBookmarks: booleanField.default(true),
+
+  /** Добавлять теги структуры (требуется для доступности PDF/A). */
+  taggedPdf: booleanField.default(false),
+
+  /** Пароль на открытие PDF. */
+  userPassword: z.string().max(128).optional(),
+
+  /** Пароль владельца — им снимаются ограничения на печать и изменение. */
+  ownerPassword: z.string().max(128).optional(),
+
+  /** Включить ограничения прав (печать, изменение, копирование). */
+  restrictPermissions: booleanField.default(false),
+
+  /** Разрешить печать при включённых ограничениях. */
+  allowPrinting: booleanField.default(true),
+
+  /** Разрешить изменение документа при включённых ограничениях. */
+  allowChanges: booleanField.default(false),
 });
 
-/** Ответ в асинхронном режиме. */
-export type ConversionAcceptedResponse = z.infer<typeof conversionAcceptedSchema>;
+/** Параметры конвертации. */
+export type ConversionOptions = z.infer<typeof conversionOptionsSchema>;
+
+// ===========================================================================
+// Ответы
+// ===========================================================================
+
+/** Ответ на постановку задачи. */
+export const convertAcceptedSchema = z.object({
+  jobId: z.string(),
+  status: z.enum(JOB_STATUSES),
+  tier: z.enum(COMPLEXITY_TIERS),
+  /** Имя очереди, в которую попала задача — для диагностики. */
+  queue: z.string(),
+  /** Число листов книги, если его удалось определить. */
+  sheets: z.number().int().nonnegative().nullable(),
+  /** Размер принятого файла в байтах. */
+  sizeBytes: z.number().int().nonnegative(),
+  /** Время постановки в очередь (ISO 8601). */
+  createdAt: z.string(),
+});
+
+/** Ответ на постановку задачи. */
+export type ConvertAccepted = z.infer<typeof convertAcceptedSchema>;
+
+/** Ссылка на готовый результат. */
+export const jobResultSchema = z.object({
+  /** Presigned URL — ссылка живёт ограниченное время. */
+  url: z.string(),
+  /** Момент истечения ссылки (ISO 8601). */
+  expiresAt: z.string(),
+  /** Размер PDF в байтах. */
+  sizeBytes: z.number().int().nonnegative(),
+});
+
+/** Ссылка на готовый результат. */
+export type JobResult = z.infer<typeof jobResultSchema>;
+
+/** Ответ о состоянии задачи. */
+export const jobStatusResponseSchema = z.object({
+  jobId: z.string(),
+  status: z.enum(JOB_STATUSES),
+  tier: z.enum(COMPLEXITY_TIERS),
+  createdAt: z.string(),
+  /** Момент, когда воркер взял задачу. */
+  startedAt: z.string().optional(),
+  /** Момент завершения — успешного или нет. */
+  finishedAt: z.string().optional(),
+  /** Код и текст ошибки при `failed`. */
+  error: z
+    .object({
+      code: z.string(),
+      message: z.string(),
+    })
+    .optional(),
+  /** Ссылка на результат при `completed`. */
+  result: jobResultSchema.optional(),
+});
+
+/** Ответ о состоянии задачи. */
+export type JobStatusResponse = z.infer<typeof jobStatusResponseSchema>;

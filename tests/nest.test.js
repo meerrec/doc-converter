@@ -1,11 +1,12 @@
 /**
- * Проверки NestJS-приложения.
+ * Проверки каркаса NestJS-приложения.
  *
  * Тесты работают с исходниками на TypeScript: раннер — Vitest, сборка перед
  * прогоном не нужна.
  *
- * Покрывается каркас: проверка доступности, формат ошибок Р7 и ограничитель
- * частоты. Маршруты конвертации проверяются отдельно, после их переноса.
+ * Покрывается то, что не зависит от инфраструктуры: проверка доступности,
+ * формат ошибок и ограничитель частоты. Маршруты конвертации проверяются
+ * в `api.test.js`.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -18,8 +19,14 @@ process.env.HOST = '127.0.0.1';
 // Небольшой всплеск, чтобы проверить ограничитель несколькими запросами
 process.env.RATE_PER_SEC = '2';
 process.env.RATE_BURST = '5';
+// Хранилище заведомо недоступно: проверка доступности не должна ждать
+// сетевого таймаута. Порт 1 закрыт всегда, отказ приходит мгновенно
+process.env.S3_ENDPOINT = '127.0.0.1';
+process.env.S3_PORT = '1';
 
-const { createServer } = await import('../src/nest/bootstrap.js');
+// Хелпер выставляет API_PORT/PORT в 0 («любой свободный»), поэтому наборы
+// тестов, идущие параллельно, не конфликтуют за порт
+const { createServer } = await import('./helpers/server.js');
 
 let app;
 let server;
@@ -51,13 +58,23 @@ describe('NestJS: проверка доступности', () => {
     expect(response.body).toEqual(
       expect.objectContaining({
         status: expect.any(String),
-        wasm: expect.any(Boolean),
+        storage: expect.any(Boolean),
         version: expect.any(String),
       })
     );
   });
 
-  it('проставляет версию конвертера в заголовке', async () => {
+  it('без хранилища сервис сообщает о деградации, но остаётся доступным', async () => {
+    const response = await request(app).get('/health');
+
+    // API принимает задачи только при живом хранилище, но сам процесс
+    // жив: 200 с degraded позволяет отличить «сломалось хранилище»
+    // от «сломался сервис»
+    expect(response.body.storage).toBe(false);
+    expect(response.body.status).toBe('degraded');
+  });
+
+  it('проставляет версию сервиса в заголовке', async () => {
     const response = await request(app).get('/health');
 
     expect(response.headers['x-converter-version']).toBeDefined();
@@ -73,14 +90,13 @@ describe('NestJS: проверка доступности', () => {
 
 describe('NestJS: формат ошибок', () => {
   it('несуществующий маршрут отдаёт { error, message }', async () => {
-    // Путь только из ASCII: supertest не экранирует кириллицу в URL
     const response = await request(app).get('/no-such-route');
 
     expect(response.status).toBe(404);
     expect(response.body.error).toBe('not_found');
     expect(typeof response.body.message).toBe('string');
     // Формат Nest по умолчанию ({ statusCode, error, message }) недопустим:
-    // контракт Р7 описывает поле error как код в snake_case
+    // контракт описывает поле error как код в snake_case
     expect(response.body.statusCode).toBeUndefined();
   });
 

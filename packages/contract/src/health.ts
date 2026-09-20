@@ -7,13 +7,13 @@ import { z } from 'zod';
 /**
  * Ответ проверки доступности.
  *
- * `wasm` сейчас всегда true: сервер объявляет готовность константой
- * (`const wasmReady = true; // TODO` в `api/server.js`), реальная проверка
- * WASM не выполняется — она требует загрузки десятков мегабайт ассетов.
+ * `storage` — доступность объектного хранилища (MinIO/S3). Проверка дешёвая
+ * (запрос к сервису), в отличие от готовности конвертера: её проверяет
+ * отдельный процесс healthcheck контейнера воркера, подключаясь к UNO.
  */
 export const healthResponseSchema = z.looseObject({
   status: z.string(),
-  wasm: z.boolean(),
+  storage: z.boolean(),
   version: z.string(),
 });
 

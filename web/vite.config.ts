@@ -11,7 +11,7 @@ import react from '@vitejs/plugin-react';
 const API_TARGET = process.env.VITE_API_PROXY_TARGET || 'http://localhost:3000';
 
 /** Пути, которые обслуживает API и которые нужно проксировать. */
-const API_ROUTES = ['/ConvertService.ashx', '/status', '/health', '/results', '/storage'];
+const API_ROUTES = ['/convert', '/health'];
 
 export default defineConfig({
   plugins: [react()],

@@ -16,13 +16,13 @@ export class AppError extends Error {
    * @param code - код ошибки из контракта
    * @param message - сообщение для клиента
    * @param statusCode - HTTP-статус ответа
-   * @param taskId - идентификатор задачи, если ошибка к ней привязана
+   * @param jobId - идентификатор задачи, если ошибка к ней привязана
    */
   constructor(
     readonly code: ErrorCode,
     message: string,
     readonly statusCode: number = 400,
-    readonly taskId?: string
+    readonly jobId?: string
   ) {
     super(message);
     this.name = 'AppError';
