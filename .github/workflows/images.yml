@@ -1,5 +1,14 @@
 # =============================================================================
-# Сборка образов: проверяется, что Dockerfile'ы собираются.
+# Сборка образов: проверяется, что Dockerfile'ы собираются и что в образ
+# попадает то, что нужно.
+#
+# Состав образа проверяется отдельно от сборки, и это не педантизм: почти
+# любая ошибка в стадиях даёт образ, который **собирается**, но падает уже
+# в работе. Так уже случилось с автоскейлером: своего Dockerfile у сервиса нет,
+# он запускается из образа api, а фильтр `--filter @doc-converter/api...` его
+# не покрывал — сборка была зелёной, контейнер не стартовал, и в compose это
+# оставалось незамеченным: healthcheck у сервиса отключён, а
+# `restart: unless-stopped` перезапускал его молча.
 #
 # Образы никуда не публикуются (`push: false`): workflow отвечает не за доставку,
 # а за то, чтобы правка исходников, манифестов или самого Dockerfile не сломала
@@ -90,10 +99,56 @@ jobs:
         include:
           - image: api
             file: apps/api/Dockerfile
+            # Проверки выполняются внутри контейнера (см. шаг ниже), поэтому
+            # пути — от корня образа, а не от рабочей копии.
+            check: |
+              set -eu
+
+              # Точки входа: без них контейнер собирается и умирает на старте
+              test -f /app/apps/api/dist/main.js
+              test -f /app/apps/api/dist/health/health-check.js
+
+              # Автоскейлер запускается из этого же образа (docker-compose.yml,
+              # сервис autoscaler), но зависимостью api не является: он входит
+              # в образ отдельным фильтром, и без dist здесь контейнер
+              # автоскейлера не стартует — при зелёной сборке.
+              test -f /app/apps/autoscaler/dist/index.js
+
+              # version.ts читает корневой package.json и при его отсутствии
+              # молча отдаёт 0.0.0 — отказ не виден ни в логах, ни в /health
+              test -f /app/package.json
+
+              # Runtime без инструментов сборки и исходников: они возвращаются
+              # в образ, только если установка перестала быть production
+              # (стадия prod-deps), а сборка — единственной
+              ! ls /app/node_modules/.pnpm | grep -qE '^(typescript|vitest|vite)@'
+              ! ls /app/node_modules/.pnpm | grep -qE '^@swc\+core@'
+              ! test -d /app/apps/api/src
           - image: web
             file: apps/web/Dockerfile
+            check: |
+              set -eu
+
+              # Финальная стадия — nginx со статикой: собирается Vite,
+              # и index.html здесь единственное доказательство, что сборка
+              # что-то произвела
+              test -f /usr/share/nginx/html/index.html
           - image: uno-worker
             file: apps/worker/Dockerfile
+            check: |
+              set -eu
+
+              test -f /app/apps/worker/dist/index.js
+              test -f /app/apps/worker/dist/healthcheck.js
+
+              # Скрипт UNO и точка входа лежат вне проектов workspace,
+              # копируются в образ отдельной инструкцией, и путь к ним
+              # захардкожен в packages/config и в самом entrypoint
+              test -f /app/docker/uno/uno_convert.py
+              test -x /app/docker/uno/worker-entrypoint.sh
+
+              # В runtime нет ни компилятора, ни тестового фреймворка
+              ! ls /app/node_modules/.pnpm | grep -qE '^(typescript|vitest)@'
 
     steps:
       - name: Клонировать репозиторий
@@ -111,11 +166,22 @@ jobs:
           context: .
           file: ${{ matrix.file }}
           push: false
+          # Образ нужен не только как результат сборки, но и как объект
+          # проверки: без load он останется в кеше Buildx и в демон
+          # не попадёт, а `docker run` его не найдёт.
+          load: true
+          tags: doc-converter-${{ matrix.image }}:ci
           # Область кеша своя у каждого образа: слои api и web не пересекаются
           # с воркером, а общий scope вытеснял бы их друг другом.
           #
-          # mode=max кеширует и промежуточные стадии (builder с установкой
-          # зависимостей), а не только финальный образ: именно они дороже
-          # всего пересобираются.
+          # mode=max кеширует и промежуточные стадии (manifests, prod-deps
+          # и builder с установками зависимостей), а не только финальный
+          # образ: именно они дороже всего пересобираются.
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      # Проверка состава — из-за неё образ и загружается в демон. Отдельным
+      # шагом, а не внутри сборки: по упавшему шагу должно быть сразу видно,
+      # что сломалось — сам Dockerfile или то, что в него попало.
+      - name: Проверить состав образа
+        run: docker run --rm --entrypoint sh "doc-converter-${{ matrix.image }}:ci" -c "${{ matrix.check }}"

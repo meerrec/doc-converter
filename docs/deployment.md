@@ -28,6 +28,12 @@ docker compose up --build
 с `minio-init`, `valkey`. Первый запуск собирает два образа: `api`
 (лёгкий) и `uno-worker` (с LibreOffice, порядка 700 МБ).
 
+В образы приложений попадают только production-зависимости и собранный
+`dist`: установка для сборки и установка для runtime — разные стадии
+(`prod-deps` ставит `--prod` в пустой каталог), поэтому `typescript`,
+`vitest` и исходников в runtime нет. У `api` это 438 МБ, из них
+`node_modules` — 76 МБ.
+
 Проверка: `curl -s localhost:3000/health | jq` → `{ "status": "ok", ... }`.
 
 ## Ресурсы и память
