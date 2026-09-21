@@ -2,11 +2,24 @@
  * Вспомогательные функции форматирования и разбора имён файлов.
  */
 
-import { isInputFormat } from '@doc-converter/contract';
+import { isInputFormat } from '@doc-converter/contract/formats';
 import type { InputFormat } from '@doc-converter/contract';
 
 /** Единицы измерения размера файла. */
 const SIZE_UNITS = ['Б', 'КБ', 'МБ', 'ГБ'] as const;
+
+/**
+ * Форматтер времени суток.
+ *
+ * Вынесен на уровень модуля намеренно: конструктор `Intl.DateTimeFormat`
+ * обращается к данным локалей и стоит десятки микросекунд, а вызывается
+ * форматирование в теле рендера каждой строки таблицы. Сам форматтер
+ * неизменяем, поэтому один экземпляр на процесс безопасен.
+ */
+const TIME_FORMATTER = new Intl.DateTimeFormat('ru-RU', {
+  hour: '2-digit',
+  minute: '2-digit',
+});
 
 /**
  * Форматирует размер файла для показа пользователю.
@@ -62,10 +75,7 @@ export function formatClockTime(isoDate: string): string | null {
     return null;
   }
 
-  return new Intl.DateTimeFormat('ru-RU', {
-    hour: '2-digit',
-    minute: '2-digit',
-  }).format(timestamp);
+  return TIME_FORMATTER.format(timestamp);
 }
 
 /**

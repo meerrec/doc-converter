@@ -1,14 +1,39 @@
 /**
- * Генераторы XLSX-файлов для тестов.
+ * Генераторы документов OOXML для тестов.
  *
  * Собираются кодом, а не хранятся в репозитории: нужны книги с разным числом
- * листов, а бинарные фикстуры в git невозможно просмотреть и трудно менять.
- * Архив собирается в памяти через yazl — на диск ничего не пишется.
+ * листов и документы с разным числом страниц, а бинарные фикстуры в git
+ * невозможно просмотреть и трудно менять. Архив собирается в памяти через
+ * yazl — на диск ничего не пишется.
  */
 
 import yazl from 'yazl';
 
-/** Типы содержимого пакета. */
+/**
+ * Собирает zip-архив из набора записей.
+ *
+ * @param entries - пары «имя записи, содержимое»
+ * @returns буфер архива
+ */
+async function buildZip(entries) {
+  const zip = new yazl.ZipFile();
+
+  for (const [name, content] of entries) {
+    zip.addBuffer(Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8'), name);
+  }
+
+  zip.end();
+
+  const chunks = [];
+
+  for await (const chunk of zip.outputStream) {
+    chunks.push(chunk);
+  }
+
+  return Buffer.concat(chunks);
+}
+
+/** Типы содержимого пакета книги. */
 const CONTENT_TYPES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -17,10 +42,25 @@ const CONTENT_TYPES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   ${''}
 </Types>`;
 
-/** Корневые связи пакета. */
+/** Корневые связи пакета книги. */
 const ROOT_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+
+/** Типы содержимого пакета текстового документа. */
+const CONTENT_TYPES_DOCX = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  ${''}
+</Types>`;
+
+/** Корневые связи пакета текстового документа. */
+const ROOT_RELS_DOCX = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>`;
 
 /**
@@ -62,13 +102,14 @@ function buildWorkbook(sheetCount) {
  * @returns буфер архива
  */
 export async function buildXlsx({ sheets = 1, rows = 5 } = {}) {
-  const zip = new yazl.ZipFile();
   const { workbook, workbookRels } = buildWorkbook(sheets);
 
-  zip.addBuffer(Buffer.from(CONTENT_TYPES, 'utf8'), '[Content_Types].xml');
-  zip.addBuffer(Buffer.from(ROOT_RELS, 'utf8'), '_rels/.rels');
-  zip.addBuffer(Buffer.from(workbook, 'utf8'), 'xl/workbook.xml');
-  zip.addBuffer(Buffer.from(workbookRels, 'utf8'), 'xl/_rels/workbook.xml.rels');
+  const entries = [
+    ['[Content_Types].xml', CONTENT_TYPES],
+    ['_rels/.rels', ROOT_RELS],
+    ['xl/workbook.xml', workbook],
+    ['xl/_rels/workbook.xml.rels', workbookRels],
+  ];
 
   for (let i = 1; i <= sheets; i += 1) {
     const cells = [];
@@ -84,18 +125,68 @@ export async function buildXlsx({ sheets = 1, rows = 5 } = {}) {
   <sheetData>${cells.join('')}</sheetData>
 </worksheet>`;
 
-    zip.addBuffer(Buffer.from(sheet, 'utf8'), `xl/worksheets/sheet${i}.xml`);
+    entries.push([`xl/worksheets/sheet${i}.xml`, sheet]);
   }
 
-  zip.end();
+  return buildZip(entries);
+}
 
-  const chunks = [];
+/**
+ * Собирает минимальный, но валидный по структуре DOCX.
+ *
+ * @param options - параметры документа
+ * @param options.pages - число страниц в свойствах документа
+ * @param options.paragraphs - число абзацев в теле
+ * @param options.withAppXml - добавлять ли `docProps/app.xml` с числом страниц
+ * @param options.withMacros - добавлять ли проект VBA (макросы)
+ * @returns буфер архива
+ */
+export async function buildDocx({
+  pages = 1,
+  paragraphs = 5,
+  withAppXml = true,
+  withMacros = false,
+} = {}) {
+  const body = [];
 
-  for await (const chunk of zip.outputStream) {
-    chunks.push(chunk);
+  for (let i = 1; i <= paragraphs; i += 1) {
+    body.push(`<w:p><w:r><w:t>Абзац ${i}</w:t></w:r></w:p>`);
   }
 
-  return Buffer.concat(chunks);
+  const document = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>${body.join('')}</w:body>
+</w:document>`;
+
+  const appXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Pages>${pages}</Pages>
+</Properties>`;
+
+  const entries = [
+    ['[Content_Types].xml', CONTENT_TYPES_DOCX],
+    ['_rels/.rels', ROOT_RELS_DOCX],
+    ['word/document.xml', document],
+  ];
+
+  if (withAppXml) {
+    entries.push(['docProps/app.xml', appXml]);
+  }
+
+  if (withMacros) {
+    entries.push(['word/vbaProject.bin', Buffer.alloc(64, 0)]);
+  }
+
+  return buildZip(entries);
+}
+
+/**
+ * Собирает zip-архив, который не является документом OOXML.
+ *
+ * @returns буфер архива
+ */
+export async function buildPlainZip() {
+  return buildZip([['notes.txt', 'просто файл']]);
 }
 
 /**
@@ -106,18 +197,7 @@ export async function buildXlsx({ sheets = 1, rows = 5 } = {}) {
  * @returns буфер архива
  */
 export async function buildZipBomb(sizeBytes = 200 * 1024 * 1024, name = 'xl/worksheets/sheet1.xml') {
-  const zip = new yazl.ZipFile();
-
-  zip.addBuffer(Buffer.alloc(sizeBytes, 0x41), name);
-  zip.end();
-
-  const chunks = [];
-
-  for await (const chunk of zip.outputStream) {
-    chunks.push(chunk);
-  }
-
-  return Buffer.concat(chunks);
+  return buildZip([[name, Buffer.alloc(sizeBytes, 0x41)]]);
 }
 
 /**
@@ -135,20 +215,9 @@ export async function buildZipBomb(sizeBytes = 200 * 1024 * 1024, name = 'xl/wor
  * @returns буфер архива
  */
 export async function buildLyingZipBomb(sizeBytes = 4 * 1024 * 1024, name = 'xl/worksheets/sheet1.xml') {
-  const zip = new yazl.ZipFile();
-
   // Нули сжимаются почти бесплатно: реальный коэффициент получается огромным,
   // а заявленный мы подделаем
-  zip.addBuffer(Buffer.alloc(sizeBytes, 0), name);
-  zip.end();
-
-  const chunks = [];
-
-  for await (const chunk of zip.outputStream) {
-    chunks.push(chunk);
-  }
-
-  const buffer = Buffer.concat(chunks);
+  const buffer = await buildZip([[name, Buffer.alloc(sizeBytes, 0)]]);
 
   patchCentralDirectorySizes(buffer);
 
@@ -208,4 +277,4 @@ function patchCentralDirectorySizes(buffer) {
   }
 }
 
-export default { buildXlsx, buildZipBomb, buildLyingZipBomb };
+export default { buildXlsx, buildDocx, buildPlainZip, buildZipBomb, buildLyingZipBomb };

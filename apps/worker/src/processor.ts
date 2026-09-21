@@ -12,7 +12,7 @@
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { ConversionOptions } from '@doc-converter/contract';
+import type { ConversionOptions, InputFormat } from '@doc-converter/contract';
 import { convertViaUno, UnoConversionError } from './uno-converter.js';
 import { downloadToFile, putFile, resultKey } from '@doc-converter/storage';
 import { markCompleted, markFailed, markProcessing } from '@doc-converter/queue';
@@ -25,8 +25,8 @@ export interface UnoJobData {
   jobId: string;
   /** Ключ входного файла в хранилище. */
   inputKey: string;
-  /** Формат входного файла. */
-  inputFormat: string;
+  /** Формат входного файла: от него зависит фильтр экспорта PDF. */
+  inputFormat: InputFormat;
   /** Параметры конвертации. */
   options: ConversionOptions;
 }
@@ -84,7 +84,7 @@ export async function processJob(data: UnoJobData): Promise<UnoJobResult> {
     await markProcessing(jobId);
     await downloadToFile(inputKey, inputPath);
 
-    const conversion = await convertViaUno(inputPath, outputPath, options);
+    const conversion = await convertViaUno(inputPath, outputPath, options, inputFormat);
 
     // Проверка на стороне воркера, а не только в Python: пустой файл мог
     // появиться и при формально успешном завершении скрипта

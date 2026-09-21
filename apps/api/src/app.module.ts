@@ -11,7 +11,7 @@ import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { HealthController } from './health/health.controller.js';
-import { XlsxModule } from './xlsx/xlsx.module.js';
+import { ConversionModule } from './conversion/conversion.module.js';
 import { RateLimitGuard } from './common/rate-limit.guard.js';
 import { parseEnv } from './env.js';
 
@@ -27,7 +27,7 @@ import { parseEnv } from './env.js';
         parseEnv(raw as NodeJS.ProcessEnv),
     }),
 
-    XlsxModule,
+    ConversionModule,
   ],
   controllers: [HealthController],
   providers: [

@@ -10,19 +10,31 @@ import { StatusBadge } from './StatusBadge';
 import { ProgressBar } from './ProgressBar';
 import { formatBytes, formatClockTime, formatDuration, pluralize } from '../lib/format';
 import { TIER_LABELS } from '../config';
-import type { QueueItem } from '../hooks/useConversionQueue';
+import { isWorkingStatus, type QueueItem } from '../hooks/useConversionQueue';
 
 interface TaskRowProps {
   item: QueueItem;
+  /**
+   * Истёк ли срок действия ссылки на результат.
+   *
+   * Считается в таблице, а не здесь: время — изменчивое значение, и чтение
+   * его в рендере строки лишило бы memo смысла (см. TaskTable).
+   */
+  isExpired: boolean;
+  /** Сколько секунд идёт конвертация; null — задача не в работе. */
+  elapsedSeconds: number | null;
   onRetry: (id: string) => void;
   onRemove: (id: string) => void;
 }
 
-export const TaskRow = memo(function TaskRow({ item, onRetry, onRemove }: TaskRowProps) {
-  const isWorking =
-    item.status === 'submitting' ||
-    item.status === 'queued' ||
-    item.status === 'processing';
+export const TaskRow = memo(function TaskRow({
+  item,
+  isExpired,
+  elapsedSeconds,
+  onRetry,
+  onRemove,
+}: TaskRowProps) {
+  const isWorking = isWorkingStatus(item.status);
 
   const parts: string[] = [
     item.result
@@ -41,18 +53,13 @@ export const TaskRow = memo(function TaskRow({ item, onRetry, onRemove }: TaskRo
   // Ссылка на результат живёт ограниченное время: сервер подписывает её
   // на час, поэтому срок показывается рядом с кнопкой, а после истечения
   // скачивание предлагается повторить
-  const expiresAt = item.result ? Date.parse(item.result.expiresAt) : Number.NaN;
-  const isExpired = Number.isFinite(expiresAt) && expiresAt <= Date.now();
   const expiresLabel = item.result ? formatClockTime(item.result.expiresAt) : null;
 
   // Скачивать есть что только у завершённой задачи с неистёкшей ссылкой
   const canDownload =
     item.status === 'completed' && item.result !== undefined && !isExpired;
 
-  const elapsed =
-    isWorking && item.submittedAt !== undefined
-      ? formatDuration((Date.now() - item.submittedAt) / 1000)
-      : null;
+  const elapsed = elapsedSeconds === null ? null : formatDuration(elapsedSeconds);
 
   return (
     <tr className="task">

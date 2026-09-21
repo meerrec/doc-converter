@@ -1,14 +1,17 @@
 /**
- * Обращение к эндпоинтам конвертации XLSX → PDF.
+ * Обращение к эндпоинтам конвертации в PDF.
  *
- * Постановка задачи — `POST /convert/xlsx-to-pdf` с файлом в multipart/form-data;
+ * Постановка задачи — `POST /convert/to-pdf` с файлом в multipart/form-data;
  * файл уходит телом запроса, а не в base64, поэтому кодировать его в памяти
  * вкладки больше не нужно. Идентификатор задачи выдаёт сервер: клиент его
  * не придумывает и не может переиспользовать (как было с полем `key`,
  * на котором держалась идемпотентность старого API).
  */
 
-import { convertAcceptedSchema, jobStatusResponseSchema } from '@doc-converter/contract';
+import {
+  isConvertAccepted,
+  isJobStatusResponse,
+} from '@doc-converter/contract/conversion';
 import type {
   ConversionOptions,
   ConvertAccepted,
@@ -20,7 +23,7 @@ import { createLimiter } from '../lib/limiter';
 
 /** Параметры постановки задачи. */
 export interface SubmitParams {
-  /** Исходная книга Excel. */
+  /** Исходный файл: книга Excel или документ Word. */
   file: File;
   /** Параметры конвертации. */
   options: ConversionOptions;
@@ -88,10 +91,10 @@ export async function submitConversion(
   params: SubmitParams,
   signal?: AbortSignal
 ): Promise<ConvertAccepted> {
-  return request<ConvertAccepted>('/convert/xlsx-to-pdf', {
+  return request<ConvertAccepted>('/convert/to-pdf', {
     method: 'POST',
     body: buildConversionForm(params),
-    parse: (value) => convertAcceptedSchema.parse(value),
+    guard: isConvertAccepted,
     signal,
     timeoutMs: UPLOAD_TIMEOUT_MS,
   });
@@ -124,7 +127,7 @@ export async function fetchStatus(
       // Сигналы объединяются: запрос прервётся и при уходе со страницы,
       // и при очистке ограничителя
       signal: signal ? AbortSignal.any([signal, limiterSignal]) : limiterSignal,
-      parse: (value) => jobStatusResponseSchema.parse(value),
+      guard: isJobStatusResponse,
     })
   );
 }

@@ -49,11 +49,16 @@ presigned URL включает хост: ссылка, подписанная д
 | `QUEUE_PREFIX` | `xlsx2pdf` | Базовое имя очередей: `<prefix>.<tier>` |
 | `WORKER_QUEUE` | `light` | Очередь, которую слушает воркер |
 | `COMPLEXITY_LIGHT_MAX_BYTES` | 2 МиБ | Порог лёгкой задачи по размеру |
-| `COMPLEXITY_LIGHT_MAX_SHEETS` | 3 | Порог лёгкой задачи по листам |
+| `COMPLEXITY_LIGHT_MAX_SHEETS` | 3 | Порог лёгкой задачи по листам книги |
+| `COMPLEXITY_LIGHT_MAX_PAGES` | 5 | Порог лёгкой задачи по страницам документа |
 | `COMPLEXITY_MEDIUM_MAX_BYTES` | 20 МиБ | Порог средней задачи по размеру |
-| `COMPLEXITY_MEDIUM_MAX_SHEETS` | 20 | Порог средней задачи по листам |
+| `COMPLEXITY_MEDIUM_MAX_SHEETS` | 20 | Порог средней задачи по листам книги |
+| `COMPLEXITY_MEDIUM_MAX_PAGES` | 30 | Порог средней задачи по страницам документа |
 
-Уровень берётся по **старшему** из двух признаков. `QUEUE_PREFIX` влияет
+Уровень берётся по **старшему** из признаков. Листы читаются из книги,
+страницы — из свойств документа (`docProps/app.xml`), поэтому для книги
+действуют только пороги по листам, для документа Word — только по страницам.
+`QUEUE_PREFIX` влияет
 на ключи Redis, которые читают KEDA и autoscaler: при смене префикса
 манифесты `deploy/k8s/scaledobject-*.yaml` нужно поправить.
 

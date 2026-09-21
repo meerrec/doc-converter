@@ -6,7 +6,7 @@
  * коды — часть внешнего контракта: переименование ломает интерфейс.
  */
 
-import { z } from 'zod';
+import type { ApiErrorBody } from './schemas.js';
 
 /** Коды ошибок, которые сервис отдаёт клиенту. */
 export const ERROR_CODES = [
@@ -30,7 +30,7 @@ export const ERROR_CODES = [
   'content_validation_failed',
   'unsupported_format',
 
-  // --- Архивы (XLSX — это zip-контейнер) -------------------------------------
+  // --- Архивы (входные форматы — контейнеры OOXML, то есть zip) --------------
   'archive_forbidden_name',
   'archive_forbidden_extension',
   'archive_ratio_exceeded',
@@ -86,17 +86,31 @@ export function isErrorCode(value: unknown): value is ErrorCode {
 }
 
 /**
- * Тело ответа об ошибке.
+ * Проверяет, что значение — тело ответа об ошибке.
  *
- * `jobId` присутствует не всегда: его добавляют только ошибки, привязанные
- * к конкретной задаче. `requestId` сервер добавляет для сверки с логами.
+ * Гард повторяет схему `apiErrorBodySchema` из `schemas.ts` для потребителей,
+ * которым рантайм-zod не нужен: веб-интерфейс разбирает ответы сервера,
+ * но не валидирует запросы, и тащить ради этого весь валидатор в браузер
+ * незачем. Тип по-прежнему выводится из схемы, а за согласованностью гарда
+ * и схемы следит `tests/contract-guards.test.js`.
+ *
+ * Лишние поля допускаются: схема объявлена как `looseObject`, и сервер вправе
+ * добавить поле, не ломая уже собранный клиент.
+ *
+ * @param value - проверяемое значение
+ * @returns true, если значение является телом ответа об ошибке
  */
-export const apiErrorBodySchema = z.looseObject({
-  error: z.string(),
-  message: z.string(),
-  jobId: z.string().optional(),
-  requestId: z.string().optional(),
-});
+export function isApiErrorBody(value: unknown): value is ApiErrorBody {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
 
-/** Тело ответа об ошибке. */
-export type ApiErrorBody = z.infer<typeof apiErrorBodySchema>;
+  const body = value as Record<string, unknown>;
+
+  return (
+    typeof body['error'] === 'string' &&
+    typeof body['message'] === 'string' &&
+    (body['jobId'] === undefined || typeof body['jobId'] === 'string') &&
+    (body['requestId'] === undefined || typeof body['requestId'] === 'string')
+  );
+}

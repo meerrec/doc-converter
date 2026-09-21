@@ -1,10 +1,13 @@
 /**
  * Проверка сигнатур файлов (magic bytes).
  *
- * Первые байты файла однозначно указывают на контейнер: XLSX — это zip.
- * Проверка не даёт выдать один формат за другой: без неё файл с расширением
- * `.xlsx`, но содержимым другого типа попал бы в LibreOffice, где разбор
- * ошибок занял бы минуты вместо мгновенного отказа.
+ * Первые байты файла указывают на контейнер: и книга Excel, и документ
+ * Word — это zip. Проверка не даёт выдать zip за что-то другое: без неё
+ * файл с расширением `.xlsx`, но содержимым другого типа попал бы
+ * в LibreOffice, где разбор ошибок занял бы минуты вместо мгновенного отказа.
+ *
+ * Различить XLSX и DOCX сигнатура не может — у обоих `PK\x03\x04`. Этим
+ * занимается `ooxml.ts`: он читает оглавление контейнера.
  *
  * Список форматов сужен до входных форматов сервиса: раньше здесь были все
  * форматы Р7-Офис, включая текстовые и PDF, затем к ним добавлялся OLE2
@@ -21,15 +24,29 @@ import { MAGIC_BYTES_CHECK_SIZE } from './limits.js';
 const MIN_CHECK_BYTES = 4;
 
 /**
+ * Сигнатуры zip-контейнера.
+ *
+ * 50 4B 03 04 — обычный архив, 50 4B 05 06 — пустой (встречается у книг
+ * без содержимого).
+ */
+const ZIP_SIGNATURES: Buffer[] = [
+  Buffer.from('PK\x03\x04', 'binary'),
+  Buffer.from('PK\x05\x06', 'binary'),
+];
+
+/**
  * Сигнатуры входных форматов.
  *
  * `null` означало бы «формат без сигнатуры» (так описывались текстовые
- * форматы); для таблиц таких нет — входной формат имеет заголовок.
+ * форматы); для документов OOXML таких нет — у них есть заголовок.
+ *
+ * Запись на каждый формат нужна не для различения — его здесь нет, — а для
+ * `checkMagicBytes`: объявленное расширение обязано иметь сигнатуру, иначе
+ * проверка ответит `magic_unsupported_type`.
  */
 const SIGNATURES: Record<string, Buffer[]> = {
-  // XLSX — zip-контейнер: 50 4B 03 04 (обычный архив)
-  // или 50 4B 05 06 (пустой архив, встречается у книг без содержимого)
-  xlsx: [Buffer.from('PK\x03\x04', 'binary'), Buffer.from('PK\x05\x06', 'binary')],
+  xlsx: ZIP_SIGNATURES,
+  docx: ZIP_SIGNATURES,
 };
 
 /** Сигнатуры поддерживаемых форматов. */
@@ -131,29 +148,6 @@ export function verifyMagicBytes(buffer: Buffer, declaredType: string): boolean 
   return checkMagicBytes(buffer, declaredType).valid;
 }
 
-/**
- * Определяет формат файла по его содержимому.
- *
- * Нужен, когда клиент не указал формат: расширение из имени файла —
- * подсказка, а не доказательство, и опираться на неё одну нельзя.
- *
- * @param buffer - данные файла
- * @returns имя формата или null, если формат не распознан
- */
-export function detectFileTypeByMagicBytes(buffer: Buffer): string | null {
-  if (!buffer || buffer.length < MIN_CHECK_BYTES) {
-    return null;
-  }
-
-  for (const [format, signatures] of Object.entries(SIGNATURES)) {
-    if (signatures.some((signature) => matchesSignature(buffer, signature))) {
-      return format;
-    }
-  }
-
-  return null;
-}
-
 /** Форматы, для которых объявлена сигнатура. */
 export const SUPPORTED_FORMATS = Object.keys(SIGNATURES);
 
@@ -172,6 +166,5 @@ export default {
   SUPPORTED_FORMATS,
   checkMagicBytes,
   verifyMagicBytes,
-  detectFileTypeByMagicBytes,
   isSupportedFormat,
 };

@@ -2,20 +2,33 @@
  * Контракт маршрута GET /health.
  */
 
-import { z } from 'zod';
+import type { HealthResponse } from './schemas.js';
 
 /**
- * Ответ проверки доступности.
+ * Проверяет, что значение — ответ проверки доступности.
  *
- * `storage` — доступность объектного хранилища (MinIO/S3). Проверка дешёвая
- * (запрос к сервису), в отличие от готовности конвертера: её проверяет
- * отдельный процесс healthcheck контейнера воркера, подключаясь к UNO.
+ * Гард повторяет схему `healthResponseSchema` из `schemas.ts` для
+ * потребителей, которым рантайм-zod не нужен: веб-интерфейс разбирает ответы
+ * сервера, но не валидирует запросы, и тащить ради этого весь валидатор
+ * в браузер незачем. Тип по-прежнему выводится из схемы, а за согласованностью
+ * гарда и схемы следит `tests/contract-guards.test.js`.
+ *
+ * Лишние поля допускаются: схема объявлена как `looseObject`, и сервер вправе
+ * добавить поле, не ломая уже собранный клиент.
+ *
+ * @param value - проверяемое значение
+ * @returns true, если значение является ответом проверки доступности
  */
-export const healthResponseSchema = z.looseObject({
-  status: z.string(),
-  storage: z.boolean(),
-  version: z.string(),
-});
+export function isHealthResponse(value: unknown): value is HealthResponse {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
 
-/** Ответ проверки доступности. */
-export type HealthResponse = z.infer<typeof healthResponseSchema>;
+  const body = value as Record<string, unknown>;
+
+  return (
+    typeof body['status'] === 'string' &&
+    typeof body['storage'] === 'boolean' &&
+    typeof body['version'] === 'string'
+  );
+}

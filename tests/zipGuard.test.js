@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { validateZip } from '../apps/api/src/security/zipGuard.js';
-import { buildXlsx, buildZipBomb, buildLyingZipBomb } from './helpers/xlsxFixtures.js';
+import { buildXlsx, buildDocx, buildZipBomb, buildLyingZipBomb } from './helpers/ooxmlFixtures.js';
 
 describe('validateZip: корректные архивы', () => {
   it('валидная книга проходит проверку', async () => {
@@ -61,6 +61,30 @@ describe('validateZip: недостоверный central directory', () => {
     // Прочитанные байты не накапливаются: запись прервана, а не дочитана.
     // Ноль здесь означает, что поток оборван до конца записи
     expect(result.totalUncompressedBytes).toBe(0);
+  });
+});
+
+describe('validateZip: макросы документа', () => {
+  it('документ с проектом VBA отбраковывается', async () => {
+    // Макросы лежат отдельной частью пакета с безобидным расширением `.bin`,
+    // поэтому фильтр расширений их пропускает, а по структуре контейнера
+    // такой документ не отличается от обычного
+    const docx = await buildDocx({ withMacros: true });
+
+    const result = await validateZip(docx);
+
+    expect(result.isValid).toBe(false);
+    expect(result.violations.map((violation) => violation.code)).toContain(
+      'archive_forbidden_name'
+    );
+  });
+
+  it('документ без макросов проходит проверку', async () => {
+    const docx = await buildDocx({ pages: 3 });
+
+    const result = await validateZip(docx);
+
+    expect(result.isValid).toBe(true);
   });
 });
 

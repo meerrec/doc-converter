@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## О проекте
 
-Сервис конвертации **XLSX → PDF**. Конвертация выполняется нативным
-LibreOffice Calc, которым управляет Python-скрипт через **UNO API**
-(`docker/uno/uno_convert.py`, `import uno`).
+Сервис конвертации **XLSX и DOCX → PDF**. Конвертация выполняется нативным
+LibreOffice (Calc для книг, Writer для текстовых документов), которым
+управляет Python-скрипт через **UNO API** (`docker/uno/uno_convert.py`,
+`import uno`). Оба модуля живут в одном процессе soffice: формат приходит
+в скрипт аргументом и выбирает только фильтр экспорта.
 
 - **Никаких CLI-обёрток**: `soffice --convert-to` и `unoconv` не используются —
   они не дают ни доступа к страничному стилю (подгонка под одну страницу),
@@ -40,6 +42,7 @@ npm run start:worker               # WORKER_QUEUE=light node apps/worker/dist/in
 npm run start:autoscaler           # node apps/autoscaler/dist/index.js
 npm run dev                        # api + воркер через concurrently
 
+npm run lint                       # ESLint (включая правила react-hooks)
 npm test                           # весь набор
 NODE_ENV=test npx vitest run tests/complexity.test.js   # один файл
 ```
@@ -103,27 +106,36 @@ packages/storage       MinIO/S3
 ### Путь одной задачи
 
 ```
-POST /convert/xlsx-to-pdf  (multipart)
-  → apps/api/src/xlsx/xlsx.controller.ts   FileInterceptor, разбор параметров
-  → apps/api/src/xlsx/xlsx.service.ts      сигнатура, zip-гард, оценка сложности
-  → packages/storage/src/s3.ts             вход в MinIO: incoming/{jobId}.xlsx
+POST /convert/to-pdf  (multipart)
+  → apps/api/src/conversion/conversion.controller.ts  FileInterceptor, разбор параметров
+  → apps/api/src/conversion/conversion.service.ts     сигнатура, zip-гард, оценка сложности
+  → apps/api/src/security/ooxml.ts                    вид документа по содержимому zip
+  → packages/storage/src/s3.ts             вход в MinIO: incoming/{jobId}.{xlsx|docx}
   → packages/queue/src/jobStatus.ts        запись состояния: job:{jobId}
   → packages/queue/src/queues.ts           задача в очередь xlsx2pdf.{tier}
                                         ↓
   → apps/worker/src/index.ts               BullMQ Worker, concurrency: 1
   → apps/worker/src/processor.ts           скачать вход → конвертировать → загрузить PDF
-  → apps/worker/src/uno-converter.ts       spawn python3 с таймаутом
+  → apps/worker/src/uno-converter.ts       spawn python3 с таймаутом, формат в argv
   → docker/uno/uno_convert.py              UNO → soffice → PDF
 ```
+
+Маршрут один на оба формата: расширение из имени — подсказка, а не
+доказательство, и выбирать по нему способ конвертации значило бы доверять
+клиенту там, где содержимое можно проверить. Сигнатура у XLSX и DOCX одна
+и та же (оба — zip), поэтому вид документа определяется по главной части
+пакета: `xl/workbook.xml` против `word/document.xml`.
 
 ### Три очереди по сложности
 
 `light` / `medium` / `heavy` — по старшему из двух признаков: размер файла
-и число листов (`apps/api/src/xlsx/complexity.ts`, листы читаются из
-`xl/workbook.xml` внутри zip через yauzl, без запуска LibreOffice).
+и объём документа (`apps/api/src/conversion/complexity.ts`). Объём читается
+из служебных частей zip-контейнера через yauzl, без запуска LibreOffice:
+у книги это число листов (`xl/workbook.xml`), у документа Word — число
+страниц (`docProps/app.xml`).
 
 Разделение обязательно: одна конвертация занимает воркер целиком, и в общей
-очереди крупная книга задерживала бы мелкие файлы.
+очереди крупный документ задерживал бы мелкие файлы.
 
 ### Где живёт состояние
 
@@ -150,12 +162,38 @@ LibreOffice лежит в `/tmp` — корневая ФС контейнера 
 Порт слушает только loopback: у UNO нет аутентификации, и выставленный наружу
 порт означал бы возможность выполнить произвольный макрос в чужом процессе.
 
+### Базовые образы
+
+Все образы — на UBI 9 из `registry.access.redhat.com`: pull анонимный, тогда
+как с quay.io namespace `ubi9` требует авторизации (анонимный запрос отвечает
+401). Docker Hub не используется: MinIO и Valkey берутся с `quay.io` (minio
+и так собран на ubi-micro, valkey — образ sclorg). Стадии сборки — s2i-образ
+Node 24, runtime обоих серверных приложений — minimal-вариант того же Node 24
+(`ubi9/nodejs-24-minimal:1`): Node приходит из образа, компиляторов в нём нет,
+и версия его не назначается в Dockerfile'ах вручную.
+
+LibreOffice в репозиториях UBI не публикуется вовсе, поэтому воркер
+подключает AppStream AlmaLinux 9 (`docker/almalinux/`) — тот же EL9 ABI,
+чем и объясняется выбор дистрибутива. **Оттуда берутся только LibreOffice
+и шрифты Noto:** системные библиотеки и python3 обязаны остаться из UBI,
+иначе база образа де-факто станет AlmaLinux. Ставит их `microdnf` — пакетный
+менеджер minimal-образа; dnf в нём отсутствует.
+
+Пользователь в образах — встроенный в UBI UID 1001, свой не создаётся:
+вторая учётная запись дублировала бы его, а на 1001 рассчитаны и compose,
+и K8s-политики. Стадии сборки возвращаются к root: базовые образы sclorg
+стартуют от 1001, а `WORKDIR /app` создаётся демоном от root — писать туда
+непривилегированный процесс не сможет.
+
 ### Слои проверки запроса
 
 `rateLimit` → `multipart (multer)` → `схема параметров (zod)` →
-`сигнатура файла` → `zip-гард` → очередь. Всё, что можно отсеять
-до обращения к хранилищу, отсекается до него — это проверяется в
-`tests/api.test.js` на наборе без Redis и MinIO.
+`расширение и сигнатура` → `zip-гард` → `вид документа OOXML` → очередь.
+Всё, что можно отсеять до обращения к хранилищу, отсекается до него —
+это проверяется в `tests/api.test.js` на наборе без Redis и MinIO.
+Чужое расширение (`.xls`, `.doc`) отвергается до чтения архива, а вид
+документа определяется после zip-гарда: разбирать оглавление контейнера,
+не прошедшего проверку, незачем.
 
 ## Конфигурация
 
@@ -183,8 +221,17 @@ LibreOffice лежит в `/tmp` — корневая ФС контейнера 
   как 500 без подробностей — иначе в ответ попадут `err.message` и системные
   коды вроде `ENOENT`.
 - **Контракт API живёт в `packages/contract`**: zod-схемы и выведенные типы.
-  Сервер берёт оттуда схемы запроса и коды ошибок, веб-интерфейс — типы.
+  Сервер берёт оттуда схемы запроса и коды ошибок, веб-интерфейс — типы,
+  константы и рукописные гарды (`isHealthResponse` и соседние).
   Своих копий списков у сторон нет.
+- **Схемы контракта изолированы в `schemas.ts`**, а веб импортирует значения
+  через подпути (`@doc-converter/contract/formats` и соседние), минуя корень.
+  Это не стилистика: zod весит четверть клиентского бандла, а сборщик не может
+  доказать, что `z.object({...})` на верхнем уровне модуля не имеет побочных
+  эффектов, — поэтому любой импорт из модуля со схемами тащил валидатор
+  в браузер. Новую константу или гард кладите в модуль **без** zod; схему —
+  в `schemas.ts`. За согласованностью гардов и схем следит
+  `tests/contract-guards.test.js`.
 - **Числовые коды FilterData — только в контракте** (`PDF_VERSION_CODES`):
   в API версия PDF называется так, как её видит пользователь («1.7»,
   «pdfa-2b»), а экспортёр LibreOffice принимает числа.
@@ -205,11 +252,12 @@ LibreOffice лежит в `/tmp` — корневая ФС контейнера 
 
 ## Тесты
 
-`tests/` — Vitest, наборы: `complexity` (оценка сложности),
-`autoscaler` (правила масштабирования, чистые функции), `api` (маршруты,
-отсев до инфраструктуры), `nest` (каркас, формат ошибок, ограничитель).
-Фикстуры XLSX генерируются кодом (`tests/helpers/xlsxFixtures.js`), а не
-хранятся в репозитории.
+`tests/` — Vitest, наборы: `complexity` (оценка сложности), `ooxml`
+(определение вида документа), `autoscaler` (правила масштабирования, чистые
+функции), `api` (маршруты, отсев до инфраструктуры), `nest` (каркас, формат
+ошибок, ограничитель), `contract-guards` (согласованность рукописных гардов
+со zod-схемами контракта). Фикстуры XLSX и DOCX генерируются кодом
+(`tests/helpers/ooxmlFixtures.js`), а не хранятся в репозитории.
 
 Тесты **не требуют** Redis, MinIO и LibreOffice: проверяется всё, что можно
 проверить без них. Живая конвертация — предмет интеграционного прогона.
@@ -219,10 +267,13 @@ LibreOffice лежит в `/tmp` — корневая ФС контейнера 
 Два workflow'а в `.github/workflows/`, оба только читают репозиторий
 (`permissions: contents: read`):
 
-- `ci.yml` — `pnpm ci`, `pnpm -r build`, `pnpm -r typecheck`, `pnpm test`
-  и проверка синтаксиса скриптов в `docker/` (`python3 -m py_compile`, `sh -n`).
-  Ровно то, что разработчик делает перед коммитом; service-контейнеры
-  не поднимаются, потому что набор тестов обходится без Redis и MinIO.
+- `ci.yml` — `pnpm ci`, `pnpm -r build`, `pnpm -r typecheck`, `pnpm lint`,
+  `pnpm test`, проверка синтаксиса скриптов в `docker/`
+  (`python3 -m py_compile`, `sh -n`) и потолок размера веб-бандла.
+  Кроме потолка — ровно то, что разработчик делает перед коммитом;
+  service-контейнеры не поднимаются, потому что набор тестов обходится
+  без Redis и MinIO. Потолок нужен потому, что возврат `zod` в бандл
+  (~85 КБ) сборка, типы и тесты пропускают молча.
 - `images.yml` — сборка трёх образов и разбор `docker-compose.yml`.
   Образы не публикуются: workflow отвечает за то, чтобы правка не сломала
   сборку, а не за доставку.

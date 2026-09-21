@@ -7,7 +7,7 @@
  * сборку интерфейса, а не проходит молча.
  */
 
-import { isErrorCode } from '@doc-converter/contract';
+import { isErrorCode } from '@doc-converter/contract/errors';
 import type { ErrorCode } from '@doc-converter/contract';
 import { ApiError, CLIENT_ERROR_CODES } from './client';
 
@@ -31,19 +31,19 @@ const ERROR_MESSAGES: Readonly<Record<ErrorCode, string>> = {
   magic_buffer_too_small: 'Файл слишком мал, чтобы определить формат',
   magic_unsupported_type: 'Этот формат не поддерживается',
   content_validation_failed: 'Файл не прошёл проверку содержимого',
-  unsupported_format: 'Поддерживаются только книги Excel в формате XLSX',
+  unsupported_format: 'Поддерживаются книги Excel (XLSX) и документы Word (DOCX)',
 
-  // --- Архивы (XLSX — это zip-контейнер) -------------------------------------
-  archive_forbidden_name: 'Внутри книги найдены недопустимые имена файлов',
-  archive_forbidden_extension: 'Внутри книги найдены файлы недопустимых типов',
+  // --- Архивы (входные форматы — контейнеры OOXML, то есть zip) --------------
+  archive_forbidden_name: 'Внутри файла найдены недопустимые имена файлов',
+  archive_forbidden_extension: 'Внутри файла найдены файлы недопустимых типов',
   archive_ratio_exceeded: 'Файл похож на архив-бомбу и отклонён',
-  archive_too_many_entries: 'Внутри книги слишком много файлов',
-  archive_entry_too_large: 'Один из файлов внутри книги слишком большой',
-  archive_total_too_large: 'Содержимое книги слишком большое',
-  archive_too_deep: 'Слишком глубокая вложенность папок внутри книги',
-  archive_duplicate_entry: 'Внутри книги найдены файлы с одинаковыми именами',
-  archive_empty: 'Внутри книги нет данных',
-  archive_corrupt: 'Файл повреждён или не является книгой Excel',
+  archive_too_many_entries: 'Внутри файла слишком много файлов',
+  archive_entry_too_large: 'Один из файлов внутри архива слишком большой',
+  archive_total_too_large: 'Содержимое файла слишком большое',
+  archive_too_deep: 'Слишком глубокая вложенность папок внутри файла',
+  archive_duplicate_entry: 'Внутри файла найдены файлы с одинаковыми именами',
+  archive_empty: 'Внутри файла нет данных',
+  archive_corrupt: 'Файл повреждён или не является документом Excel или Word',
 
   // --- Ход выполнения задачи -------------------------------------------------
   job_not_found: 'Задача не найдена — возможно, истёк срок её хранения',

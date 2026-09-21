@@ -6,8 +6,8 @@
  * дополнительный способ.
  */
 
-import { memo, useCallback, useId, useRef, useState } from 'react';
-import { INPUT_FORMATS } from '@doc-converter/contract';
+import { memo, useCallback, useId, useState } from 'react';
+import { INPUT_FORMATS } from '@doc-converter/contract/formats';
 import { MAX_UPLOAD_BYTES } from '../config';
 
 interface DropZoneProps {
@@ -28,7 +28,6 @@ export const DropZone = memo(function DropZone({
   disabled = false,
 }: DropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
   const inputId = useId();
   const hintId = useId();
 
@@ -100,7 +99,6 @@ export const DropZone = memo(function DropZone({
       onDrop={handleDrop}
     >
       <input
-        ref={inputRef}
         id={inputId}
         className="visually-hidden"
         type="file"
@@ -112,7 +110,7 @@ export const DropZone = memo(function DropZone({
       />
 
       <label className="dropzone__label" htmlFor={inputId}>
-        <span className="dropzone__title">Перетащите книги Excel сюда</span>
+        <span className="dropzone__title">Перетащите файлы Excel и Word сюда</span>
         <span className="dropzone__subtitle">
           или нажмите, чтобы выбрать на диске
         </span>

@@ -12,7 +12,8 @@
  * Все комментарии на русском языке.
  */
 
-import type { ComplexityTier, JobStatus } from '@doc-converter/contract';
+import { isInputFormat } from '@doc-converter/contract';
+import type { ComplexityTier, InputFormat, JobStatus } from '@doc-converter/contract';
 import { JOB_TTL_SEC } from '@doc-converter/config';
 import { getRedisClient } from './connection.js';
 
@@ -34,6 +35,8 @@ export interface JobRecord {
   status: JobStatus;
   /** Уровень сложности (и, значит, очередь). */
   tier: ComplexityTier;
+  /** Формат входного файла; в записях, созданных до его появления, отсутствует. */
+  inputFormat?: InputFormat;
   /** Время постановки в очередь (ISO 8601). */
   createdAt: string;
   /** Время начала обработки. */
@@ -55,15 +58,17 @@ export interface JobRecord {
  *
  * @param jobId - идентификатор задачи
  * @param tier - уровень сложности
+ * @param inputFormat - формат входного файла
  * @returns созданная запись
  */
 export async function createJob(
   jobId: string,
-  tier: ComplexityTier
+  tier: ComplexityTier,
+  inputFormat: InputFormat
 ): Promise<JobRecord> {
   const createdAt = new Date().toISOString();
 
-  const record: JobRecord = { jobId, status: 'queued', tier, createdAt };
+  const record: JobRecord = { jobId, status: 'queued', tier, inputFormat, createdAt };
 
   const client = await getRedisClient();
   const key = jobKey(jobId);
@@ -74,6 +79,7 @@ export async function createJob(
       jobId,
       status: record.status,
       tier,
+      inputFormat,
       createdAt,
     })
     .expire(key, JOB_TTL_SEC)
@@ -173,6 +179,9 @@ export async function getJob(jobId: string): Promise<JobRecord | null> {
     jobId: raw.jobId ?? jobId,
     status: (raw.status ?? 'queued') as JobStatus,
     tier: (raw.tier ?? 'light') as ComplexityTier,
+    // Значение приходит из Redis строкой: проверка нужна, чтобы в ответ
+    // не попал формат, которого нет в контракте
+    inputFormat: isInputFormat(raw.inputFormat) ? raw.inputFormat : undefined,
     createdAt: raw.createdAt ?? new Date().toISOString(),
     startedAt: raw.startedAt,
     finishedAt: raw.finishedAt,

@@ -12,7 +12,11 @@
 
 import { spawn } from 'node:child_process';
 import { PYTHON_BIN, UNO_SCRIPT_PATH, CONVERSION_TIMEOUT_MS } from '@doc-converter/config';
-import { PDF_VERSION_CODES, type ConversionOptions } from '@doc-converter/contract';
+import {
+  PDF_VERSION_CODES,
+  type ConversionOptions,
+  type InputFormat,
+} from '@doc-converter/contract';
 
 /**
  * Приводит параметры контракта к виду, который понимает Python-скрипт.
@@ -101,9 +105,15 @@ function parseResponse(stdout: string): UnoScriptResponse | null {
 /**
  * Конвертирует файл через UNO.
  *
+ * Формат передаётся скрипту явно: от него зависит фильтр экспорта
+ * (`calc_pdf_Export` или `writer_pdf_Export`), а определять его повторно
+ * по имени файла внутри скрипта значило бы завести второе место, где формат
+ * угадывается, вместо того чтобы воспользоваться уже проверенным.
+ *
  * @param inputPath - путь к исходному файлу
  * @param outputPath - путь, по которому должен появиться PDF
  * @param options - параметры конвертации
+ * @param inputFormat - формат исходного файла
  * @param timeoutMs - таймаут конвертации
  * @returns результат конвертации
  * @throws {UnoConversionError} - если конвертация не удалась или превысила таймаут
@@ -112,6 +122,7 @@ export function convertViaUno(
   inputPath: string,
   outputPath: string,
   options: ConversionOptions,
+  inputFormat: InputFormat,
   timeoutMs: number = CONVERSION_TIMEOUT_MS
 ): Promise<UnoConversionResult> {
   return new Promise((resolve, reject) => {
@@ -125,6 +136,8 @@ export function convertViaUno(
         inputPath,
         '--output',
         outputPath,
+        '--format',
+        inputFormat,
         '--options',
         JSON.stringify(toScriptOptions(options)),
       ],

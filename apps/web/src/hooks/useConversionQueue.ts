@@ -11,7 +11,15 @@
  * одного раза в секунду и только пока она в очереди или в работе.
  */
 
-import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from 'react';
 import { fetchStatus, submitConversion } from '../api/conversion';
 import { ApiError, downloadFromUrl } from '../api/client';
 import { describeError, describeJobError } from '../api/errors';
@@ -20,16 +28,18 @@ import { detectInputFormat, stripExtension } from '../lib/format';
 import {
   BATCH_CONCURRENCY,
   BATCH_MIN_INTERVAL_MS,
+  CLOCK_TICK_MS,
   MAX_UPLOAD_BYTES,
   POLL_DEADLINE_MS,
   POLL_INTERVAL_MS,
   POLL_MAX_INTERVAL_MS,
   RESULT_EXTENSION,
 } from '../config';
-import { INPUT_FORMATS } from '@doc-converter/contract';
+import { INPUT_FORMATS } from '@doc-converter/contract/formats';
 import type {
   ComplexityTier,
   ConversionOptions,
+  InputFormat,
   JobResult,
   JobStatus,
   JobStatusResponse,
@@ -63,6 +73,8 @@ export interface QueueItem {
   jobId?: string;
   /** Уровень сложности, назначенный сервером. */
   tier?: ComplexityTier;
+  /** Формат файла, определённый сервером по содержимому. */
+  inputFormat?: InputFormat;
   /** Число листов книги, если сервер его определил. */
   sheets?: number | null;
   /** Параметры, зафиксированные на момент запуска. */
@@ -78,10 +90,25 @@ export interface QueueItem {
   errorText?: string;
 }
 
+/**
+ * Файл, отклонённый при добавлении.
+ *
+ * Идентификатор нужен как ключ списка React: текст отказа собирается
+ * из имени файла и причины, поэтому у двух файлов с одинаковым именем
+ * и одинаковой причиной он совпадёт, а дубли ключей React не допускает.
+ */
+export interface RejectedFile {
+  /** Клиентский идентификатор — ключ списка React. */
+  id: string;
+  /** Текст отказа для показа пользователю. */
+  message: string;
+}
+
 /** Действия над очередью. */
 type Action =
   | { type: 'add'; items: QueueItem[] }
   | { type: 'patch'; id: string; patch: Partial<QueueItem> }
+  | { type: 'startPending' }
   | { type: 'remove'; id: string }
   | { type: 'clearFinished' };
 
@@ -102,30 +129,45 @@ function reducer(state: QueueItem[], action: Action): QueueItem[] {
         item.id === action.id ? { ...item, ...action.patch } : item
       );
 
+    case 'startPending':
+      // Одним проходом, а не N действиями `patch`: каждый `patch` — это
+      // отдельный `map` по списку, и на большой пачке вышел бы квадрат
+      return state.map((item) =>
+        item.status === 'pending' ? { ...item, status: 'submitting' } : item
+      );
+
     case 'remove':
       return state.filter((item) => item.id !== action.id);
 
     case 'clearFinished':
-      return state.filter(
-        (item) =>
-          item.status !== 'completed' &&
-          item.status !== 'failed' &&
-          item.status !== 'cancelled'
-      );
+      return state.filter((item) => !isFinishedStatus(item.status));
 
     default:
       return state;
   }
 }
 
-/** Состояния, при которых задача ещё не завершена. */
-function isActiveStatus(status: QueueItemStatus): boolean {
-  return (
-    status === 'pending' ||
-    status === 'submitting' ||
-    status === 'queued' ||
-    status === 'processing'
-  );
+/**
+ * Состояния, при которых задача отправлена и ещё не завершена.
+ *
+ * `pending` сюда не входит: файл ещё не ушёл на сервер, и показывать
+ * счётчик времени нечего.
+ *
+ * @param status - состояние задачи
+ * @returns true, если задача выполняется
+ */
+export function isWorkingStatus(status: QueueItemStatus): boolean {
+  return status === 'submitting' || status === 'queued' || status === 'processing';
+}
+
+/**
+ * Состояния, при которых задача завершена.
+ *
+ * @param status - состояние задачи
+ * @returns true, если задача больше не изменится
+ */
+function isFinishedStatus(status: QueueItemStatus): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled';
 }
 
 /**
@@ -158,8 +200,15 @@ export interface UseConversionQueueOptions {
 /** Значение, возвращаемое хуком. */
 export interface ConversionQueue {
   items: QueueItem[];
-  /** Добавляет файлы в очередь. Возвращает тексты отказов. */
-  addFiles: (files: File[]) => string[];
+  /**
+   * Текущее время на момент последнего такта часов.
+   *
+   * Нужно строкам таблицы: счётчик идущей задачи и срок действия ссылки
+   * считаются от него, а не от `Date.now()` в рендере.
+   */
+  now: number;
+  /** Добавляет файлы в очередь. Возвращает отклонённые файлы с причинами. */
+  addFiles: (files: File[]) => RejectedFile[];
   removeItem: (id: string) => void;
   clearFinished: () => void;
   startAll: () => void;
@@ -187,10 +236,13 @@ export function useConversionQueue({
 }: UseConversionQueueOptions): ConversionQueue {
   const [items, dispatch] = useReducer(reducer, []);
 
+  // Часы интерфейса. Начальное значение берётся лениво, чтобы не звать
+  // Date.now() на каждом рендере — оно нужно только как стартовая точка.
+  const [now, setNow] = useState(() => Date.now());
+
   // Актуальные настройки нужны внутри колбэков, которые не должны
   // пересоздаваться при каждом изменении формы
   const settingsRef = useRef(options);
-  settingsRef.current = options;
 
   // Зеркало списка задач для чтения внутри колбэков и цикла опроса.
   //
@@ -198,7 +250,22 @@ export function useConversionQueue({
   // новую идентичность на каждом обновлении, а для memo(TaskRow) это значит
   // перерисовку всех строк таблицы на каждом тике опроса (см. TaskTable).
   const itemsRef = useRef(items);
-  itemsRef.current = items;
+
+  // Зеркала обновляются после коммита, а не в теле рендера: запись в ref
+  // во время рендера — побочный эффект, который ломается при прерывании
+  // или повторном выполнении рендера (React 19, StrictMode в main.tsx).
+  //
+  // Layout-эффект, а не пассивный: он выполняется синхронно в фазе коммита,
+  // то есть строго до отрисовки и до любого пользовательского события.
+  // Пассивный эффект таких гарантий не даёт — клик, пришедший до его
+  // выполнения, увидел бы на одно обновление устаревшее зеркало.
+  //
+  // Отставшая ссылка читателям не грозит и здесь: все они — обработчики
+  // событий и колбэки таймеров, а они выполняются только после коммита.
+  useLayoutEffect(() => {
+    settingsRef.current = options;
+    itemsRef.current = items;
+  });
 
   // Ограничитель живёт в ссылке, потому что cancelAll заменяет его новым:
   // значение нужно читать в момент вызова, а не в момент создания
@@ -206,8 +273,14 @@ export function useConversionQueue({
 
   // Таймеры отложенных скачиваний: их нужно снимать при размонтировании
   // и при повторном запуске, иначе клики по скрытым ссылкам продолжат
-  // срабатывать после ухода со страницы
-  const downloadTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  // срабатывать после ухода со страницы.
+  //
+  // Ключ — идентификатор задачи, а не просто список: задача может исчезнуть
+  // из очереди (убрана вручную или кнопкой «Очистить завершённые»), пока
+  // её скачивание ещё ждёт своей очереди, и снять таймер нужно точечно.
+  const downloadTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map()
+  );
 
   /**
    * Возвращает текущий ограничитель, создавая его при первом обращении.
@@ -230,14 +303,20 @@ export function useConversionQueue({
   }, []);
 
   useEffect(() => {
-    // Ссылки читаются в момент размонтирования: cancelAll мог заменить
-    // ограничитель, а список отложенных скачиваний — измениться
+    // Карта берётся в момент подписки: сам объект не заменяется никогда,
+    // а `ref.current` внутри очистки может к тому времени указывать на другое
+    const downloadTimers = downloadTimersRef.current;
+
     return () => {
+      // Ограничитель, в отличие от карты, читается в момент размонтирования:
+      // cancelAll заменяет его новым
       limiterRef.current?.clear();
 
-      for (const timer of downloadTimersRef.current) {
+      for (const timer of downloadTimers.values()) {
         clearTimeout(timer);
       }
+
+      downloadTimers.clear();
     };
   }, []);
 
@@ -261,6 +340,7 @@ export function useConversionQueue({
             status: accepted.status,
             jobId: accepted.jobId,
             tier: accepted.tier,
+            inputFormat: accepted.inputFormat,
             sheets: accepted.sheets,
             submittedAt: Date.now(),
             errorText: undefined,
@@ -290,20 +370,24 @@ export function useConversionQueue({
   /**
    * Добавляет файлы в очередь, отсеивая неподдерживаемые и слишком крупные.
    */
-  const addFiles = useCallback((files: File[]): string[] => {
-    const rejected: string[] = [];
+  const addFiles = useCallback((files: File[]): RejectedFile[] => {
+    const rejected: RejectedFile[] = [];
     const accepted: QueueItem[] = [];
 
     for (const file of files) {
       if (file.size > MAX_UPLOAD_BYTES) {
-        rejected.push(
-          `«${file.name}»: размер превышает ${Math.floor(MAX_UPLOAD_BYTES / (1024 * 1024))} МБ`
-        );
+        rejected.push({
+          id: crypto.randomUUID(),
+          message: `«${file.name}»: размер превышает ${Math.floor(MAX_UPLOAD_BYTES / (1024 * 1024))} МБ`,
+        });
         continue;
       }
 
       if (!detectInputFormat(file.name)) {
-        rejected.push(`«${file.name}»: поддерживаются только файлы ${FORMAT_LIST}`);
+        rejected.push({
+          id: crypto.randomUUID(),
+          message: `«${file.name}»: поддерживаются только файлы ${FORMAT_LIST}`,
+        });
         continue;
       }
 
@@ -326,6 +410,17 @@ export function useConversionQueue({
 
   /** Запускает все ожидающие задачи через ограничитель. */
   const startAll = useCallback(() => {
+    // Намерение отправить фиксируется синхронно, до постановки в ограничитель.
+    // Ограничитель запускает задачи не сразу (BATCH_CONCURRENCY и пауза
+    // BATCH_MIN_INTERVAL_MS), и всё это время задача оставалась бы `pending`.
+    // Кнопка «Конвертировать» активна, пока есть `pending`, поэтому второй
+    // клик отправил бы те же файлы ещё раз — два POST и две задачи на сервере.
+    //
+    // Список ниже читается через itemsRef уже после dispatch: ссылка обновится
+    // только в коммите, а здесь нужен текущий состав пачки — ровно тот,
+    // который отмечается этим действием.
+    dispatch({ type: 'startPending' });
+
     for (const item of itemsRef.current) {
       if (item.status !== 'pending') {
         continue;
@@ -337,7 +432,15 @@ export function useConversionQueue({
         downloadName: `${stripExtension(item.file.name)}.${RESULT_EXTENSION}`,
       };
 
-      void getLimiter().run((signal) => sendItem(prepared, signal));
+      // Ограничитель отклоняет задачу при отмене (`clear` в cancelAll)
+      // и на очищенном ограничителе. Статусы в этом случае уже проставлены
+      // самим cancelAll, поэтому отказ здесь только гасится — иначе он всплыл
+      // бы как необработанный и засорил консоль и сборщик ошибок.
+      // Собственные ошибки sendItem не пробрасывает: внутри он их разбирает
+      // и переводит задачу в `failed`.
+      getLimiter()
+        .run((signal) => sendItem(prepared, signal))
+        .catch(() => undefined);
     }
   }, [sendItem, getLimiter]);
 
@@ -378,11 +481,14 @@ export function useConversionQueue({
         return;
       }
 
+      // Состояние сразу `submitting`, а не `pending`: задача уходит
+      // в ограничитель этой же строкой, а `pending` оставил бы её видимой
+      // для повторного запуска кнопкой «Конвертировать» (см. startAll)
       const restarted: QueueItem = {
         ...item,
         options: settingsRef.current,
         downloadName: `${stripExtension(item.file.name)}.${RESULT_EXTENSION}`,
-        status: 'pending',
+        status: 'submitting',
         jobId: undefined,
         result: undefined,
         errorText: undefined,
@@ -395,7 +501,7 @@ export function useConversionQueue({
         patch: {
           options: restarted.options,
           downloadName: restarted.downloadName,
-          status: 'pending',
+          status: 'submitting',
           jobId: undefined,
           result: undefined,
           errorText: undefined,
@@ -403,7 +509,10 @@ export function useConversionQueue({
         },
       });
 
-      void getLimiter().run((signal) => sendItem(restarted, signal));
+      // См. startAll: отказ означает отмену, статусы проставлены cancelAll
+      getLimiter()
+        .run((signal) => sendItem(restarted, signal))
+        .catch(() => undefined);
     },
     [sendItem, getLimiter]
   );
@@ -417,29 +526,152 @@ export function useConversionQueue({
    */
   const downloadAll = useCallback(() => {
     // Повторное нажатие начинает batch заново, а не добавляет второй поверх
-    for (const timer of downloadTimersRef.current) {
+    for (const timer of downloadTimersRef.current.values()) {
       clearTimeout(timer);
     }
+
+    downloadTimersRef.current.clear();
 
     const ready = itemsRef.current.filter(
       (item) => item.status === 'completed' && item.result !== undefined
     );
 
-    downloadTimersRef.current = ready.map((item, index) =>
-      setTimeout(() => {
-        if (item.result) {
-          downloadFromUrl(item.result.url, item.downloadName);
-        }
-      }, index * 300)
-    );
+    ready.forEach((item, index) => {
+      downloadTimersRef.current.set(
+        item.id,
+        setTimeout(() => {
+          // Таймер отработал — из карты его убираем, чтобы она не росла
+          downloadTimersRef.current.delete(item.id);
+
+          if (item.result) {
+            downloadFromUrl(item.result.url, item.downloadName);
+          }
+        }, index * 300)
+      );
+    });
   }, []);
+
+  /**
+   * Снимает отложенное скачивание задачи, если оно ещё не сработало.
+   *
+   * @param id - идентификатор задачи
+   */
+  const cancelDownload = useCallback((id: string) => {
+    const timer = downloadTimersRef.current.get(id);
+
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      downloadTimersRef.current.delete(id);
+    }
+  }, []);
+
+  /**
+   * Убирает задачу из списка, отменяя её отложенное скачивание.
+   *
+   * @param id - идентификатор задачи
+   */
+  const removeItem = useCallback(
+    (id: string) => {
+      // Иначе клик по ссылке удалённой задачи всё равно сработает:
+      // пользователь убрал строку, а файл скачается через долю секунды
+      cancelDownload(id);
+      dispatch({ type: 'remove', id });
+    },
+    [cancelDownload]
+  );
+
+  /** Убирает завершённые задачи, отменяя их отложенные скачивания. */
+  const clearFinished = useCallback(() => {
+    for (const item of itemsRef.current) {
+      if (isFinishedStatus(item.status)) {
+        cancelDownload(item.id);
+      }
+    }
+
+    dispatch({ type: 'clearFinished' });
+  }, [cancelDownload]);
+
+  // Счётчики состояний.
+  //
+  // Объявлены до эффекта опроса: признак «есть что опрашивать» выводится
+  // из них, а не из отдельного прохода по списку (см. hasActive).
+  const stats = useMemo(() => {
+    let pending = 0;
+    let active = 0;
+    let completed = 0;
+    let failed = 0;
+    let cancelled = 0;
+
+    for (const item of items) {
+      if (item.status === 'pending' || item.status === 'submitting') {
+        pending += 1;
+      } else if (item.status === 'completed') {
+        completed += 1;
+      } else if (item.status === 'failed') {
+        failed += 1;
+      } else if (item.status === 'cancelled') {
+        cancelled += 1;
+      } else {
+        active += 1;
+      }
+    }
+
+    return { total: items.length, pending, active, completed, failed, cancelled };
+  }, [items]);
 
   // Признак «есть что опрашивать».
   //
   // Зависимость — только сам факт наличия незавершённых задач: список задач
   // читается через itemsRef, иначе цепочка таймеров перезапускалась бы
-  // на каждом завершении задачи и сбрасывала накопленный интервал
-  const hasActive = items.some((item) => isActiveStatus(item.status));
+  // на каждом завершении задачи и сбрасывала накопленный интервал.
+  //
+  // Выводится из уже посчитанных счётчиков, а не отдельным проходом
+  // по списку: `pending` набирается на `pending|submitting`, `active` —
+  // на `queued|processing`, то есть ровно на тех четырёх состояниях,
+  // при которых задача ещё не завершена. Второй проход по массиву
+  // на каждом рендере был бы лишней работой, а `useMemo` вокруг него
+  // правило `rerender-simple-expression-in-memo` считает дороже самого
+  // выражения.
+  const hasActive = stats.pending > 0 || stats.active > 0;
+
+  // Такт часов.
+  //
+  // Строки таблицы показывают счётчик идущей задачи и следят за сроком ссылки
+  // на готовый файл — и то и другое считается от текущего времени. Раньше
+  // каждая строка звала Date.now() прямо в рендере: рендер переставал быть
+  // чистым, а срок ссылки не обновлялся вовсе — завершённые задачи больше
+  // не опрашиваются, и «ссылка истекла» могло не появиться до случайной
+  // перерисовки списка.
+  //
+  // Таймер заводится только на ближайшее осмысленное событие: пока идёт
+  // работа — на следующий такт, иначе — на момент истечения ближайшей ссылки.
+  // Без этого страница перерисовывалась бы каждую секунду вхолостую.
+  useEffect(() => {
+    let nextAt: number | null = hasActive ? now + CLOCK_TICK_MS : null;
+
+    for (const item of items) {
+      const expiresAt = item.result ? Date.parse(item.result.expiresAt) : Number.NaN;
+
+      // Истёкшие ссылки пропускаются: иначе таймер перезаводился бы на то же
+      // прошлое мгновение и цикл стал бы горячим
+      if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+        continue;
+      }
+
+      nextAt = nextAt === null ? expiresAt : Math.min(nextAt, expiresAt);
+    }
+
+    if (nextAt === null) {
+      return;
+    }
+
+    const timer = setTimeout(
+      () => setNow(Date.now()),
+      Math.max(MIN_TICK_DELAY_MS, nextAt - now)
+    );
+
+    return () => clearTimeout(timer);
+  }, [now, items, hasActive]);
 
   useEffect(() => {
     if (!hasActive) {
@@ -669,39 +901,28 @@ export function useConversionQueue({
     };
     // items намеренно не в зависимостях: актуальное состояние читается
     // через itemsRef, иначе цепочка таймеров перезапускалась бы на каждом
-    // изменении списка задач
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // изменении списка задач.
+    //
+    // От этого зависит не только плавность: перезапуск эффекта обнуляет
+    // deadlines, а в них лежит срок ожидания задачи (POLL_DEADLINE_MS).
+    // Инвариант, который делает перезапуск безопасным: опрашиваемые задачи
+    // (isPollable — есть jobId и статус queued|processing) всегда входят
+    // в число активных, поэтому момент, когда hasActive становится false, —
+    // это момент, когда опрашивать уже некого, и терять сроки не на чем.
+    // Обратный переход всегда связан с появлением новой задачи без jobId,
+    // и её дедлайн отсчитывается заново — как и задумано.
+    //
+    // Если однажды понадобится добавить items в зависимости, инвариант
+    // придётся пересматривать: молчаливое отодвигание дедлайна превратит
+    // защиту от вечного ожидания в её отсутствие.
   }, [hasActive]);
-
-  const stats = useMemo(() => {
-    let pending = 0;
-    let active = 0;
-    let completed = 0;
-    let failed = 0;
-    let cancelled = 0;
-
-    for (const item of items) {
-      if (item.status === 'pending' || item.status === 'submitting') {
-        pending += 1;
-      } else if (item.status === 'completed') {
-        completed += 1;
-      } else if (item.status === 'failed') {
-        failed += 1;
-      } else if (item.status === 'cancelled') {
-        cancelled += 1;
-      } else {
-        active += 1;
-      }
-    }
-
-    return { total: items.length, pending, active, completed, failed, cancelled };
-  }, [items]);
 
   return {
     items,
+    now,
     addFiles,
-    removeItem: useCallback((id: string) => dispatch({ type: 'remove', id }), []),
-    clearFinished: useCallback(() => dispatch({ type: 'clearFinished' }), []),
+    removeItem,
+    clearFinished,
     startAll,
     cancelAll,
     retryItem,

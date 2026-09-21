@@ -52,13 +52,27 @@ const FORBIDDEN_EXTENSIONS = new Set<string>([
 ]);
 
 /**
- * Запрещённые символы в именах файлов.
- *.Control characters (0x00-0x1F, 0x7F) и некоторые специальные символы.
+ * Часть пакета OOXML, в которой лежат макросы VBA.
+ *
+ * Расширение `.bin` безобидно, поэтому в список запрещённых расширений такая
+ * часть не попадает — проверяется точное имя: в книгах и документах с
+ * макросами она лежит в `xl/` и `word/` соответственно.
  */
+const VBA_PROJECT_ENTRY = 'vbaproject.bin';
+
+/**
+ * Запрещённые символы в именах файлов.
+ *
+ * Управляющие символы (0x00–0x1F, 0x7F) и некоторые специальные символы.
+ */
+// Управляющие символы здесь ищутся намеренно: имена частей архива приходят
+// из недоверенного файла, и такие символы в них — признак подделки, а не
+// повод для осторожности
+// eslint-disable-next-line no-control-regex
 const CONTROL_CHAR_REGEX = /[\x00-\x1F\x7F<>:"|?*\\]/;
 
 /**
- *Pattern для detection Windows drive paths (C:\...).
+ * Шаблон пути Windows с буквой диска (C:\...).
  */
 const WINDOWS_DRIVE_REGEX = /^[a-zA-Z]:/;
 
@@ -208,6 +222,15 @@ function validateEntryName(fileName: string, maxPathDepth: number = ZIP_MAX_PATH
   const ext = fileName.slice(fileName.lastIndexOf('.')).toLowerCase();
   if (FORBIDDEN_EXTENSIONS.has(ext)) {
     return 'archive_forbidden_extension';
+  }
+
+  // Проект VBA: макросы документа. Расширения `.xlsm`/`.docm` сервис
+  // не принимает, но по структуре контейнера они не отличаются от обычных
+  // книг и документов — входной формат определяется по главной части пакета,
+  // и макросодержащий файл прошёл бы эту проверку, не будь её здесь.
+  const baseName = fileName.slice(fileName.lastIndexOf('/') + 1).toLowerCase();
+  if (baseName === VBA_PROJECT_ENTRY) {
+    return 'archive_forbidden_name';
   }
 
   // Проверка на глубину пути

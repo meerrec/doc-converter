@@ -126,7 +126,11 @@ export async function getRedisClient(): Promise<Redis> {
       await waitForReady(client);
     } catch (err) {
       client.disconnect();
-      throw new Error(`Не удалось подключиться к Valkey/Redis: ${(err as Error).message}`);
+      // Причина сохраняется в `cause`: по тексту «не удалось подключиться»
+      // не отличить отказ сети от неверного пароля или адреса
+      throw new Error(`Не удалось подключиться к Valkey/Redis: ${(err as Error).message}`, {
+        cause: err,
+      });
     }
 
     sharedClient = client;
