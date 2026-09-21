@@ -87,6 +87,9 @@ jobs:
       - name: Проверить типы
         run: pnpm -r typecheck
 
+      - name: Проверить стиль
+        run: pnpm lint
+
       - name: Прогнать тесты
         run: pnpm test
 
