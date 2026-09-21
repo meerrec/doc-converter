@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Конвертация электронной таблицы в PDF через UNO API LibreOffice.
+"""Конвертация документа OOXML в PDF через UNO API LibreOffice.
 
 Скрипт подключается к уже запущенному soffice по UNO-сокету, открывает
-документ, настраивает страничный стиль и экспортирует PDF с нужными
-параметрами. Запускается по одному процессу на задачу: сам LibreOffice
-поднимает entrypoint контейнера и живёт всё время работы воркера.
+документ, при необходимости настраивает страничный стиль и экспортирует PDF
+с нужными параметрами. Запускается по одному процессу на задачу: сам
+LibreOffice поднимает entrypoint контейнера и живёт всё время работы воркера.
+
+Книгу Excel и текстовый документ Word конвертирует один и тот же soffice,
+но разными фильтрами экспорта: какой из них взять, скрипт узнаёт из
+`--format`. Формат приходит уже проверенным — API определил его по
+содержимому контейнера, — поэтому угадывать его здесь по расширению
+не нужно.
 
 Почему UNO, а не `soffice --convert-to`: CLI-обёртка не даёт ни доступа
 к страничному стилю (подгонка таблицы под одну страницу), ни полного
@@ -78,6 +84,45 @@ def prop(name: str, value) -> PropertyValue:
     return item
 
 
+# Фильтры экспорта PDF по формату исходного файла. Набор FilterData у обоих
+# общий, различается только фильтр: таблицы экспортирует Calc, текстовые
+# документы — Writer.
+EXPORT_FILTERS = {
+    "xlsx": "calc_pdf_Export",
+    "docx": "writer_pdf_Export",
+}
+
+
+def macro_execution_mode() -> int | None:
+    """Возвращает значение «макросы не исполнять» для MediaDescriptor.
+
+    Значение берётся у самого LibreOffice, а не задаётся числом: константа
+    принадлежит API, и зашитая единица в другой версии могла бы означать
+    другое (`NEVER_EXECUTE` — это 0, а не 1). Способы достать её различаются
+    между сборками python3-uno, поэтому пробуются оба.
+
+    Если константа недоступна, свойство не передаётся — при загрузке
+    в headless-режиме макросы и так не исполняются, — но факт остаётся
+    в stderr, чтобы это не прошло незамеченным.
+
+    :returns: значение для свойства MacroExecutionMode или None
+    """
+    try:
+        return uno.getConstantByName("com.sun.star.document.MacroExecMode.NEVER_EXECUTE")
+    except Exception:  # noqa: BLE001 - способ может отсутствовать в этой сборке
+        pass
+
+    try:
+        # Биндинги генерируются из IDL, и в части сборок константа доступна
+        # только так — импортом сгенерированного модуля
+        from com.sun.star.document.MacroExecMode import NEVER_EXECUTE  # noqa: PLC0415
+
+        return NEVER_EXECUTE
+    except Exception as exc:  # noqa: BLE001 - старые сборки могут не иметь и его
+        print(f"[uno] MacroExecutionMode недоступен: {exc}", file=sys.stderr)
+        return None
+
+
 # ===========================================================================
 # Настройка документа
 # ===========================================================================
@@ -90,6 +135,10 @@ def apply_fit_to_page(doc) -> None:
     и по высоте лист должен уложиться в одну страницу. Настройка ставится
     всем страничным стилям, а не только `Default`: книга может использовать
     собственные стили, и тогда лист с другим стилем остался бы разорванным.
+
+    Применимо только к таблицам: `ScaleToPages*` — свойства страничного
+    стиля Calc, у документа Writer их нет, и «уместить весь документ
+    на одну страницу» его смыслом не является.
     """
     page_styles = doc.StyleFamilies.getByName("PageStyles")
 
@@ -160,10 +209,15 @@ def load_document(desktop, input_path: str, options: dict):
     load_props = [
         prop("Hidden", True),
         prop("ReadOnly", True),
-        # Внешние ссылки не обновляются: книга может ссылаться на файл
+        # Внешние ссылки не обновляются: документ может ссылаться на файл
         # в сети, и ожидание ответа съело бы весь бюджет задачи
         prop("UpdateLinks", 0),
     ]
+
+    macro_mode = macro_execution_mode()
+
+    if macro_mode is not None:
+        load_props.append(prop("MacroExecutionMode", macro_mode))
 
     password = options.get("documentPassword")
 
@@ -198,7 +252,15 @@ def count_pdf_pages(path: str) -> int:
 # Конвертация
 # ===========================================================================
 
-def convert(host: str, port: int, timeout: float, input_path: str, output_path: str, options: dict) -> dict:
+def convert(
+    host: str,
+    port: int,
+    timeout: float,
+    input_path: str,
+    output_path: str,
+    doc_format: str,
+    options: dict,
+) -> dict:
     """Выполняет конвертацию и возвращает результат.
 
     :param host: адрес UNO-бриджа
@@ -206,6 +268,7 @@ def convert(host: str, port: int, timeout: float, input_path: str, output_path: 
     :param timeout: таймаут подключения
     :param input_path: путь к исходному файлу
     :param output_path: путь для PDF
+    :param doc_format: формат исходного файла (xlsx или docx)
     :param options: параметры конвертации
     :returns: словарь с числом страниц и размером результата
     """
@@ -221,11 +284,11 @@ def convert(host: str, port: int, timeout: float, input_path: str, output_path: 
         if doc is None:
             raise RuntimeError("LibreOffice не смог открыть документ")
 
-        if options.get("fitToOnePage", True):
+        if doc_format == "xlsx" and options.get("fitToOnePage", True):
             apply_fit_to_page(doc)
 
         export_props = (
-            prop("FilterName", "calc_pdf_Export"),
+            prop("FilterName", EXPORT_FILTERS[doc_format]),
             prop("Overwrite", True),
             prop(
                 "FilterData",
@@ -252,9 +315,16 @@ def convert(host: str, port: int, timeout: float, input_path: str, output_path: 
 
 def main() -> int:
     """Точка входа скрипта."""
-    parser = argparse.ArgumentParser(description="Конвертация таблицы в PDF через UNO")
+    parser = argparse.ArgumentParser(description="Конвертация документа в PDF через UNO")
     parser.add_argument("--input", help="путь к исходному файлу")
     parser.add_argument("--output", help="путь для PDF")
+    parser.add_argument(
+        "--format",
+        dest="doc_format",
+        choices=sorted(EXPORT_FILTERS),
+        default="xlsx",
+        help="формат исходного файла",
+    )
     parser.add_argument("--options", default="{}", help="параметры конвертации в JSON")
     parser.add_argument("--ping", action="store_true", help="только проверить доступность бриджа")
     parser.add_argument("--host", default=os.environ.get("UNO_HOST", "127.0.0.1"))
@@ -289,7 +359,13 @@ def main() -> int:
 
     try:
         result = convert(
-            args.host, args.port, args.connect_timeout, args.input, args.output, options
+            args.host,
+            args.port,
+            args.connect_timeout,
+            args.input,
+            args.output,
+            args.doc_format,
+            options,
         )
         result["durationMs"] = int((time.monotonic() - started) * 1000)
         print(json.dumps(result))

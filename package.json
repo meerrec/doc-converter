@@ -1,7 +1,7 @@
 {
   "name": "doc-converter",
   "version": "1.0.0",
-  "description": "Сервис конвертации электронных таблиц XLSX → PDF через LibreOffice + UNO API",
+  "description": "Сервис конвертации документов XLSX и DOCX → PDF через LibreOffice + UNO API",
   "type": "module",
   "private": true,
   "scripts": {
@@ -24,6 +24,7 @@
     "libreoffice",
     "uno",
     "xlsx",
+    "docx",
     "pdf"
   ],
   "license": "MIT",

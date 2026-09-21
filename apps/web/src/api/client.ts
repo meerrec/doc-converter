@@ -9,7 +9,7 @@
  * - сквозной X-Request-Id для логов сервиса
  */
 
-import { apiErrorBodySchema } from '@doc-converter/contract';
+import { isApiErrorBody } from '@doc-converter/contract/errors';
 
 /**
  * Базовый адрес API.
@@ -26,7 +26,7 @@ const DEFAULT_TIMEOUT_MS = 15_000;
  * Таймаут отправки файла: тело может быть крупным, а сеть — медленной.
  *
  * Обоснование: постановка задачи включает проверку zip-контейнера и оценку
- * сложности книги, то есть сервер отвечает не мгновенно даже на быстрой сети.
+ * сложности документа, то есть сервер отвечает не мгновенно даже на быстрой сети.
  * Две минуты — тот же порядок, что и у `CONVERSION_TIMEOUT_MS` на сервере.
  */
 export const UPLOAD_TIMEOUT_MS = 120_000;
@@ -74,14 +74,14 @@ export interface RequestOptions<T> {
    */
   body?: FormData | Record<string, unknown>;
   /**
-   * Разбор успешного ответа схемой контракта.
+   * Проверка, что успешный ответ соответствует контракту.
    *
-   * Схема передаётся вызывающей стороной, а не импортируется здесь: у каждого
-   * маршрута она своя, а клиент остаётся общим. Исключение из `parse`
-   * превращается в ApiError с кодом `invalid_response` — иначе расхождение
-   * контракта и сервера проявилось бы как «поле undefined» где-то в разметке.
+   * Гард передаётся вызывающей стороной, а не импортируется здесь: у каждого
+   * маршрута он свой, а клиент остаётся общим. Неудача проверки превращается
+   * в ApiError с кодом `invalid_response` — иначе расхождение контракта
+   * и сервера проявилось бы как «поле undefined» где-то в разметке.
    */
-  parse: (value: unknown) => T;
+  guard: (value: unknown) => value is T;
   signal?: AbortSignal;
   timeoutMs?: number;
 }
@@ -116,7 +116,7 @@ export async function request<T>(path: string, options: RequestOptions<T>): Prom
   const {
     method = 'GET',
     body,
-    parse,
+    guard,
     signal,
     timeoutMs = DEFAULT_TIMEOUT_MS,
   } = options;
@@ -180,26 +180,25 @@ export async function request<T>(path: string, options: RequestOptions<T>): Prom
   }
 
   if (!response.ok) {
-    const errorBody = apiErrorBodySchema.safeParse(parsed);
+    // Тело ошибки тоже может не соответствовать контракту — так отвечает,
+    // например, прокси: у него тело HTML, и разобрать его нечем
+    const body = isApiErrorBody(parsed) ? parsed : undefined;
 
     throw new ApiError(
       response.status,
-      errorBody.success ? errorBody.data.error : 'unknown_error',
-      errorBody.success
-        ? errorBody.data.message
-        : `Сервер ответил ошибкой ${response.status}`,
-      errorBody.success ? errorBody.data.jobId : undefined,
-      errorBody.success ? errorBody.data.requestId : undefined,
+      body?.error ?? 'unknown_error',
+      body?.message ?? `Сервер ответил ошибкой ${response.status}`,
+      body?.jobId,
+      body?.requestId,
       parseRetryAfter(response)
     );
   }
 
-  try {
-    return parse(parsed);
-  } catch (err) {
-    // Подробности разбора (путь до поля, ожидаемый тип) полезны в консоли,
-    // а пользователю показывается общее сообщение из errors.ts
-    console.error('Ответ сервера не соответствует контракту', err);
+  if (!guard(parsed)) {
+    // Само тело полезно в консоли, а пользователю показывается общее
+    // сообщение из errors.ts — во втором случае он видит тело ответа
+    // целиком, поэтому в текст ошибки оно не попадает
+    console.error('Ответ сервера не соответствует контракту', parsed);
 
     throw new ApiError(
       response.status,
@@ -207,6 +206,8 @@ export async function request<T>(path: string, options: RequestOptions<T>): Prom
       'Ответ сервера не соответствует ожидаемому формату'
     );
   }
+
+  return parsed;
 }
 
 /**

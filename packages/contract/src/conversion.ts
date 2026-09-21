@@ -1,15 +1,20 @@
 /**
- * Контракт маршрутов конвертации XLSX → PDF.
+ * Контракт маршрутов конвертации в PDF: версии PDF и разбор ответов.
  *
- * `POST /convert/xlsx-to-pdf` принимает файл в multipart/form-data, поэтому
- * все необязательные параметры приходят строками. Схемы это учитывают:
- * булевы и числовые поля разбираются из строк явно, а не через `z.coerce`,
- * который превратил бы строку `"false"` в `true` (любая непустая строка
- * для него истинна).
+ * Zod-схем запроса и ответов здесь нет намеренно — они живут в `schemas.ts`
+ * вместе с остальными схемами контракта. Причина в том, что схемы нужны
+ * только серверу, а этот модуль импортирует веб-интерфейс: пока вызов
+ * `z.object({...})` стоял на верхнем уровне, сборщик оставлял его вместе
+ * с импортом валидатора, и весь zod попадал в клиентский бандл. Подробнее —
+ * в комментарии к `schemas.ts`.
+ *
+ * Гарды дублируют проверки схем: типы по-прежнему выводятся из схем,
+ * а за согласованностью следит `tests/contract-guards.test.js`.
  */
 
-import { z } from 'zod';
-import { COMPLEXITY_TIERS, JOB_STATUSES } from './jobs.js';
+import { isInputFormat } from './formats.js';
+import { isComplexityTier, isJobStatus } from './jobs.js';
+import type { ConvertAccepted, JobResult, JobStatusResponse } from './schemas.js';
 
 // ===========================================================================
 // Версии PDF
@@ -47,207 +52,92 @@ export const PDF_VERSION_CODES: Readonly<Record<PdfVersion, number>> = {
 };
 
 // ===========================================================================
-// Разбор полей multipart
+// Гарды ответов
 // ===========================================================================
 
 /**
- * Разбирает булево значение, пришедшее строкой.
+ * Проверяет, что значение — неотрицательное целое число.
  *
- * Понимает формы, которые встречаются в реальных запросах: `true/false`,
- * `1/0`, `yes/no`, `on/off`. Пустая строка считается `false`: браузерные
- * формы присылают её для снятого флажка.
+ * @param value - проверяемое значение
+ * @returns true, если значение является неотрицательным целым
  */
-export const booleanField = z
-  .union([z.boolean(), z.string()])
-  .transform((value, ctx) => {
-    if (typeof value === 'boolean') {
-      return value;
-    }
-
-    const normalized = value.trim().toLowerCase();
-
-    if (['true', '1', 'yes', 'on'].includes(normalized)) {
-      return true;
-    }
-
-    if (['false', '0', 'no', 'off', ''].includes(normalized)) {
-      return false;
-    }
-
-    ctx.addIssue({
-      code: 'custom',
-      message: `Ожидалось булево значение, получено «${value}»`,
-    });
-
-    return z.NEVER;
-  });
-
-/**
- * Разбирает целое число из строки.
- *
- * @param min - минимальное допустимое значение
- * @param max - максимальное допустимое значение
- */
-function integerField(min: number, max: number) {
-  return z
-    .union([z.number(), z.string()])
-    .transform((value, ctx) => {
-      const parsed = typeof value === 'number' ? value : Number(value.trim());
-
-      if (!Number.isInteger(parsed)) {
-        ctx.addIssue({ code: 'custom', message: `Ожидалось целое число, получено «${value}»` });
-        return z.NEVER;
-      }
-
-      if (parsed < min || parsed > max) {
-        ctx.addIssue({
-          code: 'custom',
-          message: `Значение должно быть в диапазоне ${min}–${max}, получено ${parsed}`,
-        });
-        return z.NEVER;
-      }
-
-      return parsed;
-    });
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
-// ===========================================================================
-// Параметры конвертации
-// ===========================================================================
+/**
+ * Проверяет, что значение — ссылка на готовый результат.
+ *
+ * @param value - проверяемое значение
+ * @returns true, если значение является ссылкой на результат
+ */
+function isJobResult(value: unknown): value is JobResult {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const result = value as Record<string, unknown>;
+
+  return (
+    typeof result['url'] === 'string' &&
+    typeof result['expiresAt'] === 'string' &&
+    isNonNegativeInteger(result['sizeBytes'])
+  );
+}
 
 /**
- * Параметры конвертации — то, что клиент может попросить у экспортёра PDF.
+ * Проверяет, что значение — ответ на постановку задачи.
  *
- * Все они необязательны: без них сервис отдаёт PDF с версией по умолчанию,
- * закладками и таблицей, умещённой на одну страницу.
+ * @param value - проверяемое значение
+ * @returns true, если значение является ответом на постановку задачи
  */
-export const conversionOptionsSchema = z.object({
-  /**
-   * Текст водяного знака. Пустая строка или отсутствие поля — без знака.
-   *
-   * Ограничение в 200 символов — от экспортёра: длинный текст он разбивает
-   * по странице целиком, и знак перестаёт читаться.
-   */
-  watermark: z.string().max(200, { message: 'invalid_watermark' }).optional(),
+export function isConvertAccepted(value: unknown): value is ConvertAccepted {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
 
-  /**
-   * Как наносить водяной знак: один по центру страницы или мозаикой.
-   *
-   * `single` соответствует FilterData `Watermark`, `tiled` — `TiledWatermark`.
-   */
-  watermarkMode: z.enum(['single', 'tiled']).default('single'),
+  const body = value as Record<string, unknown>;
 
-  /**
-   * Умещать содержимое листа на одну страницу.
-   *
-   * Реализуется через `ScaleToPagesX = ScaleToPagesY = 1` в страничном стиле:
-   * LibreOffice сам подбирает масштаб. Для очень больших таблиц это делает
-   * текст нечитаемым — параметр отключаемый.
-   */
-  fitToOnePage: booleanField.default(true),
+  return (
+    typeof body['jobId'] === 'string' &&
+    isJobStatus(body['status']) &&
+    isComplexityTier(body['tier']) &&
+    typeof body['queue'] === 'string' &&
+    isInputFormat(body['inputFormat']) &&
+    // У книги это число листов, у документа Word — всегда null
+    (body['sheets'] === null || isNonNegativeInteger(body['sheets'])) &&
+    isNonNegativeInteger(body['sizeBytes']) &&
+    typeof body['createdAt'] === 'string'
+  );
+}
 
-  /** Версия PDF (в том числе PDF/A). */
-  pdfVersion: z.enum(PDF_VERSIONS).default('default'),
+/**
+ * Проверяет, что значение — ответ о состоянии задачи.
+ *
+ * @param value - проверяемое значение
+ * @returns true, если значение является ответом о состоянии задачи
+ */
+export function isJobStatusResponse(value: unknown): value is JobStatusResponse {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
 
-  /**
-   * Качество JPEG-сжатия изображений, 1–100.
-   *
-   * Действует только при включённом сжатии изображений: без него экспортёр
-   * сохраняет изображения без потерь.
-   */
-  quality: integerField(1, 100).default(90),
+  const body = value as Record<string, unknown>;
+  const error = body['error'];
 
-  /** Пережимать изображения с понижением разрешения. */
-  reduceImageResolution: booleanField.default(true),
-
-  /**
-   * Предельное разрешение изображений в DPI, 50–1200.
-   *
-   * Значение выше исходного не увеличивает картинку: экспортёр только
-   * понижает разрешение.
-   */
-  maxImageResolution: integerField(50, 1200).default(300),
-
-  /** Экспортировать закладки по листам книги. */
-  exportBookmarks: booleanField.default(true),
-
-  /** Добавлять теги структуры (требуется для доступности PDF/A). */
-  taggedPdf: booleanField.default(false),
-
-  /** Пароль на открытие PDF. */
-  userPassword: z.string().max(128).optional(),
-
-  /** Пароль владельца — им снимаются ограничения на печать и изменение. */
-  ownerPassword: z.string().max(128).optional(),
-
-  /** Включить ограничения прав (печать, изменение, копирование). */
-  restrictPermissions: booleanField.default(false),
-
-  /** Разрешить печать при включённых ограничениях. */
-  allowPrinting: booleanField.default(true),
-
-  /** Разрешить изменение документа при включённых ограничениях. */
-  allowChanges: booleanField.default(false),
-});
-
-/** Параметры конвертации. */
-export type ConversionOptions = z.infer<typeof conversionOptionsSchema>;
-
-// ===========================================================================
-// Ответы
-// ===========================================================================
-
-/** Ответ на постановку задачи. */
-export const convertAcceptedSchema = z.object({
-  jobId: z.string(),
-  status: z.enum(JOB_STATUSES),
-  tier: z.enum(COMPLEXITY_TIERS),
-  /** Имя очереди, в которую попала задача — для диагностики. */
-  queue: z.string(),
-  /** Число листов книги, если его удалось определить. */
-  sheets: z.number().int().nonnegative().nullable(),
-  /** Размер принятого файла в байтах. */
-  sizeBytes: z.number().int().nonnegative(),
-  /** Время постановки в очередь (ISO 8601). */
-  createdAt: z.string(),
-});
-
-/** Ответ на постановку задачи. */
-export type ConvertAccepted = z.infer<typeof convertAcceptedSchema>;
-
-/** Ссылка на готовый результат. */
-export const jobResultSchema = z.object({
-  /** Presigned URL — ссылка живёт ограниченное время. */
-  url: z.string(),
-  /** Момент истечения ссылки (ISO 8601). */
-  expiresAt: z.string(),
-  /** Размер PDF в байтах. */
-  sizeBytes: z.number().int().nonnegative(),
-});
-
-/** Ссылка на готовый результат. */
-export type JobResult = z.infer<typeof jobResultSchema>;
-
-/** Ответ о состоянии задачи. */
-export const jobStatusResponseSchema = z.object({
-  jobId: z.string(),
-  status: z.enum(JOB_STATUSES),
-  tier: z.enum(COMPLEXITY_TIERS),
-  createdAt: z.string(),
-  /** Момент, когда воркер взял задачу. */
-  startedAt: z.string().optional(),
-  /** Момент завершения — успешного или нет. */
-  finishedAt: z.string().optional(),
-  /** Код и текст ошибки при `failed`. */
-  error: z
-    .object({
-      code: z.string(),
-      message: z.string(),
-    })
-    .optional(),
-  /** Ссылка на результат при `completed`. */
-  result: jobResultSchema.optional(),
-});
-
-/** Ответ о состоянии задачи. */
-export type JobStatusResponse = z.infer<typeof jobStatusResponseSchema>;
+  return (
+    typeof body['jobId'] === 'string' &&
+    isJobStatus(body['status']) &&
+    isComplexityTier(body['tier']) &&
+    (body['inputFormat'] === undefined || isInputFormat(body['inputFormat'])) &&
+    typeof body['createdAt'] === 'string' &&
+    (body['startedAt'] === undefined || typeof body['startedAt'] === 'string') &&
+    (body['finishedAt'] === undefined || typeof body['finishedAt'] === 'string') &&
+    (error === undefined ||
+      (typeof error === 'object' &&
+        error !== null &&
+        typeof (error as Record<string, unknown>)['code'] === 'string' &&
+        typeof (error as Record<string, unknown>)['message'] === 'string')) &&
+    (body['result'] === undefined || isJobResult(body['result']))
+  );
+}

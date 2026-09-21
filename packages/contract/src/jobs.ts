@@ -6,8 +6,6 @@
  * клиенту для диагностики («почему мой файл ждёт дольше остальных»).
  */
 
-import { z } from 'zod';
-
 /**
  * Состояния задачи.
  *
@@ -32,12 +30,6 @@ export const COMPLEXITY_TIERS = ['light', 'medium', 'heavy'] as const;
 
 /** Уровень сложности задачи. */
 export type ComplexityTier = (typeof COMPLEXITY_TIERS)[number];
-
-/** Схема уровня сложности — для разбора значений из очереди и статуса. */
-export const complexityTierSchema = z.enum(COMPLEXITY_TIERS);
-
-/** Схема состояния задачи. */
-export const jobStatusSchema = z.enum(JOB_STATUSES);
 
 /**
  * Проверяет, что значение — известный уровень сложности.

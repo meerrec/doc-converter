@@ -10,7 +10,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
-import { buildXlsx, buildZipBomb } from './helpers/xlsxFixtures.js';
+import { buildXlsx, buildDocx, buildPlainZip, buildZipBomb } from './helpers/ooxmlFixtures.js';
 
 // Окружение задаётся до импорта модулей: config читает его при загрузке
 process.env.PORT = '3212';
@@ -46,19 +46,19 @@ afterAll(async () => {
   }
 });
 
-describe('POST /convert/xlsx-to-pdf: обязательный файл', () => {
+describe('POST /convert/to-pdf: обязательный файл', () => {
   it('без файла отвечает 400 file_required', async () => {
-    const response = await request(app).post('/convert/xlsx-to-pdf').field('watermark', 'тест');
+    const response = await request(app).post('/convert/to-pdf').field('watermark', 'тест');
 
     expect(response.status).toBe(400);
     expect(response.body.error).toBe('file_required');
   });
 });
 
-describe('POST /convert/xlsx-to-pdf: параметры', () => {
+describe('POST /convert/to-pdf: параметры', () => {
   it('некорректное число в параметре отвечает 400', async () => {
     const response = await request(app)
-      .post('/convert/xlsx-to-pdf')
+      .post('/convert/to-pdf')
       .attach('file', Buffer.from('не таблица'), 'report.xlsx')
       .field('quality', '999');
 
@@ -71,7 +71,7 @@ describe('POST /convert/xlsx-to-pdf: параметры', () => {
 
   it('неизвестная версия PDF отвечает 400', async () => {
     const response = await request(app)
-      .post('/convert/xlsx-to-pdf')
+      .post('/convert/to-pdf')
       .attach('file', Buffer.from('не таблица'), 'report.xlsx')
       .field('pdfVersion', '2.0');
 
@@ -81,7 +81,7 @@ describe('POST /convert/xlsx-to-pdf: параметры', () => {
 
   it('слишком длинный водяной знак отвечает 400', async () => {
     const response = await request(app)
-      .post('/convert/xlsx-to-pdf')
+      .post('/convert/to-pdf')
       .attach('file', Buffer.from('не таблица'), 'report.xlsx')
       .field('watermark', 'я'.repeat(300));
 
@@ -90,10 +90,10 @@ describe('POST /convert/xlsx-to-pdf: параметры', () => {
   });
 });
 
-describe('POST /convert/xlsx-to-pdf: содержимое файла', () => {
+describe('POST /convert/to-pdf: содержимое файла', () => {
   it('текст с расширением .xlsx отвечает 415 magic_mismatch', async () => {
     const response = await request(app)
-      .post('/convert/xlsx-to-pdf')
+      .post('/convert/to-pdf')
       .attach('file', Buffer.from('это обычный текст, а не книга'), 'report.xlsx');
 
     expect(response.status).toBe(415);
@@ -108,8 +108,22 @@ describe('POST /convert/xlsx-to-pdf: содержимое файла', () => {
     ]);
 
     const response = await request(app)
-      .post('/convert/xlsx-to-pdf')
+      .post('/convert/to-pdf')
       .attach('file', ole, 'report.xls');
+
+    expect(response.status).toBe(415);
+    expect(response.body.error).toBe('unsupported_format');
+  });
+
+  it('старый формат .doc больше не принимается', async () => {
+    const ole = Buffer.concat([
+      Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+      Buffer.alloc(512, 0x00),
+    ]);
+
+    const response = await request(app)
+      .post('/convert/to-pdf')
+      .attach('file', ole, 'report.doc');
 
     expect(response.status).toBe(415);
     expect(response.body.error).toBe('unsupported_format');
@@ -122,7 +136,7 @@ describe('POST /convert/xlsx-to-pdf: содержимое файла', () => {
     ]);
 
     const response = await request(app)
-      .post('/convert/xlsx-to-pdf')
+      .post('/convert/to-pdf')
       .attach('file', ole, 'report.xlsx');
 
     expect(response.status).toBe(415);
@@ -134,8 +148,21 @@ describe('POST /convert/xlsx-to-pdf: содержимое файла', () => {
     const bomb = await buildZipBomb(200 * 1024 * 1024);
 
     const response = await request(app)
-      .post('/convert/xlsx-to-pdf')
+      .post('/convert/to-pdf')
       .attach('file', bomb, 'report.xlsx');
+
+    expect(response.status).toBe(422);
+    expect(response.body.error).toBe('content_validation_failed');
+  });
+
+  it('документ с макросами отсекается до конвертации', async () => {
+    // Проект VBA лежит отдельной частью пакета и по структуре контейнера
+    // неотличим от обычного документа: ловится только zip-гардом
+    const docx = await buildDocx({ withMacros: true });
+
+    const response = await request(app)
+      .post('/convert/to-pdf')
+      .attach('file', docx, 'report.docx');
 
     expect(response.status).toBe(422);
     expect(response.body.error).toBe('content_validation_failed');
@@ -147,7 +174,7 @@ describe('POST /convert/xlsx-to-pdf: содержимое файла', () => {
     const xlsx = await buildXlsx({ sheets: 1 });
 
     const response = await request(app)
-      .post('/convert/xlsx-to-pdf')
+      .post('/convert/to-pdf')
       .attach('file', xlsx, 'report');
 
     expect(response.status).toBe(503);
@@ -155,12 +182,69 @@ describe('POST /convert/xlsx-to-pdf: содержимое файла', () => {
   });
 });
 
-describe('POST /convert/xlsx-to-pdf: недоступное хранилище', () => {
+describe('POST /convert/to-pdf: различение форматов', () => {
+  it('документ Word принимается', async () => {
+    // Сигнатура у XLSX и DOCX одна и та же, поэтому проверяется именно
+    // разбор контейнера: без него документ ушёл бы в конвертацию как книга
+    const docx = await buildDocx({ pages: 3 });
+
+    const response = await request(app)
+      .post('/convert/to-pdf')
+      .attach('file', docx, 'report.docx');
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toBe('storage_unavailable');
+  });
+
+  it('документ Word под именем .xlsx отвечает 415 magic_mismatch', async () => {
+    const docx = await buildDocx({ pages: 3 });
+
+    const response = await request(app)
+      .post('/convert/to-pdf')
+      .attach('file', docx, 'report.xlsx');
+
+    expect(response.status).toBe(415);
+    expect(response.body.error).toBe('magic_mismatch');
+  });
+
+  it('книга Excel под именем .docx отвечает 415 magic_mismatch', async () => {
+    const xlsx = await buildXlsx({ sheets: 1 });
+
+    const response = await request(app)
+      .post('/convert/to-pdf')
+      .attach('file', xlsx, 'report.docx');
+
+    expect(response.status).toBe(415);
+    expect(response.body.error).toBe('magic_mismatch');
+  });
+
+  it('zip-архив, не являющийся документом OOXML, отвечает 415 unsupported_format', async () => {
+    const zip = await buildPlainZip();
+
+    const response = await request(app)
+      .post('/convert/to-pdf')
+      .attach('file', zip, 'report.docx');
+
+    expect(response.status).toBe(415);
+    expect(response.body.error).toBe('unsupported_format');
+  });
+
+  it('zip-архив без расширения отвечает 415 unsupported_format', async () => {
+    const zip = await buildPlainZip();
+
+    const response = await request(app).post('/convert/to-pdf').attach('file', zip, 'report');
+
+    expect(response.status).toBe(415);
+    expect(response.body.error).toBe('unsupported_format');
+  });
+});
+
+describe('POST /convert/to-pdf: недоступное хранилище', () => {
   it('отвечает 503, а не 500', async () => {
     const xlsx = await buildXlsx({ sheets: 1 });
 
     const response = await request(app)
-      .post('/convert/xlsx-to-pdf')
+      .post('/convert/to-pdf')
       .attach('file', xlsx, 'report.xlsx');
 
     // Отказ хранилища — состояние, которое клиент может пережить повтором,

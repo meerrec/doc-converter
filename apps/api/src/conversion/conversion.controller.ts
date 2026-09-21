@@ -1,9 +1,13 @@
 /**
- * Маршруты конвертации XLSX → PDF.
+ * Маршруты конвертации в PDF.
  *
- * `POST /convert/xlsx-to-pdf` принимает файл в multipart/form-data вместе
+ * `POST /convert/to-pdf` принимает файл в multipart/form-data вместе
  * с необязательными параметрами конвертации; `GET /convert/status/:id`
  * отдаёт состояние задачи и ссылку на готовый PDF.
+ *
+ * Маршрут один на оба входных формата: расширение из имени файла — подсказка,
+ * а не доказательство, и выбирать по нему способ конвертации значило бы
+ * доверять клиенту там, где содержимое можно проверить.
  *
  * Все комментарии на русском языке.
  */
@@ -25,7 +29,7 @@ import {
   type JobStatusResponse,
 } from '@doc-converter/contract';
 import { AppError } from '../common/app-error.js';
-import { XlsxService } from './xlsx.service.js';
+import { ConversionService } from './conversion.service.js';
 import { MAX_FILE_BYTES } from '@doc-converter/config';
 
 /** Шаблон идентификатора задачи: сервис выдаёт UUID v4. */
@@ -59,11 +63,11 @@ function parseOptions(body: unknown): ConversionOptions {
 
 /** Контроллер конвертации. */
 @Controller('convert')
-export class XlsxController {
+export class ConversionController {
   /**
-   * @param xlsxService - сервис конвертации
+   * @param conversionService - сервис конвертации
    */
-  constructor(private readonly xlsxService: XlsxService) {}
+  constructor(private readonly conversionService: ConversionService) {}
 
   /**
    * Принимает файл и ставит задачу на конвертацию.
@@ -72,7 +76,7 @@ export class XlsxController {
    * @param body - параметры конвертации
    * @returns идентификатор задачи и её характеристики
    */
-  @Post('xlsx-to-pdf')
+  @Post('to-pdf')
   @UseInterceptors(
     FileInterceptor('file', {
       limits: {
@@ -91,7 +95,9 @@ export class XlsxController {
 
     const options = parseOptions(body);
 
-    return this.xlsxService.submit(file.buffer, file.originalname ?? 'document.xlsx', options);
+    // Имя без расширения — не ошибка: формат определяется по содержимому,
+    // а расширение из имени нужно только для сверки с ним
+    return this.conversionService.submit(file.buffer, file.originalname ?? 'document', options);
   }
 
   /**
@@ -106,6 +112,6 @@ export class XlsxController {
       throw new AppError('invalid_request', 'Идентификатор задачи имеет неверный формат', 400);
     }
 
-    return this.xlsxService.getStatus(id);
+    return this.conversionService.getStatus(id);
   }
 }

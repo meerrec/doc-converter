@@ -5,14 +5,50 @@
 import { useCallback } from 'react';
 import { TaskRow } from './TaskRow';
 import { pluralize } from '../lib/format';
-import type { ConversionQueue } from '../hooks/useConversionQueue';
+import {
+  isWorkingStatus,
+  type ConversionQueue,
+  type QueueItem,
+} from '../hooks/useConversionQueue';
 
 interface TaskTableProps {
   queue: ConversionQueue;
 }
 
+/**
+ * Истёк ли срок действия ссылки на результат.
+ *
+ * @param item - задача очереди
+ * @param now - текущее время на момент последнего такта часов
+ * @returns true, если ссылка больше не действует
+ */
+function isResultExpired(item: QueueItem, now: number): boolean {
+  if (item.result === undefined) {
+    return false;
+  }
+
+  const expiresAt = Date.parse(item.result.expiresAt);
+
+  return Number.isFinite(expiresAt) && expiresAt <= now;
+}
+
+/**
+ * Сколько секунд идёт конвертация.
+ *
+ * @param item - задача очереди
+ * @param now - текущее время на момент последнего такта часов
+ * @returns число секунд или null, если задача не в работе
+ */
+function elapsedSeconds(item: QueueItem, now: number): number | null {
+  if (!isWorkingStatus(item.status) || item.submittedAt === undefined) {
+    return null;
+  }
+
+  return (now - item.submittedAt) / 1000;
+}
+
 export function TaskTable({ queue }: TaskTableProps) {
-  const { items, stats, retryItem, removeItem } = queue;
+  const { items, now, stats, retryItem, removeItem } = queue;
 
   // Зависимости — отдельные функции, а не объект queue: сам объект
   // создаётся заново на каждом рендере, и колбэки на его основе теряли бы
@@ -74,10 +110,18 @@ export function TaskTable({ queue }: TaskTableProps) {
           </tr>
         </thead>
         <tbody>
+          {/* Зависящие от времени значения считаются здесь, а не в строке:
+              время изменчиво, и чтение его внутри memo(TaskRow) либо лишило
+              бы memo смысла, либо заморозило бы счётчик. Наружу отдаются
+              производные — булев признак и число секунд, — поэтому строка
+              перерисовывается только когда меняется что-то у неё самой:
+              у готовых и отменённых задач эти пропсы стабильны. */}
           {items.map((item) => (
             <TaskRow
               key={item.id}
               item={item}
+              isExpired={isResultExpired(item, now)}
+              elapsedSeconds={elapsedSeconds(item, now)}
               onRetry={handleRetry}
               onRemove={handleRemove}
             />

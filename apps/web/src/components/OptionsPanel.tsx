@@ -1,5 +1,5 @@
 /**
- * Панель параметров конвертации XLSX → PDF.
+ * Панель параметров конвертации документов в PDF.
  *
  * Все поля управляемые: значения приходят из состояния приложения, где лежат
  * умолчания контракта (`DEFAULT_CONVERSION_OPTIONS`). Так форма показывает
@@ -11,7 +11,7 @@
  */
 
 import { memo, useId } from 'react';
-import { PDF_VERSIONS } from '@doc-converter/contract';
+import { PDF_VERSIONS } from '@doc-converter/contract/conversion';
 import type { ConversionOptions, PdfVersion } from '@doc-converter/contract';
 import { MAX_WATERMARK_LENGTH, PDF_VERSION_OPTIONS } from '../config';
 
@@ -236,8 +236,12 @@ export const OptionsPanel = memo(function OptionsPanel({
               onOptionsChange({ exportBookmarks: event.target.checked })
             }
           />
-          <label htmlFor={bookmarksId}>Закладки по листам книги</label>
+          <label htmlFor={bookmarksId}>Закладки</label>
         </div>
+
+        <p className="field__hint">
+          У книги — по листам, у документа Word — по заголовкам
+        </p>
 
         <div className="checkbox">
           <input
@@ -270,8 +274,9 @@ export const OptionsPanel = memo(function OptionsPanel({
         </div>
 
         <p className="field__hint">
-          LibreOffice сам подбирает масштаб. Для очень больших таблиц текст
-          становится нечитаемым — тогда снимайте флажок
+          Только для книг Excel: LibreOffice сам подбирает масштаб, а для очень
+          больших таблиц текст становится нечитаемым — тогда снимайте флажок.
+          На документы Word параметр не действует
         </p>
       </fieldset>
 

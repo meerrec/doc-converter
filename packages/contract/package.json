@@ -10,6 +10,26 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./formats": {
+      "types": "./dist/formats.d.ts",
+      "default": "./dist/formats.js"
+    },
+    "./jobs": {
+      "types": "./dist/jobs.d.ts",
+      "default": "./dist/jobs.js"
+    },
+    "./errors": {
+      "types": "./dist/errors.d.ts",
+      "default": "./dist/errors.js"
+    },
+    "./conversion": {
+      "types": "./dist/conversion.d.ts",
+      "default": "./dist/conversion.js"
+    },
+    "./health": {
+      "types": "./dist/health.d.ts",
+      "default": "./dist/health.js"
     }
   },
   "files": [

@@ -166,7 +166,7 @@ RUN rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-9
 # JRE этим флагом не отсекается: java-headless — жёсткая зависимость
 # libreoffice-core в EL9, и в образе оказывается java-17-openjdk-headless
 # (в Debian-варианте JRE не было). LibreOffice использует Java для Base,
-# XSLT-фильтров и части мастеров — для конвертации XLSX она не нужна,
+# XSLT-фильтров и части мастеров — для конвертации XLSX и DOCX она не нужна,
 # но и не мешает; удалять её с --nodeps значило бы ломать пакетную базу.
 # Список репозиториев задан явно, и в minimal это не подстраховка:
 # codeready-builder там включён (enabled=1), поэтому без --disablerepo пакет

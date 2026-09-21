@@ -1,5 +1,5 @@
 /**
- * Главный экран конвертера XLSX → PDF.
+ * Главный экран конвертера документов в PDF.
  *
  * Собирает зону выбора файлов, панель параметров и таблицу задач.
  * Все сетевые операции выполняет хук очереди — компонент отвечает
@@ -7,14 +7,15 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { healthResponseSchema } from '@doc-converter/contract';
+import { isHealthResponse } from '@doc-converter/contract/health';
 import type { ConversionOptions, HealthResponse } from '@doc-converter/contract';
 import { DropZone } from './components/DropZone';
 import { OptionsPanel } from './components/OptionsPanel';
 import { TaskTable } from './components/TaskTable';
-import { useConversionQueue } from './hooks/useConversionQueue';
+import { useConversionQueue, type RejectedFile } from './hooks/useConversionQueue';
 import { request } from './api/client';
-import { DEFAULT_CONVERSION_OPTIONS } from './config';
+import { DEFAULT_CONVERSION_OPTIONS, MAX_VISIBLE_REJECTIONS } from './config';
+import { pluralize } from './lib/format';
 
 /** Состояние доступности сервиса. */
 type HealthState =
@@ -24,7 +25,7 @@ type HealthState =
 
 export function App() {
   const [options, setOptions] = useState<ConversionOptions>(DEFAULT_CONVERSION_OPTIONS);
-  const [rejected, setRejected] = useState<string[]>([]);
+  const [rejected, setRejected] = useState<RejectedFile[]>([]);
   const [health, setHealth] = useState<HealthState>({ kind: 'checking' });
 
   const queue = useConversionQueue({ options });
@@ -35,7 +36,7 @@ export function App() {
 
     request<HealthResponse>('/health', {
       signal: controller.signal,
-      parse: (value) => healthResponseSchema.parse(value),
+      guard: isHealthResponse,
     })
       .then((data) => setHealth({ kind: 'ok', data }))
       .catch((error: unknown) => {
@@ -69,10 +70,10 @@ export function App() {
   return (
     <div className="page">
       <header className="page__header">
-        <h1 className="page__title">Конвертер Excel в PDF</h1>
+        <h1 className="page__title">Конвертер документов в PDF</h1>
         <p className="page__subtitle">
-          Книги XLSX превращаются в PDF средствами LibreOffice на сервере.
-          Файлы не покидают ваш контур.
+          Книги Excel и документы Word превращаются в PDF средствами
+          LibreOffice на сервере. Файлы не покидают ваш контур.
         </p>
 
         {health.kind === 'unavailable' ? (
@@ -95,9 +96,20 @@ export function App() {
 
           {rejected.length > 0 ? (
             <ul className="alert alert--warning" role="alert">
-              {rejected.map((message) => (
-                <li key={message}>{message}</li>
+              {rejected.slice(0, MAX_VISIBLE_REJECTIONS).map((entry) => (
+                <li key={entry.id}>{entry.message}</li>
               ))}
+
+              {rejected.length > MAX_VISIBLE_REJECTIONS ? (
+                <li>
+                  и ещё {rejected.length - MAX_VISIBLE_REJECTIONS}{' '}
+                  {pluralize(rejected.length - MAX_VISIBLE_REJECTIONS, [
+                    'файл',
+                    'файла',
+                    'файлов',
+                  ])}
+                </li>
+              ) : null}
             </ul>
           ) : null}
 

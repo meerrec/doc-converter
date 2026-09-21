@@ -1,5 +1,5 @@
 /**
- * Модуль конвертации XLSX → PDF.
+ * Модуль конвертации документов в PDF.
  *
  * Подключает контроллер и сервис конвертации. Зависимостей через DI нет:
  * очереди, хранилище и состояние задач — модульные синглтоны, которые
@@ -8,12 +8,12 @@
  */
 
 import { Module } from '@nestjs/common';
-import { XlsxController } from './xlsx.controller.js';
-import { XlsxService } from './xlsx.service.js';
+import { ConversionController } from './conversion.controller.js';
+import { ConversionService } from './conversion.service.js';
 
 /** Модуль конвертации. */
 @Module({
-  controllers: [XlsxController],
-  providers: [XlsxService],
+  controllers: [ConversionController],
+  providers: [ConversionService],
 })
-export class XlsxModule {}
+export class ConversionModule {}
