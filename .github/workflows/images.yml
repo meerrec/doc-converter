@@ -17,12 +17,13 @@
 # куда образы кладутся, — а проверка сборки полезна уже сейчас.
 #
 # Почему это отдельный workflow, а не job в ci.yml: сборка воркера тянет
-# LibreOffice Calc и занимает минуты, тогда как проверки кода — секунды.
+# LibreOffice и занимает минуты, тогда как проверки кода — секунды.
 # Разные по цене вещи не должны блокировать друг друга в одном прогоне.
 #
-# Образ воркера — самый тяжёлый (LibreOffice Calc, python3-uno и шрифты,
-# порядка 700 МБ), поэтому его слои кешируются в кеше GitHub Actions:
-# слой с apt-пакетами пересобирается только при правке Dockerfile.
+# Образ воркера — самый тяжёлый (LibreOffice Calc и Writer, libreoffice-pyuno
+# и шрифты, порядка 1,3 ГБ), поэтому его слои кешируются в кеше GitHub Actions:
+# слой с microdnf-пакетами пересобирается только при правке Dockerfile или
+# списка пакетов.
 # =============================================================================
 
 name: Образы
@@ -99,6 +100,7 @@ jobs:
         include:
           - image: api
             file: apps/api/Dockerfile
+            run_args: ''
             # Проверки выполняются внутри контейнера (см. шаг ниже), поэтому
             # пути — от корня образа, а не от рабочей копии.
             check: |
@@ -126,15 +128,31 @@ jobs:
               ! test -d /app/apps/api/src
           - image: web
             file: apps/web/Dockerfile
+            # nginx разбирает конфиг целиком, а в нём есть upstream `api`:
+            # это имя резолвится только в сети compose, и без записи в hosts
+            # `nginx -t` падает на нём. Для остальных образов запись не нужна
+            run_args: '--add-host api:127.0.0.1'
             check: |
               set -eu
 
               # Финальная стадия — nginx со статикой: собирается Vite,
               # и index.html здесь единственное доказательство, что сборка
-              # что-то произвела
-              test -f /usr/share/nginx/html/index.html
+              # что-то произвела. Каталог — из штатного конфига образа
+              # ubi9/nginx-126 (в Debian-варианте был /usr/share/nginx/html)
+              test -f /opt/app-root/src/index.html
+
+              # Сниппет сайта подключается в default-server штатного конфига,
+              # и пропажа файла из nginx.default.d не видна ни по index.html,
+              # ни по коду ответа: сайт молча отдал бы чужой конфиг.
+              # Эффективный конфиг показывает именно nginx -T
+              nginx -T 2>/dev/null | grep -q 'proxy_pass http://api:3000'
+
+              # Конфигурация разбирается целиком: дубль default-server или
+              # недоступный pid-файл иначе всплыли бы только при запуске
+              nginx -t 2>&1
           - image: uno-worker
             file: apps/worker/Dockerfile
+            run_args: ''
             check: |
               set -eu
 
@@ -147,7 +165,43 @@ jobs:
               test -f /app/docker/uno/uno_convert.py
               test -x /app/docker/uno/worker-entrypoint.sh
 
-              # В runtime нет ни компилятора, ни тестового фреймворка
+              # Оба движка конвертации: без calc не откроется книга, без
+              # writer — документ Word. microdnf поставит их и транзитивно, но
+              # список пакетов в Dockerfile читается глазами, и пропажу
+              # строки из него видно только здесь. Каталог — /usr/lib64:
+              # в EL9 библиотеки лежат там (в Debian-варианте был /usr/lib)
+              test -f /usr/lib64/libreoffice/program/libsclo.so
+              test -f /usr/lib64/libreoffice/program/libswlo.so
+              command -v soffice
+
+              # Связка UNO с системным python3 — то, ради чего репозиторий
+              # AlmaLinux вообще подключён: модуль uno ставится только под
+              # python3.9 (он же системный в UBI9) и импортируется напрямую
+              python3 -c 'import uno'
+
+              # Локаль: водяной знак и другие параметры приходят скрипту
+              # в argv, и без UTF-8 кириллица разбирается как ASCII
+              python3 -c 'import sys; assert sys.argv[1] == "тест", sys.argv' тест
+
+              # Шрифты Noto ставятся отдельно от LibreOffice: без них
+              # CJK-текст в документе отрисуется квадратами
+              fc-list | grep -qi 'Noto Sans CJK'
+
+              # Node в runtime — 24, и это не косметика: версия приходит
+              # из базового образа (nodejs-24-minimal), а не назначается
+              # в Dockerfile модулем, и обязана совпасть с engines.node
+              # и со стадиями сборки
+              node --version | grep -q '^v24\.'
+
+              # Компиляторов в runtime нет — этим и обоснован minimal-вариант
+              # вместо полного ubi9/nodejs-24 (см. шапку apps/worker/Dockerfile).
+              # Пропажа любой из этих проверок означает, что база сменилась
+              # на образ с инструментами сборки
+              ! command -v gcc
+              ! command -v make
+              ! command -v git
+
+              # Runtime без инструментов сборки
               ! ls /app/node_modules/.pnpm | grep -qE '^(typescript|vitest)@'
 
     steps:
@@ -183,5 +237,17 @@ jobs:
       # Проверка состава — из-за неё образ и загружается в демон. Отдельным
       # шагом, а не внутри сборки: по упавшему шагу должно быть сразу видно,
       # что сломалось — сам Dockerfile или то, что в него попало.
+      #
+      # run_args у образа web добавляет запись `api` в /etc/hosts: без неё
+      # nginx не разберёт собственный конфиг (см. комментарий в матрице).
+      #
+      # Текст проверки передаётся переменной окружения, а не подстановкой
+      # в командную строку: подставленный как есть, он разбирается оболочкой
+      # ещё раз, и собственные кавычки проверки при этом съедаются. Проверка
+      # локали в воркере ломалась ровно так — `"тест"` доезжало до Python
+      # без кавычек и падало с NameError. Переменная окружения — данные,
+      # а не код: до `sh -c` текст доходит байт в байт.
       - name: Проверить состав образа
-        run: docker run --rm --entrypoint sh "doc-converter-${{ matrix.image }}:ci" -c "${{ matrix.check }}"
+        env:
+          CHECK: ${{ matrix.check }}
+        run: docker run --rm ${{ matrix.run_args }} --entrypoint sh "doc-converter-${{ matrix.image }}:ci" -c "$CHECK"

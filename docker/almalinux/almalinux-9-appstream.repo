@@ -1,0 +1,30 @@
+# =============================================================================
+# AlmaLinux 9 AppStream — источник LibreOffice и шрифтов Noto для воркера.
+#
+# В репозиториях UBI9 пакетов libreoffice* нет вовсе: проверено по метаданным
+# baseos, appstream и codeready-builder — ни libreoffice-calc, ни writer,
+# ни pyuno там не публикуются. AlmaLinux 9 — пересборка того же RHEL 9,
+# поэтому её AppStream совместим с базой UBI9 и по ABI (glibc 2.34),
+# и по версии системного python: libreoffice-pyuno собран под python3.9,
+# который в UBI9 и есть системный python3. База образа при этом остаётся
+# UBI9 — добавляется репозиторий, а не вендор.
+#
+# BaseOS AlmaLinux намеренно не подключается: системные библиотеки берутся
+# из UBI9, иначе база образа де-факто стала бы AlmaLinux.
+#
+# Ключ лежит рядом, в RPM-GPG-KEY-AlmaLinux-9, и импортируется из файла:
+# скачивание ключа с того же хоста, что и пакеты, сделало бы проверку подписи
+# бессмысленной. Отпечаток сверен с опубликованным на almalinux.org:
+#   BF18 AC28 7617 8908 D6E7 1267 D36C B86C B86B 3716
+#
+# $releasever здесь подставить нельзя: в UBI он равен минорной версии (9.6),
+# и путь /almalinux/9.6/... не существует — проверено, отвечает 404.
+# baseurl, а не mirrorlist: сборка не должна зависеть от того, какое зеркало
+# выберет metalink.
+# =============================================================================
+[almalinux-9-appstream]
+name=AlmaLinux 9 AppStream
+baseurl=https://repo.almalinux.org/almalinux/9/AppStream/$basearch/os/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-9

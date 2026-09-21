@@ -252,7 +252,7 @@ services:
       - LOG_LEVEL=info
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    # Пользователь conv не входит в группу docker хоста: без этого
+    # Пользователь 1001 не входит в группу docker хоста: без этого
     # обращение к сокету отвергается по правам. GID задаётся в .env
     # (`DOCKER_GID`), потому что он платформенно-зависим
     # GID сокета зависит от платформы: на Linux это группа docker (обычно 998
@@ -351,26 +351,40 @@ services:
   # Valkey (Redis-совместимый)
   # ---------------------------------------------------------------------------
   valkey:
-    image: valkey/valkey:8.1
+    # Образ с quay.io: Docker Hub в целевых окружениях недоступен, а UBI-сборки
+    # Valkey не существует вовсе — в каталоге Red Hat её нет, в репозиториях UBI
+    # публикуется только redis. sclorg — образы Red Hat на quay.io.
+    #
+    # База — CentOS Stream 10, а не UBI: это единственный публичный вариант
+    # Valkey 8 у Red Hat. Тег c10s — поток сборок; если нужна побайтовая
+    # воспроизводимость, вместо него берётся тег-дата (например, 20260916).
+    image: quay.io/sclorg/valkey-8-c10s:c10s
     container_name: doc-converter-valkey
     restart: unless-stopped
     networks:
       - converter
     volumes:
-      - valkey-data:/data
+      # Каталог — объявленный в образе VOLUME: при создании пустого тома docker
+      # копирует туда каталог образа вместе с владельцем (1001), и AOF пишется
+      # без правки прав изнутри. Прежний том принадлежал root и здесь
+      # не подойдёт — порядок перехода описан в docs/deployment.md
+      - valkey-data:/var/lib/valkey/data
+    # Штатный entrypoint образа (run-valkey) заменён на сам сервер: он читает
+    # /etc/valkey/valkey.conf, и переданные флаги могли бы до сервера не дойти —
+    # а от --maxmemory-policy зависит, потеряются ли задачи BullMQ при
+    # заполнении памяти
+    entrypoint: ["valkey-server"]
     # Политика noeviction, а не вытеснение: потеря ключей BullMQ — это
     # молчаливая потеря задач. С noeviction Valkey вернёт ошибку на запись,
     # и API отдаст 503 — видимая деградация вместо OOM-kill, уносящего очередь.
     # --save "" отключает RDB-снимки: при включённом AOF они дублируют форк
     # и его COW-страницы.
-    command: ["valkey-server", "--appendonly", "yes", "--protected-mode", "no",
+    # --dir задан явно: без него AOF писался бы в текущий каталог образа,
+    # то есть мимо тома, и исчезал бы вместе с контейнером
+    command: ["--dir", "/var/lib/valkey/data",
+              "--appendonly", "yes", "--protected-mode", "no",
               "--maxmemory", "400mb", "--maxmemory-policy", "noeviction",
               "--maxmemory-clients", "64mb", "--save", ""]
-    cap_add:
-      - CHOWN
-      - SETUID
-      - SETGID
-      - DAC_OVERRIDE
     read_only: false
     tmpfs:
       - /tmp:size=100m,mode=1777
