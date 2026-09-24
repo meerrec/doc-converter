@@ -127,3 +127,7 @@ jobs:
           python3 -m py_compile docker/uno/uno_convert.py
           rm -rf docker/uno/__pycache__
           sh -n docker/uno/worker-entrypoint.sh
+          # Скрипт получения сборки LibreOffice для браузера запускается
+          # вручную перед сборкой образа web, и опечатка в нём всплыла бы
+          # только там. Синтаксис проверяется здесь, вместе с остальными.
+          sh -n apps/web/lowa/fetch.sh

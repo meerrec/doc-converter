@@ -1,0 +1,8 @@
+# Состав сборки LibreOffice для браузера (LOWA).
+# Источник: https://cdn.zetaoffice.net/zetaoffice_latest/
+# Получено: 2026-09-24T13:24:03Z
+# Обновление: apps/web/lowa/fetch.sh, затем проверить diff и закоммитить.
+5143e5354f470b87f86ba272bcfef857bd13e6f07b59666e48a7ccb89643cd77  soffice.js
+a11808aaba3c9a4412a865bde645247fd9d0b262b5baa0680a9fced29a8656e4  soffice.wasm
+9d3c1cf3c904ce570905052ba6844f3383fde93ad1267b65a3ae4b236db2fd05  soffice.data
+5d9d909d0b9b38443c0f19704032d0fc12d654f6c9c24c2c3b237739c4848ae3  soffice.data.js.metadata
