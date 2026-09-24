@@ -214,12 +214,16 @@ services:
   # ---------------------------------------------------------------------------
   # В Kubernetes эту роль играет KEDA (см. deploy/k8s/scaledobject-*.yaml),
   # и этот сервис там не нужен. В compose масштабировать сервис по метрике
-  # нечем, поэтому реплики создаются через Docker API.
+  # нечем, поэтому реплики создаются через API движка — Docker или Podman
+  # (API у них совместимый, см. apps/autoscaler/src/docker-client.ts).
   #
-  # ВНИМАНИЕ: монтирование docker.sock даёт контейнеру root-эквивалент
-  # на хосте — через API можно создать привилегированный контейнер
-  # с корневой ФС хоста. Это осознанная плата за автомасштабирование
-  # в compose; в K8s доступ к сокету не нужен вовсе.
+  # ВНИМАНИЕ: монтирование сокета даёт контейнеру root-эквивалент на хосте —
+  # через API можно создать привилегированный контейнер с корневой ФС хоста.
+  # Это осознанная плата за автомасштабирование в compose; в K8s доступ
+  # к сокету не нужен вовсе.
+  #
+  # Podman: путь к сокету и его права отличаются от Docker, подробности —
+  # в docs/deployment.md, раздел «Podman».
   autoscaler:
     build:
       context: .
@@ -238,6 +242,9 @@ services:
       - S3_ACCESS_KEY=minioadmin
       - S3_SECRET_KEY=minioadmin
       - S3_BUCKET=conversions
+      # Путь внутри контейнера: его читает клиент автоскейлера. Источник
+      # монтирования задаётся отдельно (DOCKER_SOCKET_SOURCE) — под Podman
+      # сокет лежит не там, где у Docker
       - DOCKER_SOCKET_PATH=/var/run/docker.sock
       # Образ и сеть, из которых поднимаются реплики
       - AUTOSCALER_WORKER_IMAGE=doc-converter-uno-worker:latest
@@ -251,13 +258,27 @@ services:
       - WORKER_MEMORY_LIMIT_MB=2048
       - LOG_LEVEL=info
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Source — путь к сокету на стороне движка, target — путь внутри
+      # контейнера, который читает DOCKER_SOCKET_PATH. У Docker на Linux
+      # они совпадают. У Podman сокет по умолчанию лежит в другом месте:
+      # /run/podman/podman.sock у rootful и /run/user/<uid>/podman/podman.sock
+      # у rootless, а под macOS путь вообще указывается такой, каким его
+      # видит движок внутри виртуальной машины. Свой путь — в .env
+      # (DOCKER_SOCKET_SOURCE); узнать его: podman info --format
+      # '{{.Host.RemoteSocket.Path}}' — но в source идёт **путь без схемы**:
+      # команда печатает unix:///…, а двоеточие в коротком синтаксисе
+      # разделяет source и target
+      - "${DOCKER_SOCKET_SOURCE:-/var/run/docker.sock}:/var/run/docker.sock"
     # Пользователь 1001 не входит в группу docker хоста: без этого
     # обращение к сокету отвергается по правам. GID задаётся в .env
     # (`DOCKER_GID`), потому что он платформенно-зависим
     # GID сокета зависит от платформы: на Linux это группа docker (обычно 998
     # или 999), на macOS в Docker Desktop сокет принадлежит root:root.
     # Значение задаётся в .env (см. .env.example)
+    #
+    # Под Podman переменная смысла не имеет: у rootless-сокета владелец —
+    # сам пользователь, и внутри контейнера ему соответствует uid/gid 0,
+    # которыми процесс и так обладает. Лишний gid безвреден
     group_add:
       - "${DOCKER_GID:-999}"
     read_only: true
@@ -267,6 +288,16 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+      # Podman с SELinux (в том числе внутри podman machine): сокет
+      # rootless-сервиса помечен user_tmp_t, а контейнеру достаётся
+      # container_t, которому запрещена запись в этот sock_file —
+      # connect() кончается EACCES, и автоскейлер уходит в цикл
+      # перезапусков. Именно эту комбинацию предписывает
+      # podman-system-service(1) для доступа к сокету API из контейнера;
+      # перемаркировка :z здесь не годится — она предназначена для данных,
+      # а не для системных файлов, и права connectto не даёт.
+      # Без SELinux (в том числе на Docker) опция не делает ничего
+      - label=disable
     pids_limit: 128
     mem_limit: 256m
     memswap_limit: 256m

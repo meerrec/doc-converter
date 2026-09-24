@@ -97,7 +97,9 @@ presigned URL включает хост: ссылка, подписанная д
 
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
-| `DOCKER_SOCKET_PATH` | `/var/run/docker.sock` | Сокет Docker API |
+| `DOCKER_SOCKET_PATH` | `/var/run/docker.sock` | Сокет API, к которому обращается автоскейлер (`unix:///…` тоже принимается) |
+| `DOCKER_SOCKET_SOURCE` | `/var/run/docker.sock` | Что монтируется в контейнер от движка; читает только compose |
+| `DOCKER_HOST` | — | Запасной источник пути к сокету, если `DOCKER_SOCKET_PATH` не задан (соглашение docker CLI) |
 | `AUTOSCALER_WORKER_IMAGE` | `doc-converter-uno-worker:latest` | Образ реплик |
 | `AUTOSCALER_NETWORK` | `doc-converter_converter` | Сеть, к которой подключаются реплики |
 | `AUTOSCALER_POLL_INTERVAL_MS` | 15000 | Период опроса очередей |
@@ -106,6 +108,14 @@ presigned URL включает хост: ссылка, подписанная д
 
 Профили по уровням (min/max/`jobsPerReplica`/cooldown) заданы в
 `SCALING_PROFILES` (`packages/config/src/index.ts`) — там же их обоснование.
+
+Движок на том конце сокета — Docker или Podman: API у них совместимый, и
+различаются только путь к сокету и политика SELinux. Что задать под Podman —
+в `docs/deployment.md`, раздел «Podman». Путь разбирает
+`resolveDockerSocketPath` (приоритет `DOCKER_SOCKET_PATH` → `DOCKER_HOST` →
+значение по умолчанию); схемы кроме `unix` отвергаются на старте — клиент
+автоскейлера умеет только unix-сокет, и подставлять вместо заданного адреса
+сокет по умолчанию было бы молчаливым расхождением.
 
 ## Проверки на старте
 

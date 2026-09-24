@@ -13,24 +13,111 @@ CLI-обёрток вида `soffice --convert-to` и без `unoconv`.
 
 ## Как это работает
 
-```
+```text
 POST /convert/to-pdf (multipart: файл + параметры)
    │
-   ├─ проверка расширения, сигнатуры и zip-контейнера
-   ├─ вид документа по содержимому zip: xl/workbook.xml или word/document.xml
-   ├─ оценка сложности: размер файла + листы книги или страницы документа
-   ├─ вход в MinIO: incoming/{jobId}.{xlsx|docx}
-   └─ задача в очередь light | medium | heavy → 202 { jobId, tier, queue }
-                                   │
-                    uno-worker-<tier> (BullMQ, concurrency: 1)
-                                   │
-                    python3 uno_convert.py ──UNO──> soffice --headless
-                        (calc_pdf_Export | writer_pdf_Export)
-                                   │
-                    результат в MinIO: results/{jobId}.pdf
-
-GET /convert/status/:id → queued | processing | completed | failed
-                          + presigned URL, когда готово
+   ├─ 1. ВАЛИДАЦИЯ
+   │    ├─ расширение → сигнатура (PK\x03\x04) → разбор zip
+   │    ├─ защита от zip-bomb: sum(uncompressed) / compressed < 100
+   │    └─ тип по содержимому: xl/workbook.xml | word/document.xml
+   │
+   ├─ 2. ОЦЕНКА СЛОЖНОСТИ (tier selection)
+   │    │
+   │    ├─ media_mb      = Σ размеров xl/media, word/media, ppt/media
+   │    ├─ page_count    = docProps/app.xml → <Pages>
+   │    ├─ sheet_count   = xl/workbook.xml → count(<sheet>)
+   │    ├─ xml_mb        = Σ uncompressed XML
+   │    ├─ flags          = external_links? ole_objects? webservice?
+   │    │
+   │    └─ score = 1.0·(media_mb/10)
+   │              + 0.5·(page_count/50)
+   │              + 0.3·(sheet_count/10)
+   │              + 0.2·(xml_mb/20)
+   │              + 1.0·external_links
+   │              + 0.5·ole_objects
+   │
+   │         score < 1.5   →  light
+   │    1.5 ≤ score < 4     →  medium
+   │         score ≥ 4     →  heavy
+   │
+   ├─ 3. ПОСТАНОВКА ЗАДАЧИ
+   │    ├─ MinIO: incoming/{jobId}.{xlsx|docx}
+   │    ├─ BullMQ job: { jobId, tier, score, filename }
+   │    │
+   │    └─ retry policy per tier:
+   │         light:  attempts=3, backoff=exp(3s,  jitter=0.3)
+   │         medium: attempts=2, backoff=exp(10s, jitter=0.2)
+   │         heavy:  attempts=1, backoff=exp(30s, jitter=0.1)
+   │
+   └─ 202 { jobId, tier, queue }
+        │
+        ▼
+┌──────────────────────────────────────────────────────────────┐
+│  uno-worker-<tier>   (BullMQ, concurrency: 1)                │
+│                                                              │
+│  ├─ cgroup v2 лимиты:                                        │
+│  │    light:  memory.max=512M,  cpu.max=100% (1 ядро)        │
+│  │    medium: memory.max=1.5G,  cpu.max=100%                 │
+│  │    heavy:  memory.max=3G,   cpu.max=100%                 │
+│  │                                                          │
+│  ├─ таймаут на soffice (kill по таймеру):                    │
+│  │    light: 120s   medium: 300s   heavy: 600s               │
+│  │                                                          │
+│  ├─ 4. ИЗОЛЯЦИЯ ПРОФИЛЯ                                      │
+│  │    -env:UserInstallation=file:///tmp/lo-{jobId}           │
+│  │    ├─ копия registrymodifications.xcu (таблица замен)     │
+│  │    └─ --norestore --nolockcheck --nodefault --nologo      │
+│  │       MacroSecurityLevel=3, без сети (--network=none)     │
+│  │                                                          │
+│  ├─ 5. КОНВЕРТАЦИЯ                                           │
+│  │    python3 uno_convert.py ──UNO──> soffice --headless     │
+│  │      │                                                    │
+│  │      ├─ calc_pdf_Export   (для xlsx)                       │
+│  │      └─ writer_pdf_Export (для docx)                       │
+│  │                                                          │
+│  │    ШРИФТЫ в образе:                                       │
+│  │      fonts-liberation, fonts-dejavu, fonts-noto,          │
+│  │      fonts-noto-cjk, fonts-noto-color-emoji,              │
+│  │      fonts-crosextra-carlito  ← Calibri                   │
+│  │      fonts-crosextra-caladea  ← Cambria                   │
+│  │      + fc-cache -f -v после установки                     │
+│  │      + таблица замен в registrymodifications.xcu          │
+│  │                                                          │
+│  └─ 6. РЕЗУЛЬТАТ / ОШИБКА                                    │
+│       ├─ успех → MinIO: results/{jobId}.pdf                  │
+│       │          job.status = completed                       │
+│       │          job.result  = { url, size, pages }           │
+│       │                                                       │
+│       ├─ recoverable error (OOM-137, timeout, SIGSEGV,        │
+│       │   MinIO-down)                                          │
+│       │     ├─ attemptsMade < attempts ?                      │
+│       │     │     → throw Error → BullMQ backoff retry        │
+│       │     └─ attemptsMade == attempts                       │
+│       │           → move to DLQ (removeOnFail: false)         │
+│       │             + alert: dlq_depth > 0                    │
+│       │                                                       │
+│       └─ unrecoverable error (битый zip, unsupported format,  │
+│           macro-blocked)                                       │
+│             → throw UnrecoverableError                        │
+│             → DLQ сразу, без ретраев                          │
+│                                                              │
+│  Логирование в job:                                          │
+│    { jobId, tier, error.code, error.message,                 │
+│      stderr[last 100 lines], attemptsMade, failedReason,     │
+│      incoming_url }                                          │
+└──────────────────────────────────────────────────────────────┘
+        │
+        ▼
+GET /convert/status/:id
+   ├─ queued
+   ├─ processing      (опц. progress 0..100)
+   ├─ completed       → + presigned URL (короткий TTL)
+   ├─ failed          → + error.code:
+   │                     UNSUPPORTED_FORMAT
+   │                     TOO_COMPLEX
+   │                     CONVERSION_FAILED
+   │                     OOM
+   └─ expired / cancelled
 ```
 
 Маршрут один на оба формата: расширение из имени файла — подсказка,
@@ -116,14 +203,14 @@ curl -s -o result.pdf "<url из ответа>"
 pdfinfo result.pdf | grep Pages    # таблица умещена на одну страницу
 # Водяной знак записан глифами CID-шрифта, текстовым поиском он не находится —
 # смотрите страницу визуально (или отрендерите в изображение)
-```
+```uml
 
 ### Параметры конвертации
 
 Все параметры необязательны и передаются полями формы (строками).
 
 | Параметр | Значения | По умолчанию | Что делает |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `watermark` | текст до 200 символов | — | Водяной знак на каждой странице |
 | `watermarkMode` | `single`, `tiled` | `single` | Один по центру или мозаикой |
 | `fitToOnePage` | `true`, `false` | `true` | Уместить лист на одну страницу (`ScaleToPagesX/Y = 1`); только для книг XLSX |
@@ -175,7 +262,7 @@ curl -s -X POST http://localhost:3000/convert/to-pdf | jq
 Word — число страниц (`docProps/app.xml`).
 
 | Очередь | Условие | Почему так |
-|---|---|---|
+| --- | --- | --- |
 | `light` | ≤ 2 МиБ **и** ≤ 3 листов **и** ≤ 5 страниц | Открытие документа занимает больше времени, чем сам экспорт |
 | `medium` | ≤ 20 МиБ **и** ≤ 20 листов **и** ≤ 30 страниц | Десятки секунд на конвертацию |
 | `heavy` | Всё остальное | Минуты; каждая задача занимает реплику целиком |
@@ -195,7 +282,7 @@ Word — число страниц (`docProps/app.xml`).
 это не параллелизм, а допустимая длина очереди ожидания.
 
 | Очередь | min | max | `listLength` | `cooldownPeriod` |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | light | 0 (KEDA) / 1 (compose) | 10 | 5 | 120 с |
 | medium | 1 | 6 | 2 | 300 с |
 | heavy | 1 | 3 | 1 | 600 с |
@@ -237,7 +324,9 @@ Word — число страниц (`docProps/app.xml`).
 ### В docker compose — сервис autoscaler
 
 В compose нет ничего, что умеет масштабировать сервис по внешней метрике,
-поэтому реплики создаются сервисом `autoscaler` через Docker API.
+поэтому реплики создаются сервисом `autoscaler` через API движка — Docker
+или Podman: API у них совместимый, различаются путь к сокету и политика
+SELinux.
 
 Autoscaler различает реплики по меткам:
 
@@ -255,9 +344,29 @@ Autoscaler различает реплики по меткам:
 (`CONVERSION_TIMEOUT_MS` зависит от уровня: 120 с для light и medium,
 300 с для heavy): иначе поведение зависело бы от того, кто поднял контейнер.
 
-> **Внимание.** Autoscaler монтирует `/var/run/docker.sock`, что даёт
-> контейнеру root-эквивалент на хосте. Это осознанная плата за
-> автомасштабирование в compose; в Kubernetes доступ к сокету не нужен.
+> **Внимание.** Autoscaler монтирует сокет движка, что даёт контейнеру
+> root-эквивалент на хосте. Это осознанная плата за автомасштабирование
+> в compose; в Kubernetes доступ к сокету не нужен.
+
+### Под Podman
+
+Стек работает и под Podman, но три вещи отличаются от Docker:
+
+- **Сокет лежит в другом месте.** В `.env` задаётся `DOCKER_SOCKET_SOURCE` —
+  путь, который монтируется в контейнер (`podman info --format
+  '{{.Host.RemoteSocket.Path}}'` его печатает, но без схемы `unix://`).
+  Внутри контейнера сокет оказывается по обычному `/var/run/docker.sock`,
+  и `DOCKER_SOCKET_PATH` менять не нужно.
+- **SELinux блокирует `connect()`.** Сокет помечен `user_tmp_t`, а контейнеру
+  достаётся `container_t`: запись в такой `sock_file` запрещена. Поэтому у
+  сервиса `autoscaler` стоит `label=disable` — ровно это предписывает
+  `podman-system-service(1)` для доступа к сокету API из контейнера.
+  Без SELinux опция не делает ничего.
+- **Памяти `podman machine` по умолчанию мало.** Реплике воркера нужно до
+  2 ГБ, а машина создаётся с ~2 ГиБ: не хватает в том числе на сборку образов
+  (`exit code 137`). Лечится `podman machine set --memory 8192`.
+
+Полный рецепт запуска — в `docs/deployment.md`, раздел «Podman».
 
 ## Разработка
 
@@ -308,7 +417,7 @@ npm run typecheck     # сборка + проверка типов во всех
 
 ## Структура
 
-```
+```text
 pnpm-workspace.yaml         состав workspace и каталог версий общих зависимостей
 tsconfig.base.json          общая для всех пакетов цель компиляции и строгость
 tsconfig.json               среда исполнения серверного кода (Node)
@@ -383,7 +492,7 @@ tests/                      Vitest: сложность, OOXML, zip-гард, с�
    формируются для `S3_PUBLIC_ENDPOINT` (по умолчанию `localhost:9000`):
    изнутри сети MinIO доступен как `minio:9000`, но браузер такого имени
    не знает. В K8s нужен ingress на MinIO или внешний S3.
-8. **Autoscaler требует доступа к Docker API.** Сокет даёт root-эквивалент
+8. **Autoscaler требует доступа к сокету движка.** Сокет даёт root-эквивалент
    на хосте — в K8s используйте KEDA и не монтируйте сокет.
 9. **Ключи BullMQ в Redis.** KEDA и autoscaler читают список
    `bull:<queue>:wait`; при смене `QUEUE_PREFIX` нужно поправить и манифесты

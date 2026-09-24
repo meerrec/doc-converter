@@ -322,8 +322,83 @@ export const WORKER_CONCURRENCY = 1;
 // Автомасштабирование (docker-compose)
 // ===========================================================================
 
-/** Путь к сокету Docker API. */
-export const DOCKER_SOCKET_PATH = process.env.DOCKER_SOCKET_PATH || '/var/run/docker.sock';
+/**
+ * Путь к сокету API по умолчанию.
+ *
+ * Docker на Linux. У Podman сокет лежит иначе: `/run/podman/podman.sock`
+ * у rootful и `/run/user/<uid>/podman/podman.sock` у rootless; в macOS
+ * с podman machine путь указывается такой, каким его видит движок внутри
+ * виртуальной машины (`podman info --format '{{.Host.RemoteSocket.Path}}'`).
+ */
+export const DEFAULT_DOCKER_SOCKET_PATH = '/var/run/docker.sock';
+
+/**
+ * Приводит значение переменной окружения к пути к unix-сокету.
+ *
+ * Принимает и голый путь, и URI: `podman info --format
+ * '{{.Host.RemoteSocket.Path}}'` печатает именно `unix:///…`, и значение
+ * из этой команды должно переноситься в `.env` без правки руками.
+ *
+ * @param value - значение переменной
+ * @param variable - её имя (для текста ошибки)
+ * @returns путь к сокету или null, если переменная не задана
+ * @throws {Error} - если схема не unix или в URI нет абсолютного пути
+ */
+function socketPathFrom(value: string | undefined, variable: string): string | null {
+  const raw = value?.trim();
+
+  if (!raw) {
+    return null;
+  }
+
+  const schemeEnd = raw.indexOf('://');
+
+  if (schemeEnd === -1) {
+    return raw;
+  }
+
+  const scheme = raw.slice(0, schemeEnd);
+  const path = raw.slice(schemeEnd + 3);
+
+  // Остальные схемы (tcp://, ssh://, npipe://) означают, что сокет не
+  // локальный: клиент автоскейлера умеет только unix-сокет, и работать
+  // «как будто ничего не задано» здесь хуже отказа — адрес в окружении
+  // и адрес, по которому идёт обращение, разошлись бы молча
+  if (scheme !== 'unix') {
+    throw new Error(
+      `${variable}=${raw}: поддерживается только unix-сокет — задайте путь или unix:///путь`
+    );
+  }
+
+  if (!path.startsWith('/')) {
+    throw new Error(`${variable}=${raw}: unix-сокет задаётся как unix:///абсолютный/путь`);
+  }
+
+  return path;
+}
+
+/**
+ * Определяет путь к сокету API по переменным окружения.
+ *
+ * Приоритет: `DOCKER_SOCKET_PATH` → `DOCKER_HOST` → значение по умолчанию.
+ * Первая переменная — своя и явная, вторая — соглашение Docker CLI и Podman,
+ * которое подставляют инструменты и документация обоих движков.
+ *
+ * Читается **по месту вызова**, а не при импорте модуля: `@doc-converter/config`
+ * импортируют и api, и воркер, которым сокет не нужен, а неподдерживаемая схема
+ * в их окружении не должна ронять процессы, к автоскейлеру не относящиеся.
+ *
+ * @param env - окружение (по умолчанию `process.env`)
+ * @returns путь к сокету
+ * @throws {Error} - если переменная задана с неподдерживаемой схемой
+ */
+export function resolveDockerSocketPath(env: NodeJS.ProcessEnv = process.env): string {
+  return (
+    socketPathFrom(env.DOCKER_SOCKET_PATH, 'DOCKER_SOCKET_PATH') ??
+    socketPathFrom(env.DOCKER_HOST, 'DOCKER_HOST') ??
+    DEFAULT_DOCKER_SOCKET_PATH
+  );
+}
 
 /** Образ, из которого поднимаются реплики воркеров. */
 export const AUTOSCALER_WORKER_IMAGE = process.env.AUTOSCALER_WORKER_IMAGE || 'doc-converter-uno-worker:latest';

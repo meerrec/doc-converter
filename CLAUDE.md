@@ -300,6 +300,10 @@ light/medium/heavy, `minReplicaCount` 0/1/1 (в KEDA), потолок огран
 - **Kubernetes** — `deploy/k8s/scaledobject-*.yaml`, масштабирование по длине
   списка BullMQ.
 - **docker compose** — сервис `autoscaler`: создаёт и удаляет контейнеры через
-  Docker API. Он никогда не трогает стартовые реплики compose (у них нет
+  API движка. Он никогда не трогает стартовые реплики compose (у них нет
   метки `doc-converter.managed`) — иначе `restart: unless-stopped` возвращал бы
   их обратно и autoscaler бесконечно боролся бы с compose.
+  Движок — Docker или Podman: API совместимый, а от Podman нужны
+  `security-opt label=disable` (иначе SELinux не даёт `connect()` к сокету),
+  путь к сокету в `DOCKER_SOCKET_SOURCE` и запас памяти у `podman machine`
+  (см. `docs/deployment.md`, раздел «Podman»).

@@ -3,7 +3,8 @@
 ## Требования
 
 - Docker 24+ и Docker Compose v2 (используются `mem_limit`, `group_add`,
-  якоря YAML)
+  якоря YAML). Вместо Docker подойдёт Podman — API у него совместимый,
+  отличия и настройка описаны в разделе «Podman»
 - Для автомасштабирования в compose — доступ к `/var/run/docker.sock`
   и GID его владельца в `.env`:
 
@@ -55,6 +56,58 @@ Debian-овских (`ubi9/nginx-126` — 495 МБ, `ubi9/nodejs-24-minimal` —
 
 Проверка: `curl -s localhost:3000/health | jq` → `{ "status": "ok", ... }`.
 
+## Podman
+
+Стек работает и под Podman: API у него совместимый с Docker, и автоскейлер
+обращается к нему тем же клиентом. Отличий три — путь к сокету, права на него
+и SELinux.
+
+```bash
+# Сокет API — включается один раз. loginctl нужен, чтобы сокет и его каталог
+# существовали без активной сессии пользователя
+systemctl --user enable --now podman.socket
+loginctl enable-linger "$USER"
+
+# Путь к сокету — в .env, значение без схемы unix://
+podman info --format '{{.Host.RemoteSocket.Path}}'
+# rootless: /run/user/1000/podman/podman.sock
+# rootful:  /run/podman/podman.sock
+
+# Запуск
+docker --context podman compose up --build     # либо: podman compose up --build
+```
+
+В `.env` путь задаётся переменной **`DOCKER_SOCKET_SOURCE`** — это то, что
+монтируется в контейнер автоскейлера; по умолчанию там `/var/run/docker.sock`,
+которого у Podman нет. Внутри контейнера сокет всегда оказывается по
+`/var/run/docker.sock`: оттуда его читает `DOCKER_SOCKET_PATH`, и эту
+переменную менять не нужно.
+
+`DOCKER_GID` под Podman не нужен: у rootless-сокета владелец — сам
+пользователь, и внутри контейнера ему соответствует gid 0, который у процесса
+и так есть. Лишний `group_add` безвреден.
+
+**SELinux.** На хостах с SELinux — в том числе внутри `podman machine` — сокет
+API помечен `user_tmp_t`, а контейнеру достаётся `container_t`, которому
+запрещена запись в такой `sock_file`: `connect()` завершается `EACCES`, и
+автоскейлер уходит в цикл перезапусков. Поэтому у сервиса `autoscaler` в
+`docker-compose.yml` стоит `label=disable` — ровно это предписывает
+`podman-system-service(1)` для доступа к сокету API из контейнера
+(перемаркировка `:z` для системных файлов не годится и права `connectto`
+не даёт). Ослабления здесь нет: доступ к сокету и без того равносилен
+root-правам на хосте, см. `docs/security.md`.
+
+**Ресурсы.** `podman machine` по умолчанию получает около 2 ГиБ памяти, а
+одной реплике воркера по `mem_limit` нужно до 2 ГБ. В такой машине не хватает
+не только на работу, но и на сборку образов: `pnpm ci` в стадии `builder`
+завершается `exit code 137` (OOM-kill). Перед запуском память стоит поднять:
+
+```bash
+podman machine stop
+podman machine set --memory 8192
+podman machine start
+```
+
 ## Ресурсы и память
 
 | Сервис | `mem_limit` | Почему |
@@ -87,7 +140,8 @@ Deployment'ы приложения. KEDA читает длину списка `b
 
 ### docker compose (autoscaler)
 
-Сервис `autoscaler` создаёт и удаляет контейнеры через Docker API:
+Сервис `autoscaler` создаёт и удаляет контейнеры через API движка — Docker
+или Podman (что настроить под Podman, см. раздел «Podman»):
 
 - стартовые реплики compose (без метки `doc-converter.managed`) только
   считаются — их удаление привело бы к борьбе с `restart: unless-stopped`;
@@ -95,7 +149,7 @@ Deployment'ы приложения. KEDA читает длину списка `b
   полностью;
 - шаг изменения не больше `AUTOSCALER_MAX_STEP` за цикл.
 
-> Autoscaler монтирует docker.sock, что равносильно root-правам на хосте.
+> Autoscaler монтирует сокет движка, что равносильно root-правам на хосте.
 > В продакшене за пределами compose используйте KEDA.
 
 ## Диагностика
@@ -109,7 +163,11 @@ Deployment'ы приложения. KEDA читает длину списка `b
 | `conversion_timeout` | Документ не уложился в `CONVERSION_TIMEOUT_MS`: проверьте размер, число листов или страниц и память реплики |
 | `conversion_failed` | Ошибка самого документа; текст от LibreOffice — в `message` статуса и в логах воркера |
 | Ссылка на результат не открывается | `S3_PUBLIC_ENDPOINT` не совпадает с адресом, доступным клиенту |
-| Контейнеры воркеров копятся | Autoscaler не может обратиться к Docker API: проверьте `DOCKER_GID` и `docker compose logs autoscaler` |
+| Контейнеры воркеров копятся | Autoscaler не может обратиться к API: проверьте `DOCKER_GID` (Docker) или `DOCKER_SOCKET_SOURCE` (Podman) и `docker compose logs autoscaler` |
+| Автоскейлер перезапускается, в логе `connect EACCES` | SELinux не даёт писать в сокет: проверьте `security_opt: label=disable` у сервиса `autoscaler` и `journalctl \| grep 'avc:.*sock_file'` на хосте движка |
+| Автоскейлер пишет `connect ENOENT` | Сокет не смонтирован или смонтирован не тот путь: `DOCKER_SOCKET_SOURCE` в `.env`, у Podman это не `/var/run/docker.sock` |
+| Сборка образа падает с `exit code 137` | Не хватило памяти движку: у `podman machine` поднять лимит (`podman machine set --memory 8192`), у Docker Desktop — лимит в настройках |
+| `mc: Unable to initialize new alias … lookup minio … no such host` | Разовый сбой разрешения имён в сети compose: бакет к этому моменту уже создан, помогает повторный `docker compose up minio-init` |
 | Реплики постоянно перезапускаются | Падает soffice: смотрите логи entrypoint, чаще всего это нехватка памяти в `/tmp` (tmpfs) |
 | Valkey в логах пишет `Permission denied`, задачи не сохраняются | Том принадлежит root: образ sclorg работает от UID 1001. Порядок перехода — в разделе «Обновление» |
 

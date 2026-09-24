@@ -6,6 +6,11 @@
  * KEDA, и autoscaler там не нужен — он существует потому, что в compose
  * нет ничего, что умело бы масштабировать сервис по внешней метрике.
  *
+ * Движок на том конце сокета — Docker или Podman: API у них совместимый,
+ * отличаются путь к сокету, права на него и политика SELinux. Что именно
+ * требует Podman — в `docker-compose.yml` (сервис autoscaler) и
+ * `docs/deployment.md`.
+ *
  * Все комментарии на русском языке.
  */
 
@@ -15,6 +20,7 @@ import {
   AUTOSCALER_MAX_STEP,
   AUTOSCALER_POLL_INTERVAL_MS,
   AUTOSCALER_WORKER_IMAGE,
+  resolveDockerSocketPath,
   SCALING_PROFILES,
 } from '@doc-converter/config';
 import { getQueue } from '@doc-converter/queue';
@@ -196,9 +202,19 @@ async function tick(): Promise<void> {
  * Запускает цикл масштабирования.
  */
 async function main(): Promise<void> {
-  if (!(await ping())) {
-    throw new Error('Docker API недоступен: проверьте монтирование /var/run/docker.sock');
+  // Путь нужен для строки в логе: он попадает и в отказ, но там его называет
+  // клиент — он один знает и путь, и код ошибки соединения
+  const socketPath = resolveDockerSocketPath();
+  const probe = await ping();
+
+  if (!probe.ok) {
+    throw new Error(
+      `${probe.reason ?? 'Docker API недоступен: нет ответа'}\n` +
+        'Сокет движка должен быть смонтирован в контейнер: docs/deployment.md'
+    );
   }
+
+  console.log(`[AUTOSCALER] Сокет ${socketPath}, движок ${probe.engine ?? 'не определён'}`);
 
   if (!(await imageExists(AUTOSCALER_WORKER_IMAGE))) {
     // Не ошибка: образ может появиться позже (идёт сборка). Но без него

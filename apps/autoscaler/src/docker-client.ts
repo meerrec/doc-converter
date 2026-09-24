@@ -11,6 +11,11 @@
  * того равносилен root-правам на хосте, и расширять его поверхность
  * без необходимости не следует.
  *
+ * Движок на том конце сокета не важен: Podman предоставляет совместимый API,
+ * и все запросы ниже он принимает (проверено на Podman 6.1.2 в режиме
+ * rootless). Отличается только путь к сокету и права на него — см.
+ * `resolveDockerSocketPath` и `docker-compose.yml`.
+ *
  * Все комментарии на русском языке.
  */
 
@@ -19,7 +24,7 @@ import {
   AUTOSCALER_NETWORK,
   AUTOSCALER_WORKER_IMAGE,
   DOCKER_API_TIMEOUT_MS,
-  DOCKER_SOCKET_PATH,
+  resolveDockerSocketPath,
   S3_ACCESS_KEY,
   S3_BUCKET,
   S3_ENDPOINT,
@@ -59,15 +64,57 @@ interface DockerResponse<T> {
   body: T | null;
   /** Текст тела, если JSON разобрать не удалось. */
   raw: string;
+  /** Заголовки ответа: из них берётся `Server` — признак движка. */
+  headers: http.IncomingHttpHeaders;
+}
+
+/** Результат проверки доступности API. */
+export interface PingResult {
+  /** true, если демон ответил на `/_ping` кодом 200. */
+  ok: boolean;
+  /**
+   * Признак движка из заголовка `Server`: `Docker/<версия>` у Docker,
+   * `Libpod/<версия>` у Podman. Может отсутствовать — тогда undefined.
+   */
+  engine?: string;
+  /** Готовое объяснение отказа для оператора. */
+  reason?: string;
 }
 
 /**
- * Выполняет запрос к Docker API.
+ * Поясняет код ошибки соединения.
+ *
+ * Код — единственное, что отличает причины друг от друга: у всех трёх
+ * отказ выглядит одинаково (`Docker API недоступен`), а чинятся они
+ * по-разному, и разбираться в этом приходится в момент, когда сервис уже
+ * не работает.
+ *
+ * @param code - код errno из ошибки соединения
+ * @returns подсказка или пустая строка
+ */
+function connectHint(code: string | undefined): string {
+  switch (code) {
+    case 'ENOENT':
+      return 'сокета нет по этому пути: проверьте монтирование и DOCKER_SOCKET_PATH';
+    case 'EACCES':
+      return (
+        'нет прав на сокет: под Docker это DOCKER_GID, под Podman с SELinux — ' +
+        'security_opt label=disable у сервиса autoscaler (см. docs/deployment.md)'
+      );
+    case 'ECONNREFUSED':
+      return 'по этому пути лежит не сокет API или служба не отвечает';
+    default:
+      return '';
+  }
+}
+
+/**
+ * Выполняет запрос к API движка.
  *
  * @param method - HTTP-метод
  * @param path - путь вида `/containers/json`
  * @param body - тело запроса (сериализуется в JSON)
- * @returns код ответа и тело
+ * @returns код ответа, тело и заголовки
  */
 function request<T>(
   method: string,
@@ -75,6 +122,11 @@ function request<T>(
   body?: unknown
 ): Promise<DockerResponse<T>> {
   return new Promise((resolve, reject) => {
+    // Путь к сокету читается на каждый запрос, а не при импорте модуля:
+    // ошибка в окружении (например, `tcp://` в DOCKER_HOST) тогда отклоняет
+    // промис, `ping()` её ловит, и `main()` печатает одну понятную строку
+    // вместо стека при загрузке модуля
+    const socketPath = resolveDockerSocketPath();
     const payload = body === undefined ? undefined : JSON.stringify(body);
     let settled = false;
 
@@ -94,7 +146,7 @@ function request<T>(
 
     const req = http.request(
       {
-        socketPath: DOCKER_SOCKET_PATH,
+        socketPath,
         method,
         path,
         // Таймаут на сокет: зависший демон не присылает ни ответа, ни ошибки,
@@ -129,7 +181,14 @@ function request<T>(
             // Docker отвечает текстом на часть ошибок, например на 404
           }
 
-          settle(() => resolve({ status: res.statusCode ?? 0, body: parsed, raw }));
+          settle(() =>
+            resolve({
+              status: res.statusCode ?? 0,
+              body: parsed,
+              raw,
+              headers: res.headers,
+            })
+          );
         });
       }
     );
@@ -147,7 +206,15 @@ function request<T>(
     });
 
     req.on('error', (err) => {
-      settle(() => reject(new Error(`Docker API недоступен (${DOCKER_SOCKET_PATH}): ${err.message}`)));
+      const hint = connectHint((err as NodeJS.ErrnoException).code);
+
+      settle(() =>
+        reject(
+          new Error(
+            `Docker API недоступен (${socketPath}): ${err.message}${hint ? ` — ${hint}` : ''}`
+          )
+        )
+      );
     });
 
     if (payload) {
@@ -159,16 +226,30 @@ function request<T>(
 }
 
 /**
- * Проверяет доступность Docker API.
+ * Проверяет доступность API движка.
  *
- * @returns true, если демон отвечает
+ * Ошибка не выбрасывается, а возвращается: решение о том, что с ней делать,
+ * принимает цикл масштабирования, а он печатает причину целиком.
+ *
+ * @returns признак доступности, движок и причину отказа
  */
-export async function ping(): Promise<boolean> {
+export async function ping(): Promise<PingResult> {
   try {
     const response = await request<unknown>('GET', '/_ping');
-    return response.status === 200;
-  } catch {
-    return false;
+    const server = response.headers.server;
+    const engine = Array.isArray(server) ? server[0] : server;
+
+    if (response.status !== 200) {
+      return {
+        ok: false,
+        engine,
+        reason: `Docker API ответил на /_ping кодом ${response.status}`,
+      };
+    }
+
+    return { ok: true, engine };
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message };
   }
 }
 
