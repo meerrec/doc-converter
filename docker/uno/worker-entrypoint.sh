@@ -25,6 +25,13 @@ WORKER_ENTRY="${WORKER_ENTRY:-/app/apps/worker/dist/index.js}"
 # растёт; 60 с — с запасом, и всё равно меньше таймаута healthcheck'а.
 READY_TIMEOUT_SEC="${UNO_READY_TIMEOUT_SEC:-60}"
 
+# Период опроса бриджа после запуска воркера. Сама проверка (`kill -0`)
+# бесплатна, пауза нужна лишь чтобы не крутить цикл на холостом ходу.
+# 2 с — это ещё и окно, в течение которого воркер может взять задачу
+# у мёртвого бриджа; задача не теряется, BullMQ вернёт её в очередь
+# по stalled-механизму.
+BRIDGE_WATCH_INTERVAL_SEC=2
+
 mkdir -p "$PROFILE_DIR"
 
 echo "[entrypoint] Запуск LibreOffice (порт UNO ${UNO_PORT})"
@@ -46,9 +53,17 @@ soffice \
 SOFFICE_PID=$!
 
 # Останавливает оба процесса: без явного kill soffice переживёт воркера
-# и контейнер будет ждать принудительного завершения по таймауту
+# и контейнер будет ждать принудительного завершения по таймауту.
+#
+# Наблюдатель снимается первым и SIGKILL'ом: мягкий сигнал он обработал бы
+# между итерациями, успел бы увидеть убитый ниже soffice и напечатать
+# «LibreOffice завершился» в лог штатной остановки. Завершать ему нечего —
+# ни файлов, ни соединений он не держит.
 shutdown() {
   echo "[entrypoint] Остановка"
+  if [ -n "${BRIDGE_WATCH_PID:-}" ]; then
+    kill -KILL "$BRIDGE_WATCH_PID" 2>/dev/null || true
+  fi
   kill -TERM "$SOFFICE_PID" 2>/dev/null || true
   if [ -n "${NODE_PID:-}" ]; then
     kill -TERM "$NODE_PID" 2>/dev/null || true
@@ -91,10 +106,41 @@ echo "[entrypoint] Бридж готов, запуск воркера"
 node "$WORKER_ENTRY" &
 NODE_PID=$!
 
+# Надзор за бриджем. Без него смерть soffice остаётся незамеченной: воркер
+# продолжает слушать очередь и валит каждую задачу с `uno_unavailable`,
+# пока реплику не перезапустят руками — а healthcheck, которым контейнер
+# помечается нездоровым, перезапуска не вызывает.
+#
+# Опрос, а не `wait`: подождать чужой процесс из подоболочки нельзя, тогда
+# как soffice — потомок этого же shell и `kill -0` видит его состояние.
+(
+  while kill -0 "$SOFFICE_PID" 2>/dev/null; do
+    sleep "$BRIDGE_WATCH_INTERVAL_SEC"
+  done
+
+  echo "[entrypoint] LibreOffice завершился — останавливаю воркер" >&2
+  kill -TERM "$NODE_PID" 2>/dev/null || true
+) &
+BRIDGE_WATCH_PID=$!
+
 # Ждём именно воркер: если он умрёт, контейнер должен перезапуститься
 # (restart: unless-stopped), а не висеть с живым, но бесполезным soffice
 wait "$NODE_PID"
 EXIT_CODE=$?
+
+# Наблюдатель больше не нужен, и снимается он SIGKILL'ом: мягкий сигнал
+# он обработал бы между итерациями — успел бы увидеть убитый ниже soffice
+# и напечатать в лог реакцию на событие, к которому отношения не имеет
+kill -KILL "$BRIDGE_WATCH_PID" 2>/dev/null || true
+
+# Код выхода решает entrypoint, а не воркер: остановленный наблюдателем
+# воркер завершает свой shutdown со статусом 0, и для `restart: unless-stopped`
+# это означало бы «всё в порядке». Мёртвый бридж — не порядок: реплика
+# в таком виде нерабочая, и контейнер обязан подняться заново.
+if ! kill -0 "$SOFFICE_PID" 2>/dev/null; then
+  echo "[entrypoint] Бридж мёртв — реплике нужен перезапуск" >&2
+  EXIT_CODE=1
+fi
 
 echo "[entrypoint] Воркер завершился с кодом ${EXIT_CODE}"
 kill -TERM "$SOFFICE_PID" 2>/dev/null || true
