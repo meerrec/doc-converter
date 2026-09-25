@@ -35,13 +35,28 @@ export default defineConfig({
      * намеренно читают исходники — так прогон остаётся быстрым и не зависит
      * от того, собирали ли проект перед ним.
      */
-    alias: {
-      '@doc-converter/config': src('./packages/config/src/index.ts'),
-      '@doc-converter/contract': src('./packages/contract/src/index.ts'),
-      '@doc-converter/observability': src('./packages/observability/src/index.ts'),
-      '@doc-converter/queue': src('./packages/queue/src/index.ts'),
-      '@doc-converter/storage': src('./packages/storage/src/index.ts'),
-    },
+    alias: [
+      /**
+       * Подпути контракта идут первыми и разбираются шаблоном.
+       *
+       * Замена по началу строки здесь не годится: `@doc-converter/contract`
+       * совпал бы и с `@doc-converter/contract/formats`, превратив путь
+       * в `.../src/index.ts/formats`. А подпути нужны — веб берёт значения
+       * из модулей без zod, и проверяемый в тестах код это делает тоже.
+       */
+      {
+        find: /^@doc-converter\/contract\/(.+)$/,
+        replacement: `${src('./packages/contract/src')}/$1.ts`,
+      },
+      { find: '@doc-converter/config', replacement: src('./packages/config/src/index.ts') },
+      { find: '@doc-converter/contract', replacement: src('./packages/contract/src/index.ts') },
+      {
+        find: '@doc-converter/observability',
+        replacement: src('./packages/observability/src/index.ts'),
+      },
+      { find: '@doc-converter/queue', replacement: src('./packages/queue/src/index.ts') },
+      { find: '@doc-converter/storage', replacement: src('./packages/storage/src/index.ts') },
+    ],
   },
 
   plugins: [

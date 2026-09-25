@@ -17,7 +17,12 @@
  * Все комментарии на русском языке.
  */
 
-import { PDF_VERSION_CODES, type ConversionOptions } from '@doc-converter/contract';
+// Значение импортируется подпутём, а не из корня пакета: корень
+// реэкспортирует `schemas.ts` вместе с zod, и импорт константы притащил бы
+// валидатор в бандл браузерного пути. Тип стирается при сборке, поэтому
+// ему корень не вредит.
+import { PDF_VERSION_CODES } from '@doc-converter/contract/conversion';
+import type { ConversionOptions } from '@doc-converter/contract';
 
 /** Один элемент FilterData: то, что экспортёр принимает парой имя-значение. */
 export interface FilterDataEntry {

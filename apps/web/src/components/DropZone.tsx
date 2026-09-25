@@ -15,17 +15,24 @@ interface DropZoneProps {
   onFiles: (files: File[]) => void;
   /** Блокирует выбор файлов (например, во время отправки). */
   disabled?: boolean;
+  /**
+   * Предельный размер файла в байтах.
+   *
+   * По умолчанию — серверный лимит: форма одна на два пути, но пределы у них
+   * разные. Браузерный путь ограничен памятью вкладки, а не репликой,
+   * и подставлять сюда серверное значение значило бы обещать больше, чем
+   * этот путь выдержит.
+   */
+  maxBytes?: number;
+  /** Расширения, которые принимаются (без точки). */
+  formats?: readonly string[];
 }
-
-/** Список расширений для атрибута accept. */
-const ACCEPT = INPUT_FORMATS.map((format) => `.${format}`).join(',');
-
-/** Те же форматы в подписи — чтобы список не разошёлся с атрибутом. */
-const FORMAT_LIST = INPUT_FORMATS.map((format) => format.toUpperCase()).join(' и ');
 
 export const DropZone = memo(function DropZone({
   onFiles,
   disabled = false,
+  maxBytes = MAX_UPLOAD_BYTES,
+  formats = INPUT_FORMATS,
 }: DropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
   const inputId = useId();
@@ -89,7 +96,9 @@ export const DropZone = memo(function DropZone({
     [onFiles]
   );
 
-  const maxSizeMb = Math.floor(MAX_UPLOAD_BYTES / (1024 * 1024));
+  const maxSizeMb = Math.floor(maxBytes / (1024 * 1024));
+  const accept = formats.map((format) => `.${format}`).join(',');
+  const formatList = formats.map((format) => format.toUpperCase()).join(' и ');
 
   return (
     <div
@@ -102,8 +111,7 @@ export const DropZone = memo(function DropZone({
         id={inputId}
         className="visually-hidden"
         type="file"
-        multiple
-        accept={ACCEPT}
+        accept={accept}
         onChange={handleChange}
         disabled={disabled}
         aria-describedby={hintId}
@@ -117,7 +125,7 @@ export const DropZone = memo(function DropZone({
       </label>
 
       <p className="dropzone__hint" id={hintId}>
-        Поддерживаются файлы {FORMAT_LIST}, каждый — до {maxSizeMb} МБ.
+        Поддерживаются файлы {formatList}, каждый — до {maxSizeMb} МБ.
         Результат конвертации — PDF.
       </p>
     </div>
