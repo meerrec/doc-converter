@@ -15,10 +15,10 @@
  * Все комментарии на русском языке.
  */
 
-import { Office, OfficeError } from './office';
-import { isBridgeRequest } from '../protocol';
-import type { BridgeRequest, BridgeResponse, LocalErrorCode } from '../protocol';
-import type { LowaModule, Zetajs } from '../types';
+import { Office, OfficeError } from './office.js';
+import { isBridgeRequest } from '../protocol.js';
+import type { BridgeRequest, BridgeResponse, LocalErrorCode } from '../protocol.js';
+import type { LowaModule, Zetajs } from '../types.js';
 
 /**
  * Признак исчерпания памяти в сообщении сборки.

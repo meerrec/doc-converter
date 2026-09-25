@@ -17,6 +17,7 @@
     "start:autoscaler": "pnpm --filter @doc-converter/autoscaler start",
     "dev:api": "NODE_ENV=development pnpm --filter @doc-converter/api start",
     "dev:worker": "NODE_ENV=development pnpm --filter @doc-converter/worker start",
+    "dev:web": "pnpm --filter @doc-converter/web dev",
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:worker\""
   },
   "keywords": [

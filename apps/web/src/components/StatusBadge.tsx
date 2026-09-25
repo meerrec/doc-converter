@@ -12,8 +12,13 @@ import type { QueueItemStatus } from '../hooks/useConversionQueue';
  * Тексты состояний.
  *
  * Серверных состояний ровно четыре (`queued`, `processing`, `completed`,
- * `failed`), остальные — локальные: файл ждёт отправки, отправляется
- * или его отправка отменена.
+ * `failed`), остальные — локальные: файл ждёт отправки, отправляется,
+ * его отправка отменена или его обрабатывает офис в браузере.
+ *
+ * У браузерного маршрута состояний четыре, а не одно: офис один и работает
+ * по очереди, поэтому «ждёт», «грузится сборка», «идёт экспорт» и «открывается
+ * предпросмотр» — это разные вещи с разным временем ожидания, и свести их
+ * к «Конвертация» значило бы скрыть от пользователя, чего он ждёт.
  */
 const STATUS_LABELS: Readonly<Record<QueueItemStatus, string>> = {
   pending: 'Ожидает отправки',
@@ -23,6 +28,10 @@ const STATUS_LABELS: Readonly<Record<QueueItemStatus, string>> = {
   completed: 'Готово',
   failed: 'Ошибка',
   cancelled: 'Отменена',
+  'browser-waiting': 'Ждёт офис',
+  'browser-loading': 'Загрузка офиса',
+  'browser-converting': 'Экспорт в браузере',
+  'browser-previewing': 'Предпросмотр',
 };
 
 interface StatusBadgeProps {

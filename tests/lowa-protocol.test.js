@@ -19,7 +19,7 @@ import {
   LOCAL_ERROR_CODES,
   isBridgeRequest,
   isBridgeResponse,
-} from '../apps/web/src/local/lowa/protocol.js';
+} from '../packages/office/src/protocol.js';
 
 describe('протокол браузерного офиса: ответы', () => {
   it('принимает сообщение о готовности', () => {

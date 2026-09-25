@@ -20,9 +20,17 @@ import {
   useRef,
   useState,
 } from 'react';
+import {
+  browserFormatOf,
+  createOfficeQueue,
+  describeError as describeOfficeError,
+  MAX_FILE_BYTES,
+  type OfficePhase,
+} from '@doc-converter/office';
 import { fetchStatus, submitConversion } from '../api/conversion';
 import { ApiError, downloadFromUrl } from '../api/client';
 import { describeError, describeJobError } from '../api/errors';
+import { openOffice } from '../office';
 import { createLimiter, type Limiter } from '../lib/limiter';
 import { detectInputFormat, stripExtension } from '../lib/format';
 import {
@@ -49,20 +57,53 @@ import type {
 const FORMAT_LIST = INPUT_FORMATS.map((format) => format.toUpperCase()).join(', ');
 
 /**
+ * Маршрут задачи: где конвертируется файл.
+ *
+ * Их два и они равноправны: серверный (очередь воркеров, файл уходит
+ * на сервер) и браузерный (сборка LibreOffice в этой вкладке, файл остаётся
+ * у пользователя). Строка помнит маршрут последнего запуска, чтобы «Повторить»
+ * не спрашивал заново.
+ */
+export type QueueRoute = 'server' | 'browser';
+
+/**
  * Состояние задачи в интерфейсе.
  *
  * Кроме серверных состояний (`queued`, `processing`, `completed`, `failed`)
- * есть локальные: файл ещё не отправлен, отправляется или отправка отменена.
+ * есть локальные: файл ещё не отправлен, отправляется или отправка отменена,
+ * а также состояния браузерного маршрута — офис один и выполняет задачи
+ * по очереди, поэтому их несколько: ожидание, загрузка сборки, экспорт,
+ * предпросмотр.
  */
 export type QueueItemStatus =
-  /** Файл добавлен, отправка ещё не начата. */
+  /** Файл добавлен, задача ещё не запущена. */
   | 'pending'
   /** Файл отправляется на сервер. */
   | 'submitting'
   /** Состояние с сервера. */
   | JobStatus
   /** Отправка прервана пользователем; на сервере задачи нет. */
-  | 'cancelled';
+  | 'cancelled'
+  /** Браузерный маршрут: задача ждёт своей очереди — офис занят. */
+  | 'browser-waiting'
+  /** Браузерный маршрут: скачивается и запускается сборка офиса. */
+  | 'browser-loading'
+  /** Браузерный маршрут: офис выгружает PDF. */
+  | 'browser-converting'
+  /** Браузерный маршрут: офис открывает документ для предпросмотра. */
+  | 'browser-previewing';
+
+/**
+ * Готовый результат.
+ *
+ * Размечен по маршруту, а не сведён к адресу: у серверного результата ссылка
+ * ведёт в хранилище и живёт час, у браузерного — это blob-адрес в памяти
+ * вкладки, который живёт до уборки строки. Показать срок годности у второго
+ * нельзя, а обещать его — значило бы врать.
+ */
+export type QueueResult =
+  | ({ readonly kind: 'server' } & JobResult)
+  | { readonly kind: 'browser'; readonly url: string; readonly sizeBytes: number };
 
 /** Задача в очереди. */
 export interface QueueItem {
@@ -83,10 +124,12 @@ export interface QueueItem {
   downloadName: string;
   size: number;
   status: QueueItemStatus;
+  /** Маршрут последнего запуска: по нему «Повторить» повторяет тот же путь. */
+  route?: QueueRoute;
   /** Когда задача была поставлена — для показа, сколько она идёт. */
   submittedAt?: number;
-  /** Ссылка на готовый PDF и срок её жизни. */
-  result?: JobResult;
+  /** Ссылка на готовый PDF и срок её жизни (у серверного маршрута). */
+  result?: QueueResult;
   errorText?: string;
 }
 
@@ -157,7 +200,25 @@ function reducer(state: QueueItem[], action: Action): QueueItem[] {
  * @returns true, если задача выполняется
  */
 export function isWorkingStatus(status: QueueItemStatus): boolean {
-  return status === 'submitting' || status === 'queued' || status === 'processing';
+  return (
+    status === 'submitting' ||
+    status === 'queued' ||
+    status === 'processing' ||
+    status === 'browser-waiting' ||
+    status === 'browser-loading' ||
+    status === 'browser-converting' ||
+    status === 'browser-previewing'
+  );
+}
+
+/**
+ * Состояния браузерного маршрута.
+ *
+ * @param status - состояние задачи
+ * @returns true, если задача выполняется офисом в браузере
+ */
+export function isBrowserStatus(status: QueueItemStatus): boolean {
+  return status.startsWith('browser-');
 }
 
 /**
@@ -191,6 +252,44 @@ function isPollable(item: QueueItem): boolean {
  */
 const MIN_TICK_DELAY_MS = 50;
 
+/**
+ * Какому состоянию строки отвечает фаза очереди офиса.
+ *
+ * Фазы приходят из движка и говорят о работе офиса, состояния — о строке
+ * таблицы. Соответствие записано таблицей, чтобы не разошлось в трёх местах.
+ */
+const PHASE_STATUS: Readonly<Record<OfficePhase, QueueItemStatus>> = {
+  waiting: 'browser-waiting',
+  'loading-office': 'browser-loading',
+  converting: 'browser-converting',
+  previewing: 'browser-previewing',
+};
+
+/**
+ * Освобождает память готового результата браузерного маршрута.
+ *
+ * Серверный результат — ссылка в хранилище, освобождать нечего; браузерный
+ * живёт в памяти вкладки, и без отзыва PDF оставался бы в ней до перезагрузки
+ * страницы, даже если строку давно убрали.
+ *
+ * @param result - результат задачи
+ */
+function revokeResult(result: QueueResult | undefined): void {
+  if (result?.kind === 'browser') {
+    URL.revokeObjectURL(result.url);
+  }
+}
+
+/**
+ * Читает файл в память.
+ *
+ * @param file - выбранный файл
+ * @returns содержимое
+ */
+async function readFileBytes(file: File): Promise<Uint8Array> {
+  return new Uint8Array(await file.arrayBuffer());
+}
+
 /** Параметры хука. */
 export interface UseConversionQueueOptions {
   /** Параметры конвертации, применяемые к новым задачам. */
@@ -207,13 +306,29 @@ export interface ConversionQueue {
    * считаются от него, а не от `Date.now()` в рендере.
    */
   now: number;
+  /**
+   * Документ, открытый в окне офиса (браузерный предпросмотр).
+   *
+   * `null` — окно пусто: документ ещё не открывали, офис закрыл его сам
+   * или закрыли мы.
+   */
+  preview: { itemId: string; sheets: number | null } | null;
   /** Добавляет файлы в очередь. Возвращает отклонённые файлы с причинами. */
   addFiles: (files: File[]) => RejectedFile[];
   removeItem: (id: string) => void;
   clearFinished: () => void;
   startAll: () => void;
   cancelAll: () => void;
+  /** Запускает задачу строки выбранным маршрутом. */
+  runItem: (id: string, route: QueueRoute) => void;
+  /** Повторяет задачу тем же маршрутом, которым её запускали. */
   retryItem: (id: string) => void;
+  /** Открывает документ в окне офиса. */
+  previewItem: (id: string) => void;
+  /** Снимает ожидающую задачу браузерного маршрута. */
+  cancelItem: (id: string) => void;
+  /** Закрывает документ в окне офиса. */
+  closePreview: () => void;
   downloadAll: () => void;
   stats: {
     total: number;
@@ -271,6 +386,78 @@ export function useConversionQueue({
   // значение нужно читать в момент вызова, а не в момент создания
   const limiterRef = useRef<Limiter | null>(null);
 
+  /**
+   * Документ, открытый в окне офиса.
+   *
+   * Состояние интерфейса, а не задачи: предпросмотр не конвертирует файл
+   * и не занимает маршрут строки — он лишь показывает документ в окне офиса.
+   * Пусто (`null`) означает, что документа нет: офис его ещё не открыл,
+   * закрыл сам (открыв на его месте другой) или закрыли мы.
+   */
+  const [preview, setPreview] = useState<{ itemId: string; sheets: number | null } | null>(null);
+
+  /**
+   * Очередь офиса: все обращения к сборке идут через неё.
+   *
+   * Создаётся инициализатором состояния, а не в теле рендера и не в `useMemo`:
+   * очередь хранит ожидающие задачи, а `useMemo` React вправе пересчитать,
+   * то есть задачи могли бы пропасть. Второй экземпляр очереди не появится
+   * и при двойном вызове инициализатора — React сохраняет первое значение.
+   */
+  const [officeQueue] = useState(() =>
+    createOfficeQueue({
+      open: openOffice,
+      events: {
+        onPhase: (itemId, phase) => {
+          dispatch({ type: 'patch', id: itemId, patch: { status: PHASE_STATUS[phase] } });
+        },
+
+        onDone: (itemId, outcome) => {
+          if (outcome.kind === 'previewed') {
+            setPreview({ itemId, sheets: outcome.sheets });
+            // Документ показан, но не конвертирован: задача снова ждёт запуска
+            dispatch({
+              type: 'patch',
+              id: itemId,
+              patch: { status: 'pending', sheets: outcome.sheets },
+            });
+            return;
+          }
+
+          dispatch({
+            type: 'patch',
+            id: itemId,
+            patch: {
+              status: 'completed',
+              result: {
+                kind: 'browser',
+                url: URL.createObjectURL(
+                  new Blob([outcome.bytes as Uint8Array<ArrayBuffer>], { type: 'application/pdf' })
+                ),
+                sizeBytes: outcome.bytes.byteLength,
+              },
+            },
+          });
+        },
+
+        onFailed: (itemId, error) => {
+          dispatch({
+            type: 'patch',
+            id: itemId,
+            patch: { status: 'failed', errorText: describeOfficeError(error) },
+          });
+        },
+
+        // Офис открывает документ по другому пути только тогда, когда прежний
+        // закрыт: показанного ранее файла в окне больше нет, и состояние
+        // предпросмотра обязано это отразить
+        onDocumentChanged: (itemId) => {
+          setPreview(itemId === null ? null : { itemId, sheets: null });
+        },
+      },
+    })
+  );
+
   // Таймеры отложенных скачиваний: их нужно снимать при размонтировании
   // и при повторном запуске, иначе клики по скрытым ссылкам продолжат
   // срабатывать после ухода со страницы.
@@ -317,6 +504,12 @@ export function useConversionQueue({
       }
 
       downloadTimers.clear();
+
+      // Готовые браузерные PDF лежат в памяти вкладки, и уход со страницы
+      // их не освобождает: адреса живут, пока их не отзовут
+      for (const item of itemsRef.current) {
+        revokeResult(item.result);
+      }
     };
   }, []);
 
@@ -426,6 +619,10 @@ export function useConversionQueue({
         continue;
       }
 
+      // Готовый PDF прежнего запуска освобождается: он мог остаться
+      // от браузерного маршрута, и серверная задача его заменит
+      revokeResult(item.result);
+
       const prepared: QueueItem = {
         ...item,
         options: settingsRef.current,
@@ -473,13 +670,55 @@ export function useConversionQueue({
    * при обычном запуске: пользователь видит панель и ожидает, что применится
    * именно она.
    */
-  const retryItem = useCallback(
-    (id: string) => {
+  const runItem = useCallback(
+    (id: string, route: QueueRoute) => {
       const item = itemsRef.current.find((entry) => entry.id === id);
 
-      if (!item) {
+      if (item === undefined) {
         return;
       }
+
+      if (route === 'browser') {
+        // Кнопки браузерного маршрута заблокированы для неподходящих файлов,
+        // так что сюда можно попасть только гонкой (файл заменили, пока
+        // строка стояла) — тогда просто отказываем
+        if (browserFormatOf(item.file.name) === null || item.file.size > MAX_FILE_BYTES) {
+          return;
+        }
+
+        // Прежний результат (если строка уже конвертировалась) освобождается
+        // до постановки новой задачи: два PDF одного файла в памяти вкладки
+        // не нужны никому
+        revokeResult(item.result);
+
+        dispatch({
+          type: 'patch',
+          id,
+          patch: {
+            route: 'browser',
+            status: 'browser-waiting',
+            result: undefined,
+            errorText: undefined,
+            jobId: undefined,
+            submittedAt: Date.now(),
+          },
+        });
+
+        officeQueue.enqueue({
+          kind: 'convert',
+          itemId: id,
+          fileName: item.file.name,
+          options: settingsRef.current,
+          readBytes: () => readFileBytes(item.file),
+        });
+
+        return;
+      }
+
+      // Результат прежнего запуска освобождается здесь, а не при получении
+      // нового: готовый PDF может остаться от браузерного маршрута, и без
+      // отзыва он жил бы в памяти вкладки до уборки строки
+      revokeResult(item.result);
 
       // Состояние сразу `submitting`, а не `pending`: задача уходит
       // в ограничитель этой же строкой, а `pending` оставил бы её видимой
@@ -488,6 +727,7 @@ export function useConversionQueue({
         ...item,
         options: settingsRef.current,
         downloadName: `${stripExtension(item.file.name)}.${RESULT_EXTENSION}`,
+        route: 'server',
         status: 'submitting',
         jobId: undefined,
         result: undefined,
@@ -501,6 +741,7 @@ export function useConversionQueue({
         patch: {
           options: restarted.options,
           downloadName: restarted.downloadName,
+          route: restarted.route,
           status: 'submitting',
           jobId: undefined,
           result: undefined,
@@ -514,8 +755,78 @@ export function useConversionQueue({
         .run((signal) => sendItem(restarted, signal))
         .catch(() => undefined);
     },
-    [sendItem, getLimiter]
+    [sendItem, getLimiter, officeQueue]
   );
+
+  /**
+   * Повторяет задачу тем маршрутом, которым её запускали.
+   *
+   * Маршрут берётся из строки, а не спрашивается заново: пользователь уже
+   * сделал выбор, и «Повторить» означает повторить, а не выбрать другое.
+   */
+  const retryItem = useCallback(
+    (id: string) => {
+      const item = itemsRef.current.find((entry) => entry.id === id);
+
+      runItem(id, item?.route ?? 'server');
+    },
+    [runItem]
+  );
+
+  /**
+   * Открывает документ в окне офиса.
+   *
+   * Задача встаёт в ту же очередь, что и конвертация: офис один и открывает
+   * не более одного документа, поэтому одновременный предпросмотр и экспорт
+   * невозможны физически. Статус строки при этом не меняется — предпросмотр
+   * не конвертирует файл, — а ход работы виден в панели предпросмотра.
+   *
+   * @param id - идентификатор задачи
+   */
+  const previewItem = useCallback(
+    (id: string) => {
+      const item = itemsRef.current.find((entry) => entry.id === id);
+
+      if (item === undefined) {
+        return;
+      }
+
+      if (browserFormatOf(item.file.name) === null || item.file.size > MAX_FILE_BYTES) {
+        return;
+      }
+
+      officeQueue.enqueue({
+        kind: 'preview',
+        itemId: id,
+        fileName: item.file.name,
+        readBytes: () => readFileBytes(item.file),
+      });
+    },
+    [officeQueue]
+  );
+
+  /**
+   * Снимает ожидающую задачу браузерного маршрута.
+   *
+   * Идущую операцию прервать нельзя: у моста нет отмены, и офис доведёт её
+   * до конца или до таймаута. Поэтому отменяются только ожидающие, а строка
+   * с идущей задачей остаётся рабочей.
+   *
+   * @param id - идентификатор задачи
+   */
+  const cancelItem = useCallback(
+    (id: string) => {
+      if (officeQueue.cancelPending(id) > 0) {
+        dispatch({ type: 'patch', id, patch: { status: 'cancelled' } });
+      }
+    },
+    [officeQueue]
+  );
+
+  /** Закрывает документ в окне офиса, освобождая память. */
+  const closePreview = useCallback(() => {
+    void officeQueue.closeDocument();
+  }, [officeQueue]);
 
   /**
    * Скачивает все готовые результаты по очереди.
@@ -523,6 +834,10 @@ export function useConversionQueue({
    * Одиночное скачивание идёт по обычной ссылке в строке задачи, а здесь
    * ссылки открываются программно — с паузой, потому что браузеры
    * ограничивают число одновременных загрузок.
+   *
+   * Результат бывает двух видов — ссылка в хранилище и blob в памяти вкладки,
+   * — и оба открываются одинаково: разница для пользователя только в сроке
+   * жизни, и о ней сказано в строке (см. TaskRow).
    */
   const downloadAll = useCallback(() => {
     // Повторное нажатие начинает batch заново, а не добавляет второй поверх
@@ -572,12 +887,23 @@ export function useConversionQueue({
    */
   const removeItem = useCallback(
     (id: string) => {
+      const item = itemsRef.current.find((entry) => entry.id === id);
+
       // Иначе клик по ссылке удалённой задачи всё равно сработает:
       // пользователь убрал строку, а файл скачается через долю секунды
       cancelDownload(id);
+
+      // Ожидающая задача офиса снимается вместе со строкой: иначе офис
+      // откроет файл, которого в списке уже нет
+      officeQueue.cancelPending(id);
+
+      // Адрес результата читается до удаления строки: после dispatch его
+      // взять будет неоткуда, и blob остался бы в памяти вкладки навсегда
+      revokeResult(item?.result);
+
       dispatch({ type: 'remove', id });
     },
-    [cancelDownload]
+    [cancelDownload, officeQueue]
   );
 
   /** Убирает завершённые задачи, отменяя их отложенные скачивания. */
@@ -585,6 +911,7 @@ export function useConversionQueue({
     for (const item of itemsRef.current) {
       if (isFinishedStatus(item.status)) {
         cancelDownload(item.id);
+        revokeResult(item.result);
       }
     }
 
@@ -634,6 +961,12 @@ export function useConversionQueue({
   // выражения.
   const hasActive = stats.pending > 0 || stats.active > 0;
 
+  // Признак «есть что опрашивать на сервере» — отдельно от «есть активные
+  // задачи»: браузерные задачи тоже активны, но у них нет `jobId`, и цикл
+  // опроса с ними только крутился бы вхолостую. Проверка идёт по списку
+  // с ранним выходом, поэтому второго прохода по всем задачам не выходит.
+  const hasPollable = useMemo(() => items.some(isPollable), [items]);
+
   // Такт часов.
   //
   // Строки таблицы показывают счётчик идущей задачи и следят за сроком ссылки
@@ -650,7 +983,10 @@ export function useConversionQueue({
     let nextAt: number | null = hasActive ? now + CLOCK_TICK_MS : null;
 
     for (const item of items) {
-      const expiresAt = item.result ? Date.parse(item.result.expiresAt) : Number.NaN;
+      // Срок есть только у серверной ссылки: браузерный результат живёт
+      // в памяти вкладки, и назначать ему срок было бы выдумкой
+      const expiresAt =
+        item.result?.kind === 'server' ? Date.parse(item.result.expiresAt) : Number.NaN;
 
       // Истёкшие ссылки пропускаются: иначе таймер перезаводился бы на то же
       // прошлое мгновение и цикл стал бы горячим
@@ -674,7 +1010,7 @@ export function useConversionQueue({
   }, [now, items, hasActive]);
 
   useEffect(() => {
-    if (!hasActive) {
+    if (!hasPollable) {
       return;
     }
 
@@ -729,7 +1065,9 @@ export function useConversionQueue({
           id: item.id,
           patch: {
             status: 'completed',
-            result: response.result,
+            // Разметка маршрута: у серверного результата ссылка в хранилище
+            // и срок её жизни, у браузерного — blob без срока
+            result: { kind: 'server', ...response.result },
             tier: response.tier,
           },
         });
@@ -905,27 +1243,35 @@ export function useConversionQueue({
     //
     // От этого зависит не только плавность: перезапуск эффекта обнуляет
     // deadlines, а в них лежит срок ожидания задачи (POLL_DEADLINE_MS).
-    // Инвариант, который делает перезапуск безопасным: опрашиваемые задачи
-    // (isPollable — есть jobId и статус queued|processing) всегда входят
-    // в число активных, поэтому момент, когда hasActive становится false, —
-    // это момент, когда опрашивать уже некого, и терять сроки не на чем.
-    // Обратный переход всегда связан с появлением новой задачи без jobId,
+    // Инвариант, который делает перезапуск безопасным: hasPollable — это
+    // ровно «есть задача с jobId в состоянии queued|processing». Переход
+    // его в false означает, что опрашивать некого, и терять сроки не на чем.
+    // Обратный переход всегда связан с появлением задачи с новым jobId,
     // и её дедлайн отсчитывается заново — как и задумано.
+    //
+    // Раньше здесь стоял hasActive («есть незавершённые задачи»), и с
+    // появлением браузерного маршрута он перестал годиться: браузерные задачи
+    // активны, но опрашивать по ним нечего, и цикл запускался бы вхолостую.
     //
     // Если однажды понадобится добавить items в зависимости, инвариант
     // придётся пересматривать: молчаливое отодвигание дедлайна превратит
     // защиту от вечного ожидания в её отсутствие.
-  }, [hasActive]);
+  }, [hasPollable]);
 
   return {
     items,
     now,
+    preview,
     addFiles,
     removeItem,
     clearFinished,
     startAll,
     cancelAll,
+    runItem,
     retryItem,
+    previewItem,
+    cancelItem,
+    closePreview,
     downloadAll,
     stats,
   };

@@ -19,10 +19,10 @@
  * Все комментарии на русском языке.
  */
 
-import { BOOT_TIMEOUT_MS } from './constants';
-import { LocalError, LocalSession } from './session';
-import { withTimeout } from './timeout';
-import type { LowaModule } from './types';
+import { BOOT_TIMEOUT_MS } from './constants.js';
+import { LocalError, LocalSession } from './session.js';
+import { withTimeout } from './timeout.js';
+import type { LowaModule } from './types.js';
 
 /** Что нужно знать обвязке для загрузки. */
 export interface BootOptions {

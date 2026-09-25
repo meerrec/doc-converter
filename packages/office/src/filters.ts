@@ -15,17 +15,27 @@
  * Все комментарии на русском языке.
  */
 
-/** Фильтры экспорта PDF по расширению файла. */
-export const EXPORT_FILTERS: Readonly<Record<string, string>> = {
+/**
+ * Фильтры экспорта PDF по расширению файла.
+ *
+ * Тип выведен из значений, а не задан словарём: из него получается `BrowserFormat`
+ * — объединение известных расширений. Это не украшение: путь файла в файловой
+ * системе сборки собирается из расширения (`paths.ts`), и тип гарантирует, что
+ * туда попадает известное значение, а не часть имени, придуманного пользователем.
+ */
+export const EXPORT_FILTERS = {
   xlsx: 'calc_pdf_Export',
   docx: 'writer_pdf_Export',
-};
+} as const;
 
-/** Расширения, которые принимает браузерный путь. */
-export const LOCAL_FORMATS = Object.keys(EXPORT_FILTERS);
+/** Формат документа, который принимает браузерный путь. */
+export type BrowserFormat = keyof typeof EXPORT_FILTERS;
+
+/** Форматы, которые принимает браузерный путь. */
+export const BROWSER_FORMATS = Object.keys(EXPORT_FILTERS) as readonly BrowserFormat[];
 
 /**
- * Определяет имя фильтра экспорта по имени файла.
+ * Определяет формат документа по имени файла.
  *
  * Вид документа здесь определяется по расширению, а не по содержимому, как
  * на сервере. Это не упрощение, а другое назначение: серверная проверка
@@ -34,10 +44,22 @@ export const LOCAL_FORMATS = Object.keys(EXPORT_FILTERS);
  * с понятным сообщением, а не к чужому коду на нашем сервере.
  *
  * @param name - имя файла
+ * @returns формат или null, если он не поддерживается
+ */
+export function browserFormatOf(name: string): BrowserFormat | null {
+  const extension = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
+
+  return Object.hasOwn(EXPORT_FILTERS, extension) ? (extension as BrowserFormat) : null;
+}
+
+/**
+ * Определяет имя фильтра экспорта по имени файла.
+ *
+ * @param name - имя файла
  * @returns имя фильтра или null, если формат не поддерживается
  */
 export function exportFilterFor(name: string): string | null {
-  const extension = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
+  const format = browserFormatOf(name);
 
-  return EXPORT_FILTERS[extension] ?? null;
+  return format === null ? null : EXPORT_FILTERS[format];
 }

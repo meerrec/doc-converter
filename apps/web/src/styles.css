@@ -262,6 +262,13 @@ select {
   border-color: transparent;
 }
 
+/* Второстепенное действие: заметно, но не спорит с главным на панели.
+   В строке задачи такими стали оба маршрута — выбор способа не должен
+   выглядеть как призыв к действию */
+.button--secondary {
+  background: color-mix(in srgb, var(--text-muted) 8%, transparent);
+}
+
 .button--ghost {
   background: none;
   border-color: transparent;
@@ -429,7 +436,11 @@ select {
 
 .badge--processing,
 .badge--queued,
-.badge--submitting {
+.badge--submitting,
+.badge--browser-waiting,
+.badge--browser-loading,
+.badge--browser-converting,
+.badge--browser-previewing {
   background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);
 }

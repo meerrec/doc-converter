@@ -16,13 +16,13 @@
  * Все комментарии на русском языке.
  */
 
-import type { FilterDataEntry } from '../filterData';
+import type { FilterDataEntry } from '../filterData.js';
 import type {
   ConvertRequest,
   LocalErrorCode,
   MemoryResult,
   PreviewResult,
-} from '../protocol';
+} from '../protocol.js';
 import type {
   LowaModule,
   PropertyValue,
@@ -33,7 +33,7 @@ import type {
   XStyleContainer,
   Zetajs,
   ZetajsCss,
-} from '../types';
+} from '../types.js';
 
 /**
  * Префиксы ресурсов интерфейса, которые скрываются в предпросмотре.

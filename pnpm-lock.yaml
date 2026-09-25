@@ -148,6 +148,9 @@ importers:
       '@doc-converter/contract':
         specifier: workspace:*
         version: link:../../packages/contract
+      '@doc-converter/office':
+        specifier: workspace:*
+        version: link:../../packages/office
       react:
         specifier: ^19.3.0
         version: 19.3.0
@@ -220,6 +223,16 @@ importers:
       pino:
         specifier: ^8.17.2
         version: 8.21.0
+    devDependencies:
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+
+  packages/office:
+    dependencies:
+      '@doc-converter/contract':
+        specifier: workspace:*
+        version: link:../contract
     devDependencies:
       typescript:
         specifier: 'catalog:'

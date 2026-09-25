@@ -1,7 +1,12 @@
 /**
  * Главный экран конвертера документов в PDF.
  *
- * Собирает зону выбора файлов, панель параметров и таблицу задач.
+ * Файлы выбираются один раз, а способ конвертации выбирается для каждого
+ * файла отдельно — кнопкой в его строке. Маршрутов два: серверный (очередь
+ * воркеров, файл уходит на сервер) и браузерный (сборка LibreOffice в этой
+ * вкладке, файл не покидает компьютер). Плюс предпросмотр, который показывает
+ * документ в окне офиса и маршрута не занимает: он не конвертирует файл.
+ *
  * Все сетевые операции выполняет хук очереди — компонент отвечает
  * только за ввод и отображение.
  */
@@ -10,9 +15,13 @@ import { useCallback, useEffect, useState } from 'react';
 import { isHealthResponse } from '@doc-converter/contract/health';
 import type { ConversionOptions, HealthResponse } from '@doc-converter/contract';
 import { DropZone } from './components/DropZone';
+import { OfficePanel } from './components/OfficePanel';
 import { OptionsPanel } from './components/OptionsPanel';
+import { PreviewPanel } from './components/PreviewPanel';
 import { TaskTable } from './components/TaskTable';
 import { useConversionQueue, type RejectedFile } from './hooks/useConversionQueue';
+import { useOfficeState } from './hooks/useOfficeState';
+import { openOffice } from './office';
 import { request } from './api/client';
 import { DEFAULT_CONVERSION_OPTIONS, MAX_VISIBLE_REJECTIONS } from './config';
 import { pluralize } from './lib/format';
@@ -29,7 +38,8 @@ export function App() {
   const [health, setHealth] = useState<HealthState>({ kind: 'checking' });
 
   const queue = useConversionQueue({ options });
-  const { addFiles, startAll, cancelAll, stats } = queue;
+  const { addFiles, startAll, cancelAll, stats, preview } = queue;
+  const office = useOfficeState();
 
   useEffect(() => {
     const controller = new AbortController();
@@ -64,16 +74,33 @@ export function App() {
     setOptions((current) => ({ ...current, ...patch }));
   }, []);
 
+  /**
+   * Загружает офис по кнопке.
+   *
+   * Провал не пробрасывается: он терминален и уже записан в состоянии офиса,
+   * откуда его показывает панель. Необработанный отказ здесь попал бы
+   * в консоль и в сборщик ошибок как «что-то сломалось», ничего не добавив.
+   */
+  const handleLoadOffice = useCallback(() => {
+    void openOffice().catch(() => undefined);
+  }, []);
+
   const isBusy = stats.pending > 0 || stats.active > 0;
   const storageDown = health.kind === 'ok' && !health.data.storage;
+
+  // Имя файла для подписи в панели предпросмотра: состояние предпросмотра
+  // хранит идентификатор строки, а показывать нужно имя
+  const previewed =
+    preview === null ? null : (queue.items.find((item) => item.id === preview.itemId) ?? null);
 
   return (
     <div className="page">
       <header className="page__header">
         <h1 className="page__title">Конвертер документов в PDF</h1>
         <p className="page__subtitle">
-          Книги Excel и документы Word превращаются в PDF средствами
-          LibreOffice на сервере. Файлы не покидают ваш контур.
+          Книги Excel и документы Word превращаются в PDF средствами LibreOffice. На сервере —
+          очередью воркеров, в браузере — в этой вкладке, без отправки файла. Предпросмотр
+          показывает документ до конвертации.
         </p>
 
         {health.kind === 'unavailable' ? (
@@ -125,7 +152,7 @@ export function App() {
               onClick={startAll}
               disabled={stats.pending === 0}
             >
-              Конвертировать
+              Конвертировать все на сервере
               {stats.pending > 0 ? ` (${stats.pending})` : ''}
             </button>
 
@@ -145,19 +172,20 @@ export function App() {
           </p>
         </div>
 
-        <TaskTable queue={queue} />
+        <OfficePanel state={office} onLoad={handleLoadOffice} />
+
+        <PreviewPanel
+          fileName={previewed?.file.name ?? null}
+          sheets={preview?.sheets ?? null}
+          busy={office.kind === 'loading'}
+          onClose={queue.closePreview}
+        />
+
+        <TaskTable queue={queue} officeFailed={office.kind === 'failed'} />
       </main>
 
       <footer className="page__footer">
         {health.kind === 'ok' ? <>Версия сервиса: {health.data.version}. </> : null}
-
-        {/* Ссылка ведёт на отдельный документ, а не на раздел интерфейса:
-            там работают заголовки изоляции, которых у этой страницы нет.
-            `noopener` — потому что COOP той страницы всё равно обнулит
-            `opener`; явный атрибут избавляет от лишнего окна-посредника */}
-        <a href="/local/" target="_blank" rel="noopener">
-          Конвертировать в браузере, не отправляя файл на сервер
-        </a>
       </footer>
     </div>
   );

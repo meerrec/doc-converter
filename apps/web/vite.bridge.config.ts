@@ -1,4 +1,17 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
+
+/**
+ * Вход моста.
+ *
+ * Абсолютный путь, а не `../../packages/...`: Vite отсчитывает относительные
+ * пути от рабочего каталога процесса, а он зависит от того, откуда запущена
+ * сборка. Исходник моста лежит в пакете движка (`@doc-converter/office`),
+ * а собирает его приложение — пакет о сборке не знает.
+ */
+const BRIDGE_ENTRY = fileURLToPath(
+  new URL('../../packages/office/src/bridge/entry.ts', import.meta.url)
+);
 
 /**
  * Сборка моста — скрипта, который сборка LibreOffice исполняет в своём воркере.
@@ -11,17 +24,24 @@ import { defineConfig } from 'vite';
  * - **место**. Мост не является частью интерфейса и не должен попадать
  *   в `dist/assets`: там его подхватил бы SPA-fallback, а потолок размера
  *   бандла в CI считает файлы по маске — второй скрипт сломал бы подсчёт.
+ *   Поэтому он ложится в корень `dist`, откуда его отдаёт локация
+ *   `= /bridge.js` в `nginx.conf`, и `publicDir` выключен: публичные файлы
+ *   копирует основная сборка, и вторая копия здесь была бы лишней.
  *
- * Каталог `dist/local` в основную сборку не входит: `vite build` чистит
- * `dist` перед сборкой, поэтому мост собирается **после** приложения
- * (см. скрипт `build` в `package.json`).
+ * `emptyOutDir: false` — потому что `vite build` чистит `dist` перед сборкой,
+ * а мост собирается **после** приложения (см. скрипт `build` в `package.json`):
+ * с очисткой он снёс бы уже собранную страницу.
  */
 export default defineConfig({
+  // Публичные файлы (`public/uno/runtime.js`) копирует основная сборка:
+  // мост — отдельный скрипт, и второй копии тех же файлов здесь не нужно
+  publicDir: false,
+
   build: {
-    outDir: 'dist/local',
+    outDir: 'dist',
     emptyOutDir: false,
     lib: {
-      entry: 'src/local/lowa/bridge/entry.ts',
+      entry: BRIDGE_ENTRY,
       formats: ['iife'],
       name: 'LowaBridge',
       fileName: () => 'bridge.js',

@@ -13,9 +13,9 @@
  * Все комментарии на русском языке.
  */
 
-import { BOOT_TIMEOUT_MS, OPERATION_TIMEOUT_MS } from './constants';
-import { isBridgeResponse } from './protocol';
-import { withTimeout } from './timeout';
+import { BOOT_TIMEOUT_MS, OPERATION_TIMEOUT_MS } from './constants.js';
+import { isBridgeResponse } from './protocol.js';
+import { withTimeout } from './timeout.js';
 import type {
   BridgeCall,
   BridgeResult,
@@ -23,8 +23,8 @@ import type {
   LocalErrorCode,
   MemoryResult,
   PreviewResult,
-} from './protocol';
-import type { EmscriptenFs } from './types';
+} from './protocol.js';
+import type { EmscriptenFs } from './types.js';
 
 /** Отказ браузерного пути с кодом причины. */
 export class LocalError extends Error {

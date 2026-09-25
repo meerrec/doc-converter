@@ -14,7 +14,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { MAX_FILE_BYTES, MIN_OUTPUT_BYTES } from '../apps/web/src/local/lowa/constants.js';
+import { MAX_FILE_BYTES, MIN_OUTPUT_BYTES } from '@doc-converter/office';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 

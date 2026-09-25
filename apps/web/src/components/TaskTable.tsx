@@ -9,10 +9,13 @@ import {
   isWorkingStatus,
   type ConversionQueue,
   type QueueItem,
+  type QueueRoute,
 } from '../hooks/useConversionQueue';
 
 interface TaskTableProps {
   queue: ConversionQueue;
+  /** Офис в браузере не запустился: браузерные действия строк недоступны. */
+  officeFailed: boolean;
 }
 
 /**
@@ -23,7 +26,9 @@ interface TaskTableProps {
  * @returns true, если ссылка больше не действует
  */
 function isResultExpired(item: QueueItem, now: number): boolean {
-  if (item.result === undefined) {
+  // Срок есть только у серверной ссылки: браузерный результат лежит в памяти
+  // вкладки и не истекает — он исчезает вместе со строкой
+  if (item.result?.kind !== 'server') {
     return false;
   }
 
@@ -47,8 +52,8 @@ function elapsedSeconds(item: QueueItem, now: number): number | null {
   return (now - item.submittedAt) / 1000;
 }
 
-export function TaskTable({ queue }: TaskTableProps) {
-  const { items, now, stats, retryItem, removeItem } = queue;
+export function TaskTable({ queue, officeFailed }: TaskTableProps) {
+  const { items, now, stats, retryItem, removeItem, runItem, previewItem, cancelItem } = queue;
 
   // Зависимости — отдельные функции, а не объект queue: сам объект
   // создаётся заново на каждом рендере, и колбэки на его основе теряли бы
@@ -56,6 +61,12 @@ export function TaskTable({ queue }: TaskTableProps) {
   const handleRetry = useCallback((id: string) => retryItem(id), [retryItem]);
 
   const handleRemove = useCallback((id: string) => removeItem(id), [removeItem]);
+
+  const handleRun = useCallback((id: string, route: QueueRoute) => runItem(id, route), [runItem]);
+
+  const handlePreview = useCallback((id: string) => previewItem(id), [previewItem]);
+
+  const handleCancel = useCallback((id: string) => cancelItem(id), [cancelItem]);
 
   if (items.length === 0) {
     return null;
@@ -122,6 +133,10 @@ export function TaskTable({ queue }: TaskTableProps) {
               item={item}
               isExpired={isResultExpired(item, now)}
               elapsedSeconds={elapsedSeconds(item, now)}
+              officeFailed={officeFailed}
+              onRun={handleRun}
+              onPreview={handlePreview}
+              onCancel={handleCancel}
               onRetry={handleRetry}
               onRemove={handleRemove}
             />

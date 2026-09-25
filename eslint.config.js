@@ -32,7 +32,7 @@ export default tseslint.config(
       '**/node_modules/**',
       '**/*.d.ts',
       'apps/web/lowa/assets/**',
-      'apps/web/src/local/public/uno/runtime.js',
+      'apps/web/public/uno/runtime.js',
     ],
   },
 
@@ -41,8 +41,10 @@ export default tseslint.config(
 
   {
     // Правила хуков применяются только к React-приложению: в воркере
-    // и автоскейлере React нет
-    files: ['apps/web/**/*.{ts,tsx}'],
+    // и автоскейлере React нет, а плагин dev-сервера (`apps/web/dev`)
+    // исполняется в Node и к React отношения не имеет — по `apps/web/**`
+    // он попадал сюда зря
+    files: ['apps/web/src/**/*.{ts,tsx}'],
     extends: [reactHooks.configs.flat['recommended-latest']],
   },
 
@@ -51,7 +53,15 @@ export default tseslint.config(
     // в TypeScript-файлах их подставляет парсер, а в чистый JS — нет.
     // Скрипт получения сборки LOWA сюда же: он тоже исполняется в Node,
     // а не в браузере, и работает с `fetch`, `Buffer` и `process`.
-    files: ['tests/**/*.js', '*.config.js', '*.config.ts', 'apps/web/lowa/*.mjs'],
+    // Плагин dev-сервера (`apps/web/dev`) — по той же причине: он читает
+    // файлы сборки и поднимает middleware, а в браузер не попадает вовсе.
+    files: [
+      'tests/**/*.js',
+      '*.config.js',
+      '*.config.ts',
+      'apps/web/dev/**/*.ts',
+      'apps/web/lowa/*.mjs',
+    ],
     languageOptions: {
       globals: globals.node,
     },

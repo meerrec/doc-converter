@@ -12,7 +12,7 @@
  * в офис и возвращается обратно.
  */
 
-import type { EmscriptenFs, LowaModule } from './types';
+import type { EmscriptenFs, LowaModule } from './types.js';
 
 declare global {
   // eslint-disable-next-line no-var -- объявление глобального объекта сборки

@@ -15,7 +15,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { EXPORT_FILTERS, LOCAL_FORMATS, exportFilterFor } from '../apps/web/src/local/lowa/filters.js';
+import { EXPORT_FILTERS, BROWSER_FORMATS, exportFilterFor } from '@doc-converter/office';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const UNO_SCRIPT = `${ROOT}docker/uno/uno_convert.py`;
@@ -69,6 +69,6 @@ describe('фильтры экспорта PDF', () => {
   });
 
   it('принимают ровно те форматы, для которых есть фильтр', () => {
-    expect([...LOCAL_FORMATS].sort()).toEqual(Object.keys(EXPORT_FILTERS).sort());
+    expect([...BROWSER_FORMATS].sort()).toEqual(Object.keys(EXPORT_FILTERS).sort());
   });
 });

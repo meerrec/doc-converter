@@ -158,33 +158,58 @@ jobs:
               # об этом лучше на сборке образа, чем на живом сайте
               nginx -t 2>&1
 
-              # Страница браузерной конвертации собирается отдельным конфигом
-              # Vite в dist/local. Без неё образ собирается и работает,
-              # а страница отдаёт 404 — то есть поломка не видна ни по
-              # index.html, ни по коду ответа корня
-              test -f /opt/app-root/src/local/index.html
-              test -f /opt/app-root/src/local/bridge.js
-              test -f /opt/app-root/src/local/uno/runtime.js
+              # Мост и обвязка UNO — не бандл: их собирает и копирует
+              # основная сборка в корень `dist`. Без них страница загрузится,
+              # но офис не поднимется, и заметить это можно только в браузере
+              test -f /opt/app-root/src/bridge.js
+              test -f /opt/app-root/src/uno/runtime.js
 
               # Сборка LibreOffice для браузера: 250 МБ, которые в репозитории
               # не лежат и попадают в образ отдельной инструкцией COPY.
-              # Пропажа любого файла означает, что страница /local соберётся
+              # Пропажа любого файла означает, что страница соберётся
               # и не запустится: модуль не найдёт свои данные
-              test -f /opt/app-root/src/local/lowa/soffice.js
-              test -f /opt/app-root/src/local/lowa/soffice.wasm
-              test -f /opt/app-root/src/local/lowa/soffice.data
+              test -f /opt/app-root/src/lowa/soffice.js
+              test -f /opt/app-root/src/lowa/soffice.wasm
+              test -f /opt/app-root/src/lowa/soffice.data
 
               # Сжатые копии — то, что реально уходит в сеть (154 МБ wasm
               # по сети превращаются в 51 МБ). Их отдаёт gzip_static,
               # и без файлов он молча отдал бы распакованное
-              test -f /opt/app-root/src/local/lowa/soffice.wasm.gz
-              test -f /opt/app-root/src/local/lowa/soffice.data.gz
+              test -f /opt/app-root/src/lowa/soffice.wasm.gz
+              test -f /opt/app-root/src/lowa/soffice.data.gz
 
               # Заголовки изоляции известны nginx и заданы в конфиге:
               # без них браузер не выдаст SharedArrayBuffer, и сборка
               # не запустится, а страница останется пустой
               nginx -T 2>/dev/null | grep -q 'Cross-Origin-Opener-Policy'
               nginx -T 2>/dev/null | grep -q 'Cross-Origin-Embedder-Policy'
+
+              # Проверка ответов, а не конфигурации: заголовки обязаны
+              # примениться к документу — и к корню тоже, потому что его
+              # отдаёт SPA-fallback через внутренний редирект, — а на
+              # подресурсы не попасть. Ошибка здесь означала бы офис,
+              # который молча не стартует в проде, работая в dev-режиме,
+              # или ассет, который браузер откажется грузить
+              nginx -g 'daemon on;'
+
+              attempts=0
+              until curl -sf -o /dev/null http://127.0.0.1:8080/; do
+                attempts=$((attempts + 1))
+                if [ "$attempts" -gt 50 ]; then
+                  echo "nginx не поднялся за 10 секунд"
+                  exit 1
+                fi
+                sleep 0.2
+              done
+
+              curl -sSI http://127.0.0.1:8080/ | grep -qi '^cross-origin-opener-policy: same-origin'
+              curl -sSI http://127.0.0.1:8080/index.html | grep -qi '^cross-origin-embedder-policy: require-corp'
+
+              asset=$(basename "$(ls /opt/app-root/src/assets/*.js | head -1)")
+              if curl -sSI "http://127.0.0.1:8080/assets/$asset" | grep -qi '^cross-origin-'; then
+                echo "изоляция попала на подресурс: браузер откажется его грузить"
+                exit 1
+              fi
           - image: uno-worker
             file: apps/worker/Dockerfile
             run_args: ''

@@ -21,7 +21,7 @@
  * Все комментарии на русском языке.
  */
 
-import type { FilterDataEntry } from './filterData';
+import type { FilterDataEntry } from './filterData.js';
 
 /**
  * Коды отказов браузерного пути.

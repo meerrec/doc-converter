@@ -1,5 +1,5 @@
 /**
- * Правила импортов в браузерном пути.
+ * Границы пакета движка браузерной конвертации.
  *
  * Два правила, и оба уже нарушались — поэтому и проверяются машиной, а не
  * вниманием на ревью.
@@ -11,11 +11,13 @@
  * в бандл. Типы стираются при сборке, поэтому `import type` из корня
  * безопасен — и только он.
  *
- * **Браузерный путь не попадает в основной бандл.** Страница `/local`
- * собирается отдельным конфигом (`vite.local.config.ts`), и импорт из `local`
- * в код интерфейса вернул бы её в общую сборку вместе с canvas, сборкой LOWA
- * и всем остальным. Потолок размера бандла в CI такую ошибку поймает,
- * но скажет только «бандл вырос».
+ * **Движок не знает о приложении.** Раньше независимость браузерного пути
+ * удерживал запрет импорта `src/local` из интерфейса — теперь её удерживает
+ * граница пакета: React, серверный API и код страницы сюда не импортируются,
+ * и это видно по манифесту (`packages/office/package.json`). Проверка нужна
+ * потому, что граница проходит по каталогу, а не по среде исполнения: движок
+ * лежит в том же репозитории, и относительный путь до `apps/web` собирается
+ * без единой ошибки.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -24,8 +26,17 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const WEB_SRC = path.join(ROOT, 'apps/web/src');
-const LOCAL_SRC = path.join(WEB_SRC, 'local');
+const OFFICE_SRC = path.join(ROOT, 'packages', 'office', 'src');
+
+/** Пакеты, которые движку недоступны: он не знает ни о приложении, ни о сервере. */
+const FORBIDDEN_PACKAGES = [
+  'react',
+  'react-dom',
+  '@doc-converter/config',
+  '@doc-converter/queue',
+  '@doc-converter/storage',
+  '@doc-converter/observability',
+];
 
 /**
  * Собирает пути всех файлов с указанным расширением под каталогом.
@@ -69,8 +80,8 @@ function importedModules(source) {
   return found;
 }
 
-describe('импорты контракта в браузерном пути', () => {
-  const files = filesUnder(LOCAL_SRC, '.ts');
+describe('импорты контракта в движке', () => {
+  const files = filesUnder(OFFICE_SRC, '.ts');
 
   it('файлы найдены', () => {
     // Проверка самого теста: пустой список означал бы, что правило
@@ -96,21 +107,21 @@ describe('импорты контракта в браузерном пути', (
   });
 });
 
-describe('изоляция браузерного пути', () => {
-  it('интерфейс не импортирует код страницы /local', () => {
-    const files = filesUnder(WEB_SRC, '.ts')
-      .concat(filesUnder(WEB_SRC, '.tsx'))
-      .filter((file) => !file.startsWith(LOCAL_SRC));
-
-    for (const file of files) {
+describe('изоляция движка от приложения', () => {
+  it('движок не импортирует React, серверные пакеты и код приложений', () => {
+    for (const file of filesUnder(OFFICE_SRC, '.ts')) {
       const relative = path.relative(ROOT, file);
 
       for (const { module } of importedModules(readFileSync(file, 'utf8'))) {
-        const targetsLocal = module.includes('local/') || module.endsWith('/local');
+        const forbidden =
+          FORBIDDEN_PACKAGES.includes(module) ||
+          module.startsWith('react/') ||
+          module.includes('apps/') ||
+          module.startsWith('../apps');
 
         expect(
-          targetsLocal,
-          `${relative}: импорт из local вернул бы браузерную конвертацию в основной бандл (${module})`
+          forbidden,
+          `${relative}: движок обязан оставаться переносимым, а импорт «${module}» привязывает его к приложению`
         ).toBe(false);
       }
     }

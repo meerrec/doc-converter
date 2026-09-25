@@ -58,6 +58,7 @@ COPY packages/config/package.json ./packages/config/
 COPY packages/observability/package.json ./packages/observability/
 COPY packages/queue/package.json ./packages/queue/
 COPY packages/storage/package.json ./packages/storage/
+COPY packages/office/package.json ./packages/office/
 COPY apps/api/package.json ./apps/api/
 COPY apps/worker/package.json ./apps/worker/
 COPY apps/autoscaler/package.json ./apps/autoscaler/
@@ -66,12 +67,15 @@ COPY apps/web/package.json ./apps/web/
 # Ставим зависимости веба и контракта (с тремя точками — вместе с зависимостями)
 RUN pnpm ci --filter @doc-converter/web...
 
-# Исходники контракта и веба
+# Исходники контракта, движка браузерной конвертации и веба. Порядок
+# копирования значения не имеет, но список обязан совпадать с зависимостями
+# `@doc-converter/web`: чего здесь нет, того не соберёт шаг ниже
 COPY packages/contract ./packages/contract
+COPY packages/office ./packages/office
 COPY apps/web ./apps/web
 
-# Сборка по графу зависимостей: контракт собирается первым, потому что
-# web импортирует его собранный dist
+# Сборка по графу зависимостей: контракт и движок собираются первыми,
+# потому что web импортирует их собранный dist
 RUN pnpm --filter @doc-converter/web... build
 
 # --- Стадия 2: раздача -------------------------------------------------------
@@ -83,24 +87,23 @@ FROM registry.access.redhat.com/ubi9/nginx-126:1
 # См. apps/web/nginx.conf — это сниппет, а не самостоятельный конфиг.
 COPY apps/web/nginx.conf /opt/app-root/etc/nginx.default.d/converter.conf
 
-# Собранная статика. Каталог — тот же, что в root штатного конфига образа
-# (в Debian-варианте был /usr/share/nginx/html). Здесь же оказывается
-# и страница `/local` (`dist/local`): её собирает тот же `vite build`,
-# отдельным конфигом в отдельный каталог.
+# Собранная статика: документ страницы, бандл, чанк воркера офиса, мост
+# и обвязка UNO. Каталог — тот же, что в root штатного конфига образа
+# (в Debian-варианте был /usr/share/nginx/html).
 COPY --chown=1001:0 --from=builder /app/apps/web/dist /opt/app-root/src
 
 # Сборка LibreOffice для браузера — около 250 МБ. В репозитории её нет
 # (`.gitignore`): файлы скачиваются перед сборкой образа командой
-# `node apps/web/lowa/fetch.mjs`. Без них страница `/local` не работает,
-# поэтому отсутствие файлов — ошибка сборки, а не тихая деградация.
-COPY --chown=1001:0 apps/web/lowa/assets /opt/app-root/src/local/lowa
+# `node apps/web/lowa/fetch.mjs`. Без них браузерная конвертация и предпросмотр
+# не работают, поэтому отсутствие файлов — ошибка сборки, а не тихая деградация.
+COPY --chown=1001:0 apps/web/lowa/assets /opt/app-root/src/lowa
 
 # Контрольные суммы проверяются в образе, а не только глазами при скачивании:
 # у вендора доступен единственный путь `zetaoffice_latest`, и содержимое
 # под ним может смениться в любой момент. Проверка кладёт файл сумм вне
 # раздачи (`/tmp`), чтобы он не оказался доступен по HTTP.
 COPY --chown=1001:0 apps/web/lowa/assets.sha256 /tmp/lowa-assets.sha256
-RUN cd /opt/app-root/src/local/lowa && sha256sum -c /tmp/lowa-assets.sha256
+RUN cd /opt/app-root/src/lowa && sha256sum -c /tmp/lowa-assets.sha256
 
 # nginx слушает 8080 (штатный конфиг образа), а не 80: compose публикует
 # "8080:8080". Порт в EXPOSE и в healthcheck обязан совпадать с ним,

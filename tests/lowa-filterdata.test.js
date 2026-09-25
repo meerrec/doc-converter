@@ -4,7 +4,7 @@
  * Один и тот же документ должен конвертироваться одинаково независимо от того,
  * где это произошло. Параметры экспортёра задаются списком `FilterData`,
  * и списков теперь два: серверный — в `docker/uno/uno_convert.py`, браузерный —
- * в `apps/web/src/local/lowa/filterData.ts`.
+ * в `packages/office/src/filterData.ts`.
  *
  * Разошедшись, они дадут разный результат, и заметить это можно было бы только
  * сравнением готовых PDF: файл получается валидным в обоих случаях. Поэтому
@@ -19,7 +19,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { PDF_VERSION_CODES } from '@doc-converter/contract';
-import { buildFilterData } from '../apps/web/src/local/lowa/filterData.js';
+import { buildFilterData } from '@doc-converter/office';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const UNO_SCRIPT = `${ROOT}docker/uno/uno_convert.py`;

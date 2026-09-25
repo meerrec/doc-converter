@@ -70,6 +70,7 @@ COPY packages/config/package.json ./packages/config/
 COPY packages/observability/package.json ./packages/observability/
 COPY packages/queue/package.json ./packages/queue/
 COPY packages/storage/package.json ./packages/storage/
+COPY packages/office/package.json ./packages/office/
 COPY apps/api/package.json ./apps/api/
 COPY apps/worker/package.json ./apps/worker/
 COPY apps/autoscaler/package.json ./apps/autoscaler/

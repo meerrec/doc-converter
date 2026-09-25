@@ -49,6 +49,7 @@ export default defineConfig({
         replacement: `${src('./packages/contract/src')}/$1.ts`,
       },
       { find: '@doc-converter/config', replacement: src('./packages/config/src/index.ts') },
+      { find: '@doc-converter/office', replacement: src('./packages/office/src/index.ts') },
       { find: '@doc-converter/contract', replacement: src('./packages/contract/src/index.ts') },
       {
         find: '@doc-converter/observability',
