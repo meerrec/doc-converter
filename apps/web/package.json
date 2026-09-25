@@ -6,8 +6,8 @@
   "description": "Веб-интерфейс сервиса конвертации документов",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build && vite build --config vite.bridge.config.ts",
-    "build:bridge": "vite build --config vite.bridge.config.ts",
+    "build": "tsc --noEmit && vite build && vite build --config vite.bridge.config.ts && vite build --config vite.local.config.ts",
+    "build:local": "vite build --config vite.bridge.config.ts && vite build --config vite.local.config.ts",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit"
   },

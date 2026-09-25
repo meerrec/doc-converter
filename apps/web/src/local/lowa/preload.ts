@@ -52,6 +52,16 @@ export interface PreloadProgress {
 export type PreloadedAssets = ReadonlyMap<string, string>;
 
 /**
+ * Как часто сообщать о ходе загрузки.
+ *
+ * Не «на каждый кусок»: браузер отдаёт данные порциями по десятки килобайт,
+ * и на 154 МБ это тысячи сообщений — каждое обновляет состояние страницы,
+ * а перерисовка идёт быстрее, чем приходят данные. Десять раз в секунду
+ * человек всё равно не различит, а лишней работы на порядки меньше.
+ */
+const PROGRESS_INTERVAL_MS = 100;
+
+/**
  * Скачивает файлы сборки.
  *
  * @param assetsUrl - каталог сборки
@@ -68,9 +78,15 @@ export async function preloadAssets(
   let loadedBytes = 0;
   let expectedBytes = 0;
   let unknownSize = false;
+  let lastReport = 0;
+
+  // Пути приводятся к абсолютным до первого запроса: каталог сборки задаётся
+  // относительно страницы, а `fetch` относительный адрес понимает, только
+  // если считать его от адреса документа — что здесь и делается
+  const base = new URL(assetsUrl, document.baseURI);
 
   for (const name of PRELOAD_FILES) {
-    const response = await fetch(new URL(name, assetsUrl).toString(), { signal });
+    const response = await fetch(new URL(name, base).toString(), { signal });
 
     if (!response.ok) {
       throw new Error(`${name}: сервер ответил ${response.status}`);
@@ -105,10 +121,15 @@ export async function preloadAssets(
       chunks.push(value as Uint8Array<ArrayBuffer>);
       loadedBytes += value.byteLength;
 
-      onProgress({
-        loadedBytes,
-        totalBytes: unknownSize ? null : expectedBytes,
-      });
+      const now = Date.now();
+
+      if (now - lastReport >= PROGRESS_INTERVAL_MS) {
+        lastReport = now;
+        onProgress({
+          loadedBytes,
+          totalBytes: unknownSize ? null : expectedBytes,
+        });
+      }
     }
 
     urls.set(
@@ -118,6 +139,10 @@ export async function preloadAssets(
       )
     );
   }
+
+  // Итог сообщается всегда: последнее обновление могло не попасть в интервал,
+  // и полоса осталась бы на «почти всё»
+  onProgress({ loadedBytes, totalBytes: unknownSize ? null : expectedBytes });
 
   return urls;
 }

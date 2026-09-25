@@ -148,11 +148,17 @@ export function App() {
         <TaskTable queue={queue} />
       </main>
 
-      {health.kind === 'ok' ? (
-        <footer className="page__footer">
-          Версия сервиса: {health.data.version}
-        </footer>
-      ) : null}
+      <footer className="page__footer">
+        {health.kind === 'ok' ? <>Версия сервиса: {health.data.version}. </> : null}
+
+        {/* Ссылка ведёт на отдельный документ, а не на раздел интерфейса:
+            там работают заголовки изоляции, которых у этой страницы нет.
+            `noopener` — потому что COOP той страницы всё равно обнулит
+            `opener`; явный атрибут избавляет от лишнего окна-посредника */}
+        <a href="/local/" target="_blank" rel="noopener">
+          Конвертировать в браузере, не отправляя файл на сервер
+        </a>
+      </footer>
     </div>
   );
 }
