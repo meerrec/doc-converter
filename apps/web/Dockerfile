@@ -87,23 +87,10 @@ FROM registry.access.redhat.com/ubi9/nginx-126:1
 # См. apps/web/nginx.conf — это сниппет, а не самостоятельный конфиг.
 COPY apps/web/nginx.conf /opt/app-root/etc/nginx.default.d/converter.conf
 
-# Собранная статика: документ страницы, бандл, чанк воркера офиса, мост
-# и обвязка UNO. Каталог — тот же, что в root штатного конфига образа
+# Собранная статика: документ страницы, бандл и чанк браузерного движка
+# с wasm-ассетами. Каталог — тот же, что в root штатного конфига образа
 # (в Debian-варианте был /usr/share/nginx/html).
 COPY --chown=1001:0 --from=builder /app/apps/web/dist /opt/app-root/src
-
-# Сборка LibreOffice для браузера — около 250 МБ. В репозитории её нет
-# (`.gitignore`): файлы скачиваются перед сборкой образа командой
-# `node apps/web/lowa/fetch.mjs`. Без них браузерная конвертация и предпросмотр
-# не работают, поэтому отсутствие файлов — ошибка сборки, а не тихая деградация.
-COPY --chown=1001:0 apps/web/lowa/assets /opt/app-root/src/lowa
-
-# Контрольные суммы проверяются в образе, а не только глазами при скачивании:
-# у вендора доступен единственный путь `zetaoffice_latest`, и содержимое
-# под ним может смениться в любой момент. Проверка кладёт файл сумм вне
-# раздачи (`/tmp`), чтобы он не оказался доступен по HTTP.
-COPY --chown=1001:0 apps/web/lowa/assets.sha256 /tmp/lowa-assets.sha256
-RUN cd /opt/app-root/src/lowa && sha256sum -c /tmp/lowa-assets.sha256
 
 # nginx слушает 8080 (штатный конфиг образа), а не 80: compose публикует
 # "8080:8080". Порт в EXPOSE и в healthcheck обязан совпадать с ним,

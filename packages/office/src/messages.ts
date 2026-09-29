@@ -1,31 +1,13 @@
 /**
  * Тексты отказов браузерного пути.
  *
- * Коды приходят из обвязки (`protocol.ts`), и каждый означает разное:
- * «не хватило памяти» лечится меньшим документом, «не загрузился офис» —
- * повторной попыткой. Свести их к одному «ошибка» значило бы лишить
- * пользователя единственной подсказки, что делать.
- *
- * Тексты лежат в движке, а не в интерфейсе, потому что знание о том, что
- * означает каждый код, есть только у него: код `lowa_timeout` появляется
- * здесь, а UI увидел бы просто «операция не удалась».
+ * Тексты лежат в движке, а не в интерфейсе: знание о том, что означает
+ * каждый код, есть только у него, а UI видит лишь исключение.
  *
  * Все комментарии на русском языке.
  */
 
-import type { LocalErrorCode } from './protocol.js';
-import { LocalError } from './session.js';
-
-/** Что показать пользователю при отказе. */
-export const ERROR_MESSAGES: Readonly<Record<LocalErrorCode, string>> = {
-  lowa_boot_failed: 'Не удалось загрузить офис. Обновите страницу и попробуйте снова.',
-  lowa_load_failed: 'Документ не открылся: возможно, файл повреждён или это не Excel и не Word.',
-  lowa_export_failed: 'Не удалось сохранить PDF. Проверьте параметры экспорта.',
-  lowa_oom:
-    'Не хватило памяти браузера. Закройте лишние вкладки или возьмите документ поменьше — эта операция выполняется на вашем устройстве.',
-  lowa_timeout: 'Операция заняла слишком много времени и была прервана.',
-  lowa_unavailable: 'Офис в браузере недоступен. Обновите страницу.',
-};
+import { EngineError, ENGINE_ERROR_MESSAGES } from './engine/errors.js';
 
 /**
  * Приводит исключение к тексту для пользователя.
@@ -34,8 +16,8 @@ export const ERROR_MESSAGES: Readonly<Record<LocalErrorCode, string>> = {
  * @returns сообщение
  */
 export function describeError(error: unknown): string {
-  if (error instanceof LocalError) {
-    return ERROR_MESSAGES[error.code];
+  if (error instanceof EngineError) {
+    return ENGINE_ERROR_MESSAGES[error.code];
   }
 
   return error instanceof Error ? error.message : String(error);

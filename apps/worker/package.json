@@ -16,7 +16,7 @@
     "@doc-converter/observability": "workspace:*",
     "@doc-converter/queue": "workspace:*",
     "@doc-converter/storage": "workspace:*",
-    "bullmq": "^5.1.0"
+    "bullmq": "^5.81.5"
   },
   "devDependencies": {
     "typescript": "catalog:"

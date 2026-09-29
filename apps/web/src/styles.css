@@ -476,21 +476,32 @@ select {
    ========================================================================== */
 
 /*
- * Canvas — не картинка, а окно офиса: сборка рисует в него документ целиком,
- * вместе с меню и панелями, которые удаётся скрыть уже внутри документа.
- * Ширина задана в процентах, чтобы окно подстраивалось под страницу.
+ * Страницы рисует pdf.js в canvas'ы: панель показывает их столбиком,
+ * как настоящий PDF, а не окно редактора. Каждая страница — отдельный
+ * canvas, поэтому размер задан здесь, а не внутри рендера.
  */
-.preview__canvas {
+.preview__pages {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  max-height: 70vh;
+  overflow: auto;
+  margin: 0 0 1.5rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.preview__page {
   display: block;
   width: 100%;
   height: auto;
-  margin: 0 0 1.5rem;
-  border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: #2b2b2b;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 12%);
 }
 
-/* Подпись под пустым canvas: без неё он выглядит сломанным изображением */
+/* Подпись вместо пустого окна: без неё панель выглядит сломанной */
 .preview__hint {
   margin: 0 0 1rem;
   color: var(--text-muted);

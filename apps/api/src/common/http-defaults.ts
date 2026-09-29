@@ -13,11 +13,10 @@ import { CONVERTER_VERSION } from '../version.js';
  * Заголовки безопасности и версии конвертера.
  *
  * Замечание на будущее: `Cross-Origin-Opener-Policy`,
- * `Cross-Origin-Embedder-Policy` и `Cross-Origin-Resource-Policy` появились
- * в расчёте на WASM в браузере (без них не выдаётся `SharedArrayBuffer`),
- * но конвертер работает в Node — в форк-процессе на сервере. Для API это
- * политики уровня документа и пользы не приносят. Поведение сохранено как
- * есть; пересмотреть стоит отдельно, вместе с CSP.
+ * `Cross-Origin-Embedder-Policy` и `Cross-Origin-Resource-Policy` остались
+ * от прежнего браузерного WASM-пути и для ответов API (Node-процесс)
+ * пользы не приносят — это политики уровня документа. Поведение сохранено
+ * как есть; пересмотреть стоит отдельно, вместе с CSP.
  *
  * @param app - приложение NestJS
  * @param isProduction - включает CSP (как в Express-версии)

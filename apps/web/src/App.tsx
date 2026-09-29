@@ -3,9 +3,9 @@
  *
  * Файлы выбираются один раз, а способ конвертации выбирается для каждого
  * файла отдельно — кнопкой в его строке. Маршрутов два: серверный (очередь
- * воркеров, файл уходит на сервер) и браузерный (сборка LibreOffice в этой
- * вкладке, файл не покидает компьютер). Плюс предпросмотр, который показывает
- * документ в окне офиса и маршрута не занимает: он не конвертирует файл.
+ * воркеров, файл уходит на сервер) и браузерный (движок в этой вкладке, файл
+ * не покидает компьютер). Плюс предпросмотр, который показывает страницы
+ * документа и маршрута не занимает: он не скачивает файл.
  *
  * Все сетевые операции выполняет хук очереди — компонент отвечает
  * только за ввод и отображение.
@@ -20,8 +20,6 @@ import { OptionsPanel } from './components/OptionsPanel';
 import { PreviewPanel } from './components/PreviewPanel';
 import { TaskTable } from './components/TaskTable';
 import { useConversionQueue, type RejectedFile } from './hooks/useConversionQueue';
-import { useOfficeState } from './hooks/useOfficeState';
-import { openOffice } from './office';
 import { request } from './api/client';
 import { DEFAULT_CONVERSION_OPTIONS, MAX_VISIBLE_REJECTIONS } from './config';
 import { pluralize } from './lib/format';
@@ -39,7 +37,6 @@ export function App() {
 
   const queue = useConversionQueue({ options });
   const { addFiles, startAll, cancelAll, stats, preview } = queue;
-  const office = useOfficeState();
 
   useEffect(() => {
     const controller = new AbortController();
@@ -74,17 +71,6 @@ export function App() {
     setOptions((current) => ({ ...current, ...patch }));
   }, []);
 
-  /**
-   * Загружает офис по кнопке.
-   *
-   * Провал не пробрасывается: он терминален и уже записан в состоянии офиса,
-   * откуда его показывает панель. Необработанный отказ здесь попал бы
-   * в консоль и в сборщик ошибок как «что-то сломалось», ничего не добавив.
-   */
-  const handleLoadOffice = useCallback(() => {
-    void openOffice().catch(() => undefined);
-  }, []);
-
   const isBusy = stats.pending > 0 || stats.active > 0;
   const storageDown = health.kind === 'ok' && !health.data.storage;
 
@@ -98,9 +84,9 @@ export function App() {
       <header className="page__header">
         <h1 className="page__title">Конвертер документов в PDF</h1>
         <p className="page__subtitle">
-          Книги Excel и документы Word превращаются в PDF средствами LibreOffice. На сервере —
-          очередью воркеров, в браузере — в этой вкладке, без отправки файла. Предпросмотр
-          показывает документ до конвертации.
+          Книги Excel и документы Word превращаются в PDF. На сервере — очередью
+          воркеров LibreOffice, в браузере — движком в этой вкладке, без отправки файла.
+          Предпросмотр показывает страницы до скачивания.
         </p>
 
         {health.kind === 'unavailable' ? (
@@ -172,16 +158,16 @@ export function App() {
           </p>
         </div>
 
-        <OfficePanel state={office} onLoad={handleLoadOffice} />
+        <OfficePanel failed={queue.engineFailed} />
 
         <PreviewPanel
           fileName={previewed?.file.name ?? null}
           sheets={preview?.sheets ?? null}
-          busy={office.kind === 'loading'}
+          url={preview?.url ?? null}
           onClose={queue.closePreview}
         />
 
-        <TaskTable queue={queue} officeFailed={office.kind === 'failed'} />
+        <TaskTable queue={queue} officeFailed={queue.engineFailed} />
       </main>
 
       <footer className="page__footer">

@@ -1,38 +1,19 @@
 /**
- * Фильтры экспорта PDF по виду документа.
+ * Форматы документов браузерного пути.
  *
- * Список повторяет серверный (`EXPORT_FILTERS` в `docker/uno/uno_convert.py`)
- * и не может быть выведен из контракта: серверный скрипт написан на Python
- * и контракт не читает, а в контракте описаны только те вещи, о которых
- * стороны договариваются (форматы, коды ошибок, версии PDF). Имена фильтров
- * экспортёра — внутреннее дело работы с UNO.
- *
- * За расхождением следит `tests/lowa-filters.test.js`: он разбирает имена
- * фильтров прямо из Python-скрипта. Иначе ошибка проявилась бы отказом
- * экспорта в браузере, а причина — «фильтр называется иначе» — искалась бы
- * долго.
+ * Список совпадает со входными форматами сервиса (`INPUT_FORMATS` контракта),
+ * но сведён в отдельную карту по расширениям: браузерный движок принимает
+ * ровно те же файлы, что и сервер, однако формат здесь определяется именем,
+ * а не содержимым контейнера.
  *
  * Все комментарии на русском языке.
  */
 
-/**
- * Фильтры экспорта PDF по расширению файла.
- *
- * Тип выведен из значений, а не задан словарём: из него получается `BrowserFormat`
- * — объединение известных расширений. Это не украшение: путь файла в файловой
- * системе сборки собирается из расширения (`paths.ts`), и тип гарантирует, что
- * туда попадает известное значение, а не часть имени, придуманного пользователем.
- */
-export const EXPORT_FILTERS = {
-  xlsx: 'calc_pdf_Export',
-  docx: 'writer_pdf_Export',
-} as const;
+/** Расширения, которые принимает браузерный путь. */
+export const BROWSER_FORMATS = ['docx', 'xlsx'] as const;
 
-/** Формат документа, который принимает браузерный путь. */
-export type BrowserFormat = keyof typeof EXPORT_FILTERS;
-
-/** Форматы, которые принимает браузерный путь. */
-export const BROWSER_FORMATS = Object.keys(EXPORT_FILTERS) as readonly BrowserFormat[];
+/** Формат документа браузерного пути. */
+export type BrowserFormat = (typeof BROWSER_FORMATS)[number];
 
 /**
  * Определяет формат документа по имени файла.
@@ -40,8 +21,8 @@ export const BROWSER_FORMATS = Object.keys(EXPORT_FILTERS) as readonly BrowserFo
  * Вид документа здесь определяется по расширению, а не по содержимому, как
  * на сервере. Это не упрощение, а другое назначение: серверная проверка
  * защищает сервер от того, что прислал клиент, а здесь клиент конвертирует
- * свой же файл, и защищать нечего. Ошибка приведёт к отказу экспорта
- * с понятным сообщением, а не к чужому коду на нашем сервере.
+ * свой же файл, и защищать нечего. Ошибка приведёт к отказу с понятным
+ * сообщением, а не к исполнению чужого кода.
  *
  * @param name - имя файла
  * @returns формат или null, если он не поддерживается
@@ -49,17 +30,7 @@ export const BROWSER_FORMATS = Object.keys(EXPORT_FILTERS) as readonly BrowserFo
 export function browserFormatOf(name: string): BrowserFormat | null {
   const extension = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
 
-  return Object.hasOwn(EXPORT_FILTERS, extension) ? (extension as BrowserFormat) : null;
-}
-
-/**
- * Определяет имя фильтра экспорта по имени файла.
- *
- * @param name - имя файла
- * @returns имя фильтра или null, если формат не поддерживается
- */
-export function exportFilterFor(name: string): string | null {
-  const format = browserFormatOf(name);
-
-  return format === null ? null : EXPORT_FILTERS[format];
+  return (BROWSER_FORMATS as readonly string[]).includes(extension)
+    ? (extension as BrowserFormat)
+    : null;
 }

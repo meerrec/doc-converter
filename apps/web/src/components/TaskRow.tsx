@@ -35,7 +35,7 @@ interface TaskRowProps {
   isExpired: boolean;
   /** Сколько секунд идёт конвертация; null — задача не в работе. */
   elapsedSeconds: number | null;
-  /** Офис в браузере не запустился: браузерные действия недоступны. */
+  /** Движок браузерной конвертации не загрузился: браузерные действия недоступны. */
   officeFailed: boolean;
   onRun: (id: string, route: QueueRoute) => void;
   onPreview: (id: string) => void;
@@ -63,7 +63,7 @@ export const TaskRow = memo(function TaskRow({
   const browserFormat = browserFormatOf(item.file.name);
   const tooLargeForBrowser = item.file.size > MAX_FILE_BYTES;
   const browserReason = officeFailed
-    ? 'Офис в браузере не запустился — обновите страницу'
+    ? 'Движок в браузере не загрузился — обновите страницу'
     : browserFormat === null
       ? 'Браузерный путь принимает только XLSX и DOCX'
       : tooLargeForBrowser

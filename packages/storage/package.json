@@ -21,7 +21,7 @@
   },
   "dependencies": {
     "@doc-converter/config": "workspace:*",
-    "minio": "^8.0.1"
+    "minio": "^8.0.7"
   },
   "devDependencies": {
     "typescript": "catalog:"

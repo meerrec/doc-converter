@@ -22,15 +22,15 @@ import {
 } from 'react';
 import {
   browserFormatOf,
-  createOfficeQueue,
+  createLocalQueue,
   describeError as describeOfficeError,
+  EngineError,
   MAX_FILE_BYTES,
   type OfficePhase,
 } from '@doc-converter/office';
 import { fetchStatus, submitConversion } from '../api/conversion';
 import { ApiError, downloadFromUrl } from '../api/client';
 import { describeError, describeJobError } from '../api/errors';
-import { openOffice } from '../office';
 import { createLimiter, type Limiter } from '../lib/limiter';
 import { detectInputFormat, stripExtension } from '../lib/format';
 import {
@@ -60,7 +60,7 @@ const FORMAT_LIST = INPUT_FORMATS.map((format) => format.toUpperCase()).join(', 
  * Маршрут задачи: где конвертируется файл.
  *
  * Их два и они равноправны: серверный (очередь воркеров, файл уходит
- * на сервер) и браузерный (сборка LibreOffice в этой вкладке, файл остаётся
+ * на сервер) и браузерный (движок в этой вкладке, файл остаётся
  * у пользователя). Строка помнит маршрут последнего запуска, чтобы «Повторить»
  * не спрашивал заново.
  */
@@ -71,8 +71,8 @@ export type QueueRoute = 'server' | 'browser';
  *
  * Кроме серверных состояний (`queued`, `processing`, `completed`, `failed`)
  * есть локальные: файл ещё не отправлен, отправляется или отправка отменена,
- * а также состояния браузерного маршрута — офис один и выполняет задачи
- * по очереди, поэтому их несколько: ожидание, загрузка сборки, экспорт,
+ * а также состояния браузерного маршрута — движок один и выполняет задачи
+ * по очереди, поэтому их несколько: ожидание, загрузка модулей, экспорт,
  * предпросмотр.
  */
 export type QueueItemStatus =
@@ -84,13 +84,13 @@ export type QueueItemStatus =
   | JobStatus
   /** Отправка прервана пользователем; на сервере задачи нет. */
   | 'cancelled'
-  /** Браузерный маршрут: задача ждёт своей очереди — офис занят. */
+  /** Браузерный маршрут: задача ждёт своей очереди — движок занят. */
   | 'browser-waiting'
-  /** Браузерный маршрут: скачивается и запускается сборка офиса. */
+  /** Браузерный маршрут: загружается модуль движка. */
   | 'browser-loading'
-  /** Браузерный маршрут: офис выгружает PDF. */
+  /** Браузерный маршрут: движок собирает PDF. */
   | 'browser-converting'
-  /** Браузерный маршрут: офис открывает документ для предпросмотра. */
+  /** Браузерный маршрут: движок собирает страницы для предпросмотра. */
   | 'browser-previewing';
 
 /**
@@ -215,7 +215,7 @@ export function isWorkingStatus(status: QueueItemStatus): boolean {
  * Состояния браузерного маршрута.
  *
  * @param status - состояние задачи
- * @returns true, если задача выполняется офисом в браузере
+ * @returns true, если задача выполняется движком в браузере
  */
 export function isBrowserStatus(status: QueueItemStatus): boolean {
   return status.startsWith('browser-');
@@ -253,9 +253,9 @@ function isPollable(item: QueueItem): boolean {
 const MIN_TICK_DELAY_MS = 50;
 
 /**
- * Какому состоянию строки отвечает фаза очереди офиса.
+ * Какому состоянию строки отвечает фаза очереди движка.
  *
- * Фазы приходят из движка и говорят о работе офиса, состояния — о строке
+ * Фазы приходят из движка и говорят о его работе, состояния — о строке
  * таблицы. Соответствие записано таблицей, чтобы не разошлось в трёх местах.
  */
 const PHASE_STATUS: Readonly<Record<OfficePhase, QueueItemStatus>> = {
@@ -307,12 +307,20 @@ export interface ConversionQueue {
    */
   now: number;
   /**
-   * Документ, открытый в окне офиса (браузерный предпросмотр).
+   * Документ, показанный в панели предпросмотра (браузерный маршрут).
    *
-   * `null` — окно пусто: документ ещё не открывали, офис закрыл его сам
-   * или закрыли мы.
+   * `null` — показывать нечего: документ ещё не собирали, движок заменил его
+   * другим или предпросмотр закрыли.
    */
-  preview: { itemId: string; sheets: number | null } | null;
+  /**
+   * Документ, показанный в предпросмотре.
+   *
+   * `url` — blob-адрес готового PDF: он уже в памяти вкладки, и живёт
+   * до закрытия предпросмотра, замены документа или ухода со страницы.
+   */
+  preview: { itemId: string; sheets: number | null; url: string } | null;
+  /** Движок браузерной конвертации не загрузился: браузерные действия недоступны. */
+  engineFailed: boolean;
   /** Добавляет файлы в очередь. Возвращает отклонённые файлы с причинами. */
   addFiles: (files: File[]) => RejectedFile[];
   removeItem: (id: string) => void;
@@ -323,11 +331,11 @@ export interface ConversionQueue {
   runItem: (id: string, route: QueueRoute) => void;
   /** Повторяет задачу тем же маршрутом, которым её запускали. */
   retryItem: (id: string) => void;
-  /** Открывает документ в окне офиса. */
+  /** Показывает страницы документа. */
   previewItem: (id: string) => void;
   /** Снимает ожидающую задачу браузерного маршрута. */
   cancelItem: (id: string) => void;
-  /** Закрывает документ в окне офиса. */
+  /** Закрывает предпросмотр. */
   closePreview: () => void;
   downloadAll: () => void;
   stats: {
@@ -387,17 +395,65 @@ export function useConversionQueue({
   const limiterRef = useRef<Limiter | null>(null);
 
   /**
-   * Документ, открытый в окне офиса.
+   * Документ, показанный в панели предпросмотра.
    *
-   * Состояние интерфейса, а не задачи: предпросмотр не конвертирует файл
-   * и не занимает маршрут строки — он лишь показывает документ в окне офиса.
-   * Пусто (`null`) означает, что документа нет: офис его ещё не открыл,
-   * закрыл сам (открыв на его месте другой) или закрыли мы.
+   * Состояние интерфейса, а не задачи: предпросмотр не занимает маршрут
+   * строки — он лишь показывает страницы. Пусто (`null`) означает, что
+   * документа нет: движок его ещё не собрал, закрыл (собрав на его месте
+   * другой) или закрыли мы.
    */
-  const [preview, setPreview] = useState<{ itemId: string; sheets: number | null } | null>(null);
+  const [preview, setPreview] = useState<{
+    itemId: string;
+    sheets: number | null;
+    /** Адрес готового PDF предпросмотра; живёт до закрытия или замены. */
+    url: string;
+  } | null>(null);
 
   /**
-   * Очередь офиса: все обращения к сборке идут через неё.
+   * Движок браузерной конвертации не загрузился.
+   *
+   * Отказ загрузки терминален: модуль движка тянет wasm, и повторять те же
+   * мегабайты в этой вкладке нечем. Поэтому строкам сразу отказывают в
+   * браузерных действиях, а не гоняют их по кругу отказов.
+   */
+  const [engineFailed, setEngineFailed] = useState(false);
+
+  /**
+   * Заменяет адрес предпросмотра, освобождая прежний.
+   *
+   * Blob-адрес держит PDF в памяти вкладки, пока его не отзовут: при каждом
+   * новом предпросмотре освобождается предыдущий, иначе файлы копились бы
+   * до перезагрузки страницы.
+   *
+   * @param next - новое состояние предпросмотра
+   */
+  const replacePreview = useCallback(
+    (next: { itemId: string; sheets: number | null; url: string } | null) => {
+      setPreview((current) => {
+        if (current !== null && current.url !== next?.url) {
+          URL.revokeObjectURL(current.url);
+        }
+
+        return next;
+      });
+    },
+    []
+  );
+
+  /**
+   * Текущий адрес предпросмотра для очистки при уходе со страницы.
+   *
+   * Зеркало состояния в ссылке: эффект очистки подписывается один раз
+   * и состояния на тот момент ещё не видит.
+   */
+  const previewUrlRef = useRef<string | null>(null);
+
+  useLayoutEffect(() => {
+    previewUrlRef.current = preview?.url ?? null;
+  });
+
+  /**
+   * Очередь движка: все обращения к нему идут через неё.
    *
    * Создаётся инициализатором состояния, а не в теле рендера и не в `useMemo`:
    * очередь хранит ожидающие задачи, а `useMemo` React вправе пересчитать,
@@ -405,8 +461,7 @@ export function useConversionQueue({
    * и при двойном вызове инициализатора — React сохраняет первое значение.
    */
   const [officeQueue] = useState(() =>
-    createOfficeQueue({
-      open: openOffice,
+    createLocalQueue({
       events: {
         onPhase: (itemId, phase) => {
           dispatch({ type: 'patch', id: itemId, patch: { status: PHASE_STATUS[phase] } });
@@ -414,7 +469,21 @@ export function useConversionQueue({
 
         onDone: (itemId, outcome) => {
           if (outcome.kind === 'previewed') {
-            setPreview({ itemId, sheets: outcome.sheets });
+            // Предпросмотр своего движка — готовый PDF: у него нет окна
+            // офиса, и страницы показывает тот же экспортёр, что собирает
+            // результат
+            replacePreview(
+              outcome.pdf === undefined
+                ? null
+                : {
+                    itemId,
+                    sheets: outcome.sheets,
+                    url: URL.createObjectURL(
+                      new Blob([outcome.pdf as Uint8Array<ArrayBuffer>], { type: 'application/pdf' })
+                    ),
+                  }
+            );
+
             // Документ показан, но не конвертирован: задача снова ждёт запуска
             dispatch({
               type: 'patch',
@@ -441,6 +510,10 @@ export function useConversionQueue({
         },
 
         onFailed: (itemId, error) => {
+          if (error instanceof EngineError && error.code === 'engine_load_failed') {
+            setEngineFailed(true);
+          }
+
           dispatch({
             type: 'patch',
             id: itemId,
@@ -448,11 +521,10 @@ export function useConversionQueue({
           });
         },
 
-        // Офис открывает документ по другому пути только тогда, когда прежний
-        // закрыт: показанного ранее файла в окне больше нет, и состояние
-        // предпросмотра обязано это отразить
-        onDocumentChanged: (itemId) => {
-          setPreview(itemId === null ? null : { itemId, sheets: null });
+        // Показанного ранее файла больше нет: движок открывает документ
+        // на месте прежнего, и держать на экране его страницы нельзя
+        onDocumentChanged: () => {
+          replacePreview(null);
         },
       },
     })
@@ -509,6 +581,13 @@ export function useConversionQueue({
       // их не освобождает: адреса живут, пока их не отзовут
       for (const item of itemsRef.current) {
         revokeResult(item.result);
+      }
+
+      // Предпросмотр — тот же ресурс вкладки: его адрес тоже нужно отозвать
+      const previewUrl = previewUrlRef.current;
+
+      if (previewUrl !== null) {
+        URL.revokeObjectURL(previewUrl);
       }
     };
   }, []);
@@ -774,12 +853,12 @@ export function useConversionQueue({
   );
 
   /**
-   * Открывает документ в окне офиса.
+   * Показывает страницы документа.
    *
-   * Задача встаёт в ту же очередь, что и конвертация: офис один и открывает
-   * не более одного документа, поэтому одновременный предпросмотр и экспорт
-   * невозможны физически. Статус строки при этом не меняется — предпросмотр
-   * не конвертирует файл, — а ход работы виден в панели предпросмотра.
+   * Задача встаёт в ту же очередь, что и конвертация: у движка одна линейная
+   * память, поэтому одновременный предпросмотр и экспорт невозможны
+   * физически. Статус строки при этом не меняется — предпросмотр не
+   * конвертирует файл, — а ход работы виден в панели предпросмотра.
    *
    * @param id - идентификатор задачи
    */
@@ -799,6 +878,9 @@ export function useConversionQueue({
         kind: 'preview',
         itemId: id,
         fileName: item.file.name,
+        // Предпросмотр своего движка — тот же PDF, что пойдёт на скачивание:
+        // знак и прочие параметры берутся из формы, а не из умолчаний
+        options: settingsRef.current,
         readBytes: () => readFileBytes(item.file),
       });
     },
@@ -808,8 +890,8 @@ export function useConversionQueue({
   /**
    * Снимает ожидающую задачу браузерного маршрута.
    *
-   * Идущую операцию прервать нельзя: у моста нет отмены, и офис доведёт её
-   * до конца или до таймаута. Поэтому отменяются только ожидающие, а строка
+   * Идущую операцию прервать нельзя: у движка нет отмены, и задачу он доведёт
+   * до конца или до отказа. Поэтому отменяются только ожидающие, а строка
    * с идущей задачей остаётся рабочей.
    *
    * @param id - идентификатор задачи
@@ -823,10 +905,11 @@ export function useConversionQueue({
     [officeQueue]
   );
 
-  /** Закрывает документ в окне офиса, освобождая память. */
+  /** Закрывает предпросмотр, освобождая память вкладки. */
   const closePreview = useCallback(() => {
+    replacePreview(null);
     void officeQueue.closeDocument();
-  }, [officeQueue]);
+  }, [officeQueue, replacePreview]);
 
   /**
    * Скачивает все готовые результаты по очереди.
@@ -893,8 +976,8 @@ export function useConversionQueue({
       // пользователь убрал строку, а файл скачается через долю секунды
       cancelDownload(id);
 
-      // Ожидающая задача офиса снимается вместе со строкой: иначе офис
-      // откроет файл, которого в списке уже нет
+      // Ожидающая задача движка снимается вместе со строкой: иначе он
+      // разберёт файл, которого в списке уже нет
       officeQueue.cancelPending(id);
 
       // Адрес результата читается до удаления строки: после dispatch его
@@ -1262,6 +1345,7 @@ export function useConversionQueue({
     items,
     now,
     preview,
+    engineFailed,
     addFiles,
     removeItem,
     clearFinished,

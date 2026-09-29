@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Движок браузерной конвертации: сборка LibreOffice, сессия офиса, очередь задач",
+  "description": "Движок браузерной конвертации: BetterOffice (Rust/WASM) и собственный экспортёр PDF",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -20,7 +20,14 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@doc-converter/contract": "workspace:*"
+    "@betteroffice/docx": "0.3.0",
+    "@betteroffice/fonts": "0.3.0",
+    "@betteroffice/fonts-cjk": "0.3.0",
+    "@betteroffice/xlsx": "0.3.0",
+    "@doc-converter/contract": "workspace:*",
+    "fast-png": "8.0.0",
+    "fflate": "0.8.3",
+    "harfbuzzjs": "1.6.2"
   },
   "devDependencies": {
     "typescript": "catalog:"

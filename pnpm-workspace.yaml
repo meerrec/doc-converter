@@ -38,7 +38,7 @@ catalog:
   # Компилятор один на все пакеты — иначе расходятся Diagnostics
   typescript: ^5.9.3
   # Типы Node общие для сервера и веба
-  '@types/node': ^26.6.1
+  '@types/node': ^26.6.3
 
 # Сборка нативных модулей разрешена только этим пакетам.
 #
@@ -48,3 +48,15 @@ catalog:
 allowBuilds:
   '@swc/core': true
   msgpackr-extract: true
+
+minimumReleaseAgeExclude:
+  - '@betteroffice/docx@0.3.0'
+  - '@betteroffice/fonts-cjk@0.3.0'
+  - '@betteroffice/fonts@0.3.0'
+  - '@betteroffice/xlsx@0.3.0'
+  - decode-uri-component@0.4.3
+  - stream-json@3.4.1
+
+overrides:
+  decode-uri-component@<=0.4.2: ^0.5.0
+  stream-json@<=3.4.0: ^3.4.1
