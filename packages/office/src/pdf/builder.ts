@@ -14,7 +14,7 @@
  * Все комментарии на русском языке.
  */
 
-import { deflateSync } from 'fflate';
+import { zlibSync } from 'fflate';
 
 /**
  * Сжимает данные для потока PDF.
@@ -26,11 +26,17 @@ import { deflateSync } from 'fflate';
  * от `node:zlib` работает и в браузере, и в Node — поэтому экспортёр
  * проверяется обычным тестом, без браузера.
  *
+ * Имя функции здесь не косметика: `/FlateDecode` — это формат **zlib**
+ * (RFC 1950), и у `fflate` ему отвечает `zlibSync`. Соседний `deflateSync`
+ * отдаёт «сырой» DEFLATE без заголовка и контрольной суммы, и просмотрщик,
+ * который его не прощает, читает поток как пустой: страница выходит белой,
+ * а файл при этом выглядит целым. Поэтому сжатие идёт только через `zlibSync`.
+ *
  * @param data - несжатые данные
  * @returns поток zlib: его и ждёт `/FlateDecode`
  */
 function deflate(data: Uint8Array): Uint8Array {
-  return deflateSync(data);
+  return zlibSync(data);
 }
 
 /** Байты в UTF-16BE — так PDF записывает строки в CMap и метаданных. */
