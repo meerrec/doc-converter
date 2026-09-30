@@ -11,6 +11,12 @@
  *   `<0041> Tj` — номер глифа в исходном шрифте, и он же индексирует
  *   `CIDToGIDMap /Identity`. Поэтому шрифт субсеттится с `RETAIN_GIDS`
  *   (см. `subset.ts`), а не как обычно;
+ * - **формат шрифта определяет способ встраивания.** TrueType (таблица
+ *   `glyf`) кладётся в `FontFile2` при `CIDFontType2`, а CFF-контейнер
+ *   (`OTTO`, им приходят CJK-начертания) — в `FontFile3` с подтипом
+ *   `OpenType` при `CIDFontType0`, где `CIDToGIDMap` не допускается вовсе.
+ *   Признак читается из байтов: одно и то же семейство может прийти
+ *   и файлом `.ttf`, и `.otf`;
  * - **`ToUnicode` строится из кластеров**, а кластеры — смещения в байтах
  *   UTF-8. Без этой таблицы текст виден, но не копируется и не ищется;
  * - **координаты переворачиваются**: display list считает Y вниз от верхнего
@@ -32,6 +38,7 @@
  */
 
 import { PdfBuilder } from './builder.js';
+import { readGlyphToCid } from './cff.js';
 import { toUnicodeCMap } from './cmap.js';
 import { decodeImage } from './image.js';
 import { loadSubsetter } from './subset.js';
@@ -179,21 +186,52 @@ function collectFontUsage(pages: readonly DisplayPage[]): Map<number, FontUsage>
   return usage;
 }
 
+/** Сигнатура sfnt-контейнера с таблицей CFF: `OTTO`. */
+const SFNT_OTTO = [0x4f, 0x54, 0x54, 0x4f];
+
+/**
+ * Определяет, лежит ли в байтах CFF-контейнер.
+ *
+ * По сигнатуре, а не по имени: провайдер отдаёт и `.ttf`, и `.otf`, а один
+ * и тот же шрифт встречается в обоих видах. У TrueType сигнатура другая
+ * (`0x00010000` или `true`), и на неё здесь отвечает «нет».
+ *
+ * @param bytes - байты sfnt
+ * @returns true, если контейнер несёт CFF
+ */
+function isCffFont(bytes: Uint8Array): boolean {
+  return SFNT_OTTO.every((byte, index) => bytes[index] === byte);
+}
+
+/**
+ * Встроенный шрифт: как его назвать на странице и как перевести глиф в CID.
+ *
+ * `cidOf` заполнен только для CID-keyed CFF: у TrueType номер глифа и есть
+ * CID, и карта там не нужна.
+ */
+interface EmbeddedFont {
+  readonly name: string;
+  /** Номер объекта шрифта в файле. */
+  readonly ref: number;
+  /** CID по номеру глифа; `null` — номера совпадают. */
+  readonly cidOf: Uint16Array | null;
+}
+
 /**
  * Добавляет шрифты и возвращает их имена в ресурсах страниц.
  *
  * @param pdf - сборщик
  * @param usage - собранные символы и ширины
  * @param resources - байты шрифтов по номерам
- * @returns номер шрифта → имя в ресурсах
+ * @returns номер шрифта → встроенный шрифт
  */
 async function emitFonts(
   pdf: PdfBuilder,
   usage: ReadonlyMap<number, FontUsage>,
   resources: ReadonlyMap<number, FontResource>
-): Promise<Map<number, string>> {
+): Promise<Map<number, EmbeddedFont>> {
   const subsetter = await loadSubsetter();
-  const names = new Map<number, string>();
+  const embedded = new Map<number, EmbeddedFont>();
 
   for (const [fontId, entry] of usage) {
     const resource = resources.get(fontId);
@@ -207,31 +245,78 @@ async function emitFonts(
 
     const name = `F${fontId}`;
     const subset = subsetter.subset(resource.bytes, entry.text);
+    const cff = isCffFont(subset);
 
-    const fileRef = pdf.addStream('<< /Filter /FlateDecode /Length1 ' + subset.byteLength + ' >>', subset);
+    // У CID-keyed CFF номер глифа и CID расходятся после субсеттинга,
+    // а PDF адресует глифы именно CID — см. `cff.ts`. Ширины и `ToUnicode`
+    // поэтому тоже пересчитываются на CID: иначе они описывали бы
+    // не те знаки, что нарисованы
+    const cidOf = cff ? readGlyphToCid(subset) : null;
+    const cidOfGlyph = (glyph: number): number | null => {
+      if (cidOf === null) {
+        return glyph;
+      }
+
+      return cidOf[glyph] ?? null;
+    };
+
+    const fileRef = cff
+      ? pdf.addStream(
+          `<< /Filter /FlateDecode /Subtype /OpenType /Length1 ${subset.byteLength} >>`,
+          subset
+        )
+      : pdf.addStream(`<< /Filter /FlateDecode /Length1 ${subset.byteLength} >>`, subset);
+
+    // Поле с файлом шрифта у двух форматов называется по-разному, и подмена
+    // одного другим не косметическая ошибка: `FontFile2` с CFF внутри
+    // просмотрщик читает как TrueType и не рисует ни одного глифа
+    const fontFile = cff ? `/FontFile3 ${fileRef} 0 R` : `/FontFile2 ${fileRef} 0 R`;
 
     const descriptorRef = pdf.add(
-      `<< /Type /FontDescriptor /FontName /${name} /Flags 4 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 /FontFile2 ${fileRef} 0 R >>`
+      `<< /Type /FontDescriptor /FontName /${name} /Flags 4 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 ${fontFile} >>`
     );
 
     const widths = [...entry.widths.entries()]
-      .map(([glyph, width]) => `${glyph} [${Math.round(width)}]`)
+      .flatMap(([glyph, width]) => {
+        const cid = cidOfGlyph(glyph);
+
+        return cid === null ? [] : [`${cid} [${Math.round(width)}]`];
+      })
       .join(' ');
 
+    // `CIDToGIDMap` — поле только `CIDFontType2`. У CIDFontType0 соответствие
+    // CID→GID задаёт charset самого CFF, и лишнее поле делает словарь
+    // недействительным
+    const descendant = cff
+      ? `/Subtype /CIDFontType0`
+      : `/Subtype /CIDFontType2 /CIDToGIDMap /Identity`;
+
     const descendantRef = pdf.add(
-      `<< /Type /Font /Subtype /CIDFontType2 /BaseFont /${name} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor ${descriptorRef} 0 R /DW 1000 /W [${widths}] /CIDToGIDMap /Identity >>`
+      `<< /Type /Font ${descendant} /BaseFont /${name} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor ${descriptorRef} 0 R /DW 1000 /W [${widths}] >>`
     );
 
-    const toUnicodeRef = pdf.addStream('<< /Filter /FlateDecode >>', toUnicodeCMap(entry.mapping));
+    // Ключи `ToUnicode` — тоже CID: по ним просмотрщик сопоставляет
+    // нарисованный глиф символу при копировании и поиске
+    const mapping = new Map<number, string>();
+
+    for (const [glyph, piece] of entry.mapping) {
+      const cid = cidOfGlyph(glyph);
+
+      if (cid !== null && !mapping.has(cid)) {
+        mapping.set(cid, piece);
+      }
+    }
+
+    const toUnicodeRef = pdf.addStream('<< /Filter /FlateDecode >>', toUnicodeCMap(mapping));
 
     const fontRef = pdf.add(
       `<< /Type /Font /Subtype /Type0 /BaseFont /${name} /Encoding /Identity-H /DescendantFonts [${descendantRef} 0 R] /ToUnicode ${toUnicodeRef} 0 R >>`
     );
 
-    names.set(fontId, `/${name} ${fontRef} 0 R`);
+    embedded.set(fontId, { name, ref: fontRef, cidOf });
   }
 
-  return names;
+  return embedded;
 }
 
 /** Картинка, разложенная на объекты PDF. */
@@ -362,7 +447,7 @@ function readDataUrl(url: string): Uint8Array | null {
  * @param pdf - сборщик
  * @param pagesRef - номер дерева страниц
  * @param page - страница display list
- * @param fonts - имена шрифтов по номерам
+ * @param fonts - встроенные шрифты по номерам
  * @param images - объекты картинок по именам
  * @returns номер объекта страницы
  */
@@ -370,7 +455,7 @@ function emitPage(
   pdf: PdfBuilder,
   pagesRef: number,
   page: DisplayPage,
-  fonts: ReadonlyMap<number, string>,
+  fonts: ReadonlyMap<number, EmbeddedFont>,
   images: ReadonlyMap<string, EmittedImage>
 ): number {
   const height = page.height * PX_TO_PT;
@@ -394,7 +479,8 @@ function emitPage(
 
   const resources = [...usedFonts]
     .map((fontId) => fonts.get(fontId))
-    .filter((entry): entry is string => entry !== undefined)
+    .filter((entry): entry is EmbeddedFont => entry !== undefined)
+    .map((entry) => `/${entry.name} ${entry.ref} 0 R`)
     .join(' ');
 
   const xobjects = [...usedImages]
@@ -416,7 +502,7 @@ interface DrawContext {
   readonly flip: (y: number) => number;
   readonly usedFonts: Set<number>;
   readonly usedImages: Set<string>;
-  readonly fonts: ReadonlyMap<number, string>;
+  readonly fonts: ReadonlyMap<number, EmbeddedFont>;
 }
 
 /**
@@ -538,6 +624,9 @@ function drawDecoration(primitive: DecorationPrimitive, context: DrawContext): v
  * поэтому результат совпадает с тем, что показал бы рендер движка. Заодно
  * это снимает вопрос кернинга и лигатур — раскладку уже посчитал движок.
  *
+ * В поток идёт **CID**, а не номер глифа движка: у CID-keyed CFF это разные
+ * числа, и карта перевода лежит в `EmbeddedFont.cidOf`.
+ *
  * @param primitive - прогон текста
  * @param context - поток страницы
  */
@@ -549,16 +638,19 @@ function drawGlyphRun(primitive: GlyphRunPrimitive, context: DrawContext): void 
   }
 
   context.usedFonts.add(primitive.fontId);
-  context.content.push(
-    'BT',
-    fillColor(primitive.color),
-    `${font.slice(0, font.indexOf(' '))} ${pt(primitive.size)} Tf`
-  );
+  context.content.push('BT', fillColor(primitive.color), `/${font.name} ${pt(primitive.size)} Tf`);
 
   for (const glyph of primitive.glyphs) {
+    const cid = font.cidOf === null ? glyph.id : font.cidOf[glyph.id];
+
+    // Глифа нет в субсете — рисовать нечего: пустой CID дал бы `.notdef`
+    if (cid === undefined) {
+      continue;
+    }
+
     context.content.push(
       `1 0 0 1 ${pt(glyph.x)} ${pt(context.flip(glyph.y))} Tm`,
-      `<${glyph.id.toString(16).padStart(4, '0').toUpperCase()}> Tj`
+      `<${cid.toString(16).padStart(4, '0').toUpperCase()}> Tj`
     );
   }
 

@@ -42,6 +42,14 @@ export interface FontRequirement {
   readonly family: string;
   readonly bold: boolean;
   readonly italic: boolean;
+  /**
+   * Скриптовые fallback'и, которые движок просит для этого требования.
+   *
+   * Поля может не быть: латинице и кириллице хватает основной гарнитуры.
+   * Это поле движка (типы пакета его не описывают), поэтому наличие
+   * проверяется здесь, а не предполагается.
+   */
+  readonly scripts?: readonly string[];
 }
 
 /** Отдаёт байты шрифта по требованию; `undefined` — такого шрифта нет. */
@@ -96,11 +104,27 @@ export async function registerFonts(
     return id;
   };
 
-  // Скриптовые fallback'и общие для всех цепочек: они добирают то,
-  // чего нет в основной гарнитуре, и стоят в конце каждой цепочки
+  // Скриптовые fallback'и общие для всех цепочек: они добирают то, чего нет
+  // в основной гарнитуре, и стоят в конце каждой цепочки. Но грузятся
+  // не все подряд, а только названные движком: CJK-начертания весят больше
+  // 20 МБ, и документ на кириллице не должен платить за них. Движок сообщает
+  // нужные скрипты в требованиях (`scripts`), пустой список означает, что
+  // fallback'и не понадобятся
+  const neededScripts = new Set<string>();
+
+  for (const requirement of requirements) {
+    for (const script of requirement.scripts ?? []) {
+      neededScripts.add(script);
+    }
+  }
+
   const scriptIds: number[] = [];
 
   for (const script of SCRIPT_FALLBACKS) {
+    if (!neededScripts.has(script)) {
+      continue;
+    }
+
     const id = await register(`script:${script}`, provider.resolveScriptFallback?.(script, false, false));
 
     if (id !== null) {

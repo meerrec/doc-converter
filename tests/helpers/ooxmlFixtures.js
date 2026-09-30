@@ -132,11 +132,22 @@ export async function buildXlsx({ sheets = 1, rows = 5 } = {}) {
 }
 
 /**
+ * Экранирует текст для XML.
+ *
+ * @param text - исходная строка
+ * @returns строка с заменёнными спецсимволами
+ */
+function escapeXml(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
  * Собирает минимальный, но валидный по структуре DOCX.
  *
  * @param options - параметры документа
  * @param options.pages - число страниц в свойствах документа
  * @param options.paragraphs - число абзацев в теле
+ * @param options.lines - тексты абзацев; заданы — вместо «Абзац N»
  * @param options.withAppXml - добавлять ли `docProps/app.xml` с числом страниц
  * @param options.withMacros - добавлять ли проект VBA (макросы)
  * @returns буфер архива
@@ -144,13 +155,20 @@ export async function buildXlsx({ sheets = 1, rows = 5 } = {}) {
 export async function buildDocx({
   pages = 1,
   paragraphs = 5,
+  lines = null,
   withAppXml = true,
   withMacros = false,
 } = {}) {
   const body = [];
 
-  for (let i = 1; i <= paragraphs; i += 1) {
-    body.push(`<w:p><w:r><w:t>Абзац ${i}</w:t></w:r></w:p>`);
+  if (lines !== null) {
+    for (const line of lines) {
+      body.push(`<w:p><w:r><w:t>${escapeXml(line)}</w:t></w:r></w:p>`);
+    }
+  } else {
+    for (let i = 1; i <= paragraphs; i += 1) {
+      body.push(`<w:p><w:r><w:t>Абзац ${i}</w:t></w:r></w:p>`);
+    }
   }
 
   const document = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

@@ -17,6 +17,7 @@ import { describe, it, expect } from 'vitest';
 import { inflateSync } from 'node:zlib';
 import { buildDocx, buildXlsx } from './helpers/ooxmlFixtures.js';
 import { convertDocument } from '../packages/office/src/engine/convert.js';
+import { readGlyphToCid } from '../packages/office/src/pdf/cff.js';
 
 /** Параметры конвертации по умолчанию — те же значения, что в контракте. */
 const OPTIONS = {
@@ -141,6 +142,51 @@ describe('содержимое PDF', () => {
       .filter((body) => /BT\s[\s\S]*Tj/.test(body));
 
     expect(painted.length).toBeGreaterThan(0);
+  }, 120000);
+
+  /**
+   * Иероглифы приходят CFF-шрифтом (`OTTO`), а не TrueType, и встраиваются
+   * другим словарём — `FontFile3`/`CIDFontType0`. Проверка нужна потому, что
+   * ошибка здесь не роняет сборку: файл выходит целым, а страница — с чужими
+   * знаками или пустой. Так и было, пока в поток писался номер глифа вместо
+   * CID, а шрифт субсеттился с сохранением этих номеров.
+   */
+  it('документ с иероглифами адресует глифы по CID встроенного шрифта', async () => {
+    const bytes = await buildDocx({ lines: ['日本語のテスト文書です'] });
+    const result = await convertDocument({
+      bytes: new Uint8Array(bytes),
+      fileName: 'иероглифы.docx',
+      options: OPTIONS,
+    });
+
+    expect(new TextDecoder('latin1').decode(result.bytes)).toContain('/FontFile3');
+
+    const streams = readStreams(result.bytes);
+    const decode = (body) => new TextDecoder('latin1').decode(body);
+    const embedded = streams
+      .map((stream) => stream.body)
+      .find((body) => decode(body.subarray(0, 4)) === 'OTTO');
+
+    expect(embedded).toBeDefined();
+
+    // `ToUnicode` строится по тем же CID: в нём обязан быть знак из текста
+    const cmaps = streams.map((stream) => decode(stream.body)).filter((body) => body.includes('beginbfchar'));
+
+    expect(cmaps.some((body) => body.includes('<65E5>'))).toBe(true);
+
+    // Все CID из потока страницы должны быть в charset встроенного шрифта:
+    // запись номера глифа вместо CID эту проверку не прошла бы, потому что
+    // карта субсета не тождественна
+    const cidOf = readGlyphToCid(embedded);
+    const known = new Set(cidOf);
+    const content = streams
+      .map((stream) => decode(stream.body))
+      .filter((body) => /BT[\s\S]*?ET/.test(body))
+      .join('\n');
+    const used = [...content.matchAll(/<([0-9A-F]+)>\s*Tj/g)].map((match) => parseInt(match[1], 16));
+
+    expect(used.length).toBeGreaterThan(0);
+    expect(used.filter((cid) => !known.has(cid))).toEqual([]);
   }, 120000);
 
   it('страница книги приходит непустой картинкой', async () => {
