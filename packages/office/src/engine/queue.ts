@@ -140,7 +140,7 @@ export function createLocalQueue(options: LocalQueueOptions): OfficeQueue {
   let engineReady = options.convert !== undefined;
 
   const convert: EngineConverter =
-    options.convert ?? (async (input) => (await loadEngine()).convertDocument(input));
+    options.convert ?? (async (input) => (await loadEngine()).convert(input));
 
   /**
    * Запускает следующую задачу.
@@ -189,7 +189,9 @@ export function createLocalQueue(options: LocalQueueOptions): OfficeQueue {
         events.onPhase(job.itemId, 'loading-office');
 
         try {
-          await loadEngine();
+          // `warmup` поднимает воркер и инициализирует в нём wasm: без него
+          // эта работа попала бы в фазу конвертации и выглядела бы зависанием
+          await (await loadEngine()).warmup();
         } catch (error) {
           // Отказ загрузки терминален и должен отличаться от отказа самого
           // документа: по коду `engine_load_failed` страница блокирует

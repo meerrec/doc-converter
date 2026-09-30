@@ -20,7 +20,7 @@ import { browserFormatOf } from '../filters.js';
 import { buildPdf } from '../pdf/export.js';
 import { renderDocx } from './document.js';
 import { EngineError } from './errors.js';
-import { renderXlsx } from './xlsx.js';
+import { renderXlsx } from './xlsx/render.js';
 
 /** Что получилось из файла. */
 export interface ConvertedDocument {

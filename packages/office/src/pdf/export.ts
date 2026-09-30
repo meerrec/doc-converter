@@ -24,10 +24,11 @@
  *
  * Чего экспортёр пока не делает (сознательно, а не по недосмотру):
  *
- * - **прогоны `kind: 'text'` пропускаются.** Движок не разложил их на глифы,
- *   отдав строку и CSS-шорткат шрифта. Так приходят номера пунктов списка —
- *   содержимое теряется. Лечится шейпингом через harfbuzz (он уже есть
- *   в зависимостях ради субсеттинга), но это отдельный шаг;
+ * - **прогоны `kind: 'text'` пропускаются.** Так приходят номера пунктов
+ *   списка у документов Word: движок не разложил их на глифы, отдав строку
+ *   и CSS-шорткат шрифта. Книги приходят теми же строками, но их раскладывает
+ *   наш шейпинг (`shape/`) до экспортёра, поэтому сюда такие прогоны
+ *   не доходят;
  * - **повороты и масштаб текста** (`rotationDeg`, `horizontalScale`)
  *   игнорируются: текст рисуется по своим координатам глифов, и для
  *   неповёрнутого листа это верно;
@@ -40,9 +41,11 @@
 import { PdfBuilder } from './builder.js';
 import { readGlyphToCid } from './cff.js';
 import { toUnicodeCMap } from './cmap.js';
+import { parseColor } from './color.js';
 import { decodeImage } from './image.js';
 import { loadSubsetter } from './subset.js';
 import type {
+  ClipRect,
   DecorationPrimitive,
   DisplayList,
   DisplayPage,
@@ -51,6 +54,7 @@ import type {
   GlyphRunPrimitive,
   ImagePrimitive,
   LinePrimitive,
+  PathPrimitive,
   RectPrimitive,
 } from './types.js';
 
@@ -105,11 +109,12 @@ export async function buildPdf(displayList: DisplayList, options: PdfExportOptio
   const pagesRef = pdf.add('');
   const fonts = await emitFonts(pdf, usage, options.fonts);
   const images = emitImages(pdf, pages);
+  const alphas = emitAlphaStates(pdf, pages);
 
   const pageRefs: number[] = [];
 
   for (const page of pages) {
-    pageRefs.push(emitPage(pdf, pagesRef, page, fonts, images));
+    pageRefs.push(emitPage(pdf, pagesRef, page, fonts, images, alphas));
   }
 
   pdf.replace(
@@ -456,7 +461,8 @@ function emitPage(
   pagesRef: number,
   page: DisplayPage,
   fonts: ReadonlyMap<number, EmbeddedFont>,
-  images: ReadonlyMap<string, EmittedImage>
+  images: ReadonlyMap<string, EmittedImage>,
+  alphas: ReadonlyMap<number, EmittedAlpha>
 ): number {
   const height = page.height * PX_TO_PT;
 
@@ -466,13 +472,41 @@ function emitPage(
   const content: string[] = [];
   const usedFonts = new Set<number>();
   const usedImages = new Set<string>();
+  const usedAlphas = new Set<number>();
 
   if (page.background !== undefined && page.background !== '') {
     content.push(`${fillColor(page.background)}`, `0 0 ${pt(page.width)} ${pt(page.height)} re f`);
   }
 
+  // Матрица страницы: подгонка под лист (`fitToOnePage`) и поля книги.
+  // Сжимается всё содержимое сразу, а не каждый примитив по отдельности, —
+  // поэтому текст остаётся текстом, а не пересчитанными координатами
+  const transform = page.transform;
+
+  if (transform !== undefined) {
+    const tx = transform.x * PX_TO_PT;
+    const ty = height * (1 - transform.scale) - transform.y * PX_TO_PT;
+
+    content.push(
+      'q',
+      `${transform.scale.toFixed(4)} 0 0 ${transform.scale.toFixed(4)} ${fixed(tx)} ${fixed(ty)} cm`
+    );
+  }
+
   for (const primitive of pagePrimitives(page)) {
-    drawPrimitive(primitive, { content, flip, usedFonts, usedImages, fonts });
+    drawPrimitive(primitive, {
+      content,
+      flip,
+      usedFonts,
+      usedImages,
+      usedAlphas,
+      fonts,
+      alphas,
+    });
+  }
+
+  if (transform !== undefined) {
+    content.push('Q');
   }
 
   const contentRef = pdf.addStream('<< /Filter /FlateDecode >>', new TextEncoder().encode(content.join('\n')));
@@ -491,8 +525,16 @@ function emitPage(
 
   const xobjectDict = xobjects === '' ? '' : ` /XObject << ${xobjects} >>`;
 
+  const graphics = [...usedAlphas]
+    .map((value) => alphas.get(value))
+    .filter((entry): entry is EmittedAlpha => entry !== undefined)
+    .map((entry) => `/${entry.name} ${entry.ref} 0 R`)
+    .join(' ');
+
+  const graphicsDict = graphics === '' ? '' : ` /ExtGState << ${graphics} >>`;
+
   return pdf.add(
-    `<< /Type /Page /Parent ${pagesRef} 0 R /MediaBox [0 0 ${pt(page.width)} ${pt(page.height)}] /Resources << /Font << ${resources} >>${xobjectDict} >> /Contents ${contentRef} 0 R >>`
+    `<< /Type /Page /Parent ${pagesRef} 0 R /MediaBox [0 0 ${pt(page.width)} ${pt(page.height)}] /Resources << /Font << ${resources} >>${xobjectDict}${graphicsDict} >> /Contents ${contentRef} 0 R >>`
   );
 }
 
@@ -502,7 +544,114 @@ interface DrawContext {
   readonly flip: (y: number) => number;
   readonly usedFonts: Set<number>;
   readonly usedImages: Set<string>;
+  readonly usedAlphas: Set<number>;
   readonly fonts: ReadonlyMap<number, EmbeddedFont>;
+  readonly alphas: ReadonlyMap<number, EmittedAlpha>;
+}
+
+/** Состояние прозрачности, заведённое в файле. */
+interface EmittedAlpha {
+  readonly name: string;
+  readonly ref: number;
+}
+
+/**
+ * Заводит объекты состояния прозрачности на все встреченные значения.
+ *
+ * Прозрачность в PDF — не цвет с альфой, а отдельный словарь `/ExtGState`.
+ * Объект общий на весь файл: одно и то же значение встречается на десятках
+ * страниц, и заводить его каждый раз значило бы повторять словарь.
+ *
+ * @param pdf - сборщик
+ * @param pages - страницы документа
+ * @returns значение прозрачности → объект
+ */
+function emitAlphaStates(pdf: PdfBuilder, pages: readonly DisplayPage[]): Map<number, EmittedAlpha> {
+  const values = new Set<number>();
+
+  for (const page of pages) {
+    for (const primitive of pagePrimitives(page)) {
+      const alpha = (primitive as { alpha?: number }).alpha;
+
+      if (alpha !== undefined && alpha < 1) {
+        values.add(roundAlpha(alpha));
+      }
+    }
+  }
+
+  const states = new Map<number, EmittedAlpha>();
+  let index = 0;
+
+  for (const value of values) {
+    index += 1;
+    states.set(value, {
+      name: `GS${index}`,
+      ref: pdf.add(`<< /Type /ExtGState /ca ${value} /CA ${value} >>`),
+    });
+  }
+
+  return states;
+}
+
+/**
+ * Открывает графическое состояние примитива: прозрачность и обрезку.
+ *
+ * @param primitive - примитив с необязательными `alpha` и `clip`
+ * @param context - поток страницы
+ * @returns число открытых состояний, которые нужно закрыть
+ */
+function beginPrimitive(
+  primitive: { readonly alpha?: number; readonly clip?: ClipRect },
+  context: DrawContext
+): number {
+  const clip = primitive.clip;
+  const alpha = primitive.alpha;
+  const state = alpha !== undefined && alpha < 1 ? context.alphas.get(roundAlpha(alpha)) : undefined;
+  const alphaRef = state === undefined ? null : state;
+
+  if (clip === undefined && alphaRef === null) {
+    return 0;
+  }
+
+  context.content.push('q');
+
+  if (alphaRef !== null) {
+    context.usedAlphas.add(roundAlpha(alpha ?? 1));
+    context.content.push(`/${alphaRef.name} gs`);
+  }
+
+  if (clip !== undefined && clip.w > 0 && clip.h > 0) {
+    context.content.push(
+      `${pt(clip.x)} ${pt(context.flip(clip.y + clip.h))} ${pt(clip.w)} ${pt(clip.h)} re W n`
+    );
+  }
+
+  return 1;
+}
+
+/**
+ * Закрывает графическое состояние примитива.
+ *
+ * @param depth - что вернул `beginPrimitive`
+ * @param context - поток страницы
+ */
+function endPrimitive(depth: number, context: DrawContext): void {
+  if (depth > 0) {
+    context.content.push('Q');
+  }
+}
+
+/**
+ * Округляет прозрачность до тысячных.
+ *
+ * Значения приходят из цветов вида `rgba(...)`, а словарь `/ExtGState` —
+ * объект файла: без округления близкие значения заводили бы отдельные записи.
+ *
+ * @param value - прозрачность
+ * @returns округлённое значение
+ */
+function roundAlpha(value: number): number {
+  return Math.round(Math.min(1, Math.max(0, value)) * 1000) / 1000;
 }
 
 /**
@@ -528,8 +677,11 @@ function drawPrimitive(primitive: DisplayPrimitive, context: DrawContext): void 
     case 'glyphRun':
       drawGlyphRun(primitive as GlyphRunPrimitive, context);
       return;
+    case 'path':
+      drawPath(primitive as PathPrimitive, context);
+      return;
     default:
-      // `text` и фигуры движка пока не поддержаны — см. шапку файла
+      // `text` движка пока не поддержан — см. шапку файла
       return;
   }
 }
@@ -545,10 +697,14 @@ function drawRect(primitive: RectPrimitive, context: DrawContext): void {
     return;
   }
 
+  const depth = beginPrimitive(primitive, context);
+
   context.content.push(
     fillColor(primitive.fill),
     `${pt(primitive.x)} ${pt(context.flip(primitive.y + primitive.h))} ${pt(primitive.w)} ${pt(primitive.h)} re f`
   );
+
+  endPrimitive(depth, context);
 }
 
 /**
@@ -564,12 +720,16 @@ function drawRect(primitive: RectPrimitive, context: DrawContext): void {
 function drawLine(primitive: LinePrimitive, context: DrawContext): void {
   const width = primitive.strokeWidth > 0 ? primitive.strokeWidth : MIN_DECORATION_PT;
 
+  const depth = beginPrimitive(primitive, context);
+
   context.content.push(
     `${strokeColor(primitive.color)} RG`,
     `${pt(width)} w`,
     dashPattern(primitive.dash),
     `${pt(primitive.x1)} ${pt(context.flip(primitive.y1))} m ${pt(primitive.x2)} ${pt(context.flip(primitive.y2))} l S`
   );
+
+  endPrimitive(depth, context);
 }
 
 /**
@@ -587,12 +747,16 @@ function drawImage(primitive: ImagePrimitive, context: DrawContext): void {
   // использование: в ресурсы страницы попадает лишь то, что нарисовано
   context.usedImages.add(primitive.relId);
 
+  const depth = beginPrimitive(primitive, context);
+
   context.content.push(
     'q',
     `${pt(primitive.w)} 0 0 ${pt(primitive.h)} ${pt(primitive.x)} ${pt(context.flip(primitive.y + primitive.h))} cm`,
     `/${imageName(primitive.relId)} Do`,
     'Q'
   );
+
+  endPrimitive(depth, context);
 }
 
 /**
@@ -609,12 +773,16 @@ function drawDecoration(primitive: DecorationPrimitive, context: DrawContext): v
   const thickness = Math.max(primitive.h, MIN_DECORATION_PT / PX_TO_PT);
   const pattern = primitive.dashed === true ? '[3 2] 0 d' : primitive.dotted === true ? '[1 2] 0 d' : '[] 0 d';
 
+  const depth = beginPrimitive(primitive, context);
+
   context.content.push(
     fillColor(primitive.color),
     pattern,
     `${pt(primitive.x)} ${pt(context.flip(primitive.y + thickness))} ${pt(primitive.w)} ${pt(thickness)} re f`,
     '[] 0 d'
   );
+
+  endPrimitive(depth, context);
 }
 
 /**
@@ -637,6 +805,8 @@ function drawGlyphRun(primitive: GlyphRunPrimitive, context: DrawContext): void 
     return;
   }
 
+  const depth = beginPrimitive(primitive, context);
+
   context.usedFonts.add(primitive.fontId);
   context.content.push('BT', fillColor(primitive.color), `/${font.name} ${pt(primitive.size)} Tf`);
 
@@ -655,6 +825,84 @@ function drawGlyphRun(primitive: GlyphRunPrimitive, context: DrawContext): void 
   }
 
   context.content.push('ET');
+
+  endPrimitive(depth, context);
+}
+
+/**
+ * Рисует путь: фигуры, диаграммы — всё, что движок отдал командой `path`.
+ *
+ * Квадратичная кривая переводится в кубическую: оператора `q` в PDF нет,
+ * а ломаная на месте сглаженного угла заметна. Контрольные точки считаются
+ * по обычной формуле подъёма степени — результат совпадает с тем, что
+ * нарисовал бы canvas.
+ *
+ * @param primitive - путь
+ * @param context - поток страницы
+ */
+function drawPath(primitive: PathPrimitive, context: DrawContext): void {
+  if (primitive.commands.length === 0) {
+    return;
+  }
+
+  const depth = beginPrimitive(primitive, context);
+
+  /** Последняя точка пути: от неё считается квадратичная кривая. */
+  let current: { x: number; y: number } | null = null;
+
+  for (const command of primitive.commands) {
+    switch (command.type) {
+      case 'move':
+        context.content.push(`${pt(command.x)} ${pt(context.flip(command.y))} m`);
+        current = { x: command.x, y: command.y };
+        break;
+      case 'line':
+        context.content.push(`${pt(command.x)} ${pt(context.flip(command.y))} l`);
+        current = { x: command.x, y: command.y };
+        break;
+      case 'cubic':
+        context.content.push(
+          `${pt(command.cp1x)} ${pt(context.flip(command.cp1y))} ${pt(command.cp2x)} ${pt(context.flip(command.cp2y))} ${pt(command.x)} ${pt(context.flip(command.y))} c`
+        );
+        current = { x: command.x, y: command.y };
+        break;
+      case 'quad': {
+        const from = current ?? { x: command.cpx, y: command.cpy };
+        const firstX = from.x + (2 / 3) * (command.cpx - from.x);
+        const firstY = from.y + (2 / 3) * (command.cpy - from.y);
+        const secondX = command.x + (2 / 3) * (command.cpx - command.x);
+        const secondY = command.y + (2 / 3) * (command.cpy - command.y);
+
+        context.content.push(
+          `${pt(firstX)} ${pt(context.flip(firstY))} ${pt(secondX)} ${pt(context.flip(secondY))} ${pt(command.x)} ${pt(context.flip(command.y))} c`
+        );
+        current = { x: command.x, y: command.y };
+        break;
+      }
+      case 'close':
+        context.content.push('h');
+        break;
+    }
+  }
+
+  const fill = primitive.fill;
+  const stroke = primitive.stroke;
+
+  if (fill !== undefined) {
+    context.content.push(fillColor(fill));
+  }
+
+  if (stroke !== undefined) {
+    context.content.push(
+      `${strokeColor(stroke.color)} RG`,
+      `${pt(stroke.width > 0 ? stroke.width : MIN_DECORATION_PT)} w`
+    );
+  }
+
+  // Оператор выбирается по тому, что задано: `B` — заливка и обводка сразу
+  context.content.push(fill !== undefined && stroke !== undefined ? 'B' : fill !== undefined ? 'f' : 'S');
+
+  endPrimitive(depth, context);
 }
 
 /**
@@ -688,6 +936,19 @@ function pt(value: number): string {
 }
 
 /**
+ * Округляет значение, которое уже выражено в пунктах.
+ *
+ * Нужно там, где величина посчитана в пунктах, а не пришла в пикселях:
+ * повторное умножение на `PX_TO_PT` в `pt` её бы испортило.
+ *
+ * @param value - значение в пунктах
+ * @returns строка с числом
+ */
+function fixed(value: number): string {
+  return value.toFixed(2);
+}
+
+/**
  * Цвет заливки: `#rrggbb` → `r g b rg`.
  *
  * @param color - цвет display list
@@ -714,22 +975,7 @@ function strokeColor(color: string): string {
  * @returns три компоненты через пробел
  */
 function channels(color: string): string {
-  const value = (color.startsWith('#') ? color.slice(1) : color).trim();
-  const full =
-    value.length === 3
-      ? value
-          .split('')
-          .map((char) => char + char)
-          .join('')
-      : value;
-
-  if (!/^[0-9a-fA-F]{6}$/.test(full)) {
-    return '0 0 0';
-  }
-
-  const part = (from: number): string => (parseInt(full.slice(from, from + 2), 16) / 255).toFixed(3);
-
-  return `${part(0)} ${part(2)} ${part(4)}`;
+  return parseColor(color).channels;
 }
 
 /**

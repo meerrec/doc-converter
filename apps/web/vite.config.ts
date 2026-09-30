@@ -42,4 +42,12 @@ export default defineConfig({
     outDir: 'dist',
     sourcemap: false,
   },
+
+  // Воркер движка собирается как ES-модуль: внутри него нужен `import.meta.url`
+  // — по нему движок находит свои wasm-ассеты. В режиме `iife` Vite подменяет
+  // его через `self.location`, и это работает, но держится на деталях сборки,
+  // а не на стандарте
+  worker: {
+    format: 'es',
+  },
 });

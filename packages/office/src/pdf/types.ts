@@ -33,7 +33,21 @@ export interface PositionedGlyph {
   readonly advance?: number;
 }
 
-/** Прогон текста, уже разложенный движком на глифы. */
+/**
+ * Прямоугольник обрезки: за его пределами примитив не рисуется.
+ *
+ * Так приходит текст книги: ячейка обрезает содержимое, если оно шире
+ * колонки. В PDF это оператор `W n`, а не «обрезать координаты» —
+ * знаки за границей просто не выводятся.
+ */
+export interface ClipRect {
+  readonly x: number;
+  readonly y: number;
+  readonly w: number;
+  readonly h: number;
+}
+
+/** Прогон текста, уже разложенный на глифы — движком (Word) или нами (книга). */
 export interface GlyphRunPrimitive {
   readonly kind: 'glyphRun';
   readonly fontId: number;
@@ -41,6 +55,10 @@ export interface GlyphRunPrimitive {
   readonly color: string;
   readonly text: string;
   readonly glyphs: readonly PositionedGlyph[];
+  /** Обрезка по ячейке; у документа Word её нет. */
+  readonly clip?: ClipRect;
+  /** Прозрачность: `1` — непрозрачный, поле отсутствует. */
+  readonly alpha?: number;
 }
 
 /** Прямоугольник: заливка фона, граница таблицы, плашка. */
@@ -51,6 +69,8 @@ export interface RectPrimitive {
   readonly w: number;
   readonly h: number;
   readonly fill: string;
+  readonly clip?: ClipRect;
+  readonly alpha?: number;
 }
 
 /** Отрезок: граница, разделитель, подчёркивание таблицы. */
@@ -63,6 +83,8 @@ export interface LinePrimitive {
   readonly strokeWidth: number;
   readonly color: string;
   readonly dash?: readonly number[];
+  readonly clip?: ClipRect;
+  readonly alpha?: number;
 }
 
 /** Картинка: байты лежат в `relId` как `data:`-ссылка. */
@@ -73,6 +95,45 @@ export interface ImagePrimitive {
   readonly y: number;
   readonly w: number;
   readonly h: number;
+  readonly clip?: ClipRect;
+}
+
+/** Команда пути — подмножество графических операторов PDF. */
+export type PathCommand =
+  | { readonly type: 'move'; readonly x: number; readonly y: number }
+  | { readonly type: 'line'; readonly x: number; readonly y: number }
+  | {
+      readonly type: 'quad';
+      readonly cpx: number;
+      readonly cpy: number;
+      readonly x: number;
+      readonly y: number;
+    }
+  | {
+      readonly type: 'cubic';
+      readonly cp1x: number;
+      readonly cp1y: number;
+      readonly cp2x: number;
+      readonly cp2y: number;
+      readonly x: number;
+      readonly y: number;
+    }
+  | { readonly type: 'close' };
+
+/**
+ * Путь: фигуры, диаграммы, всё, что движок книг отдаёт командой `path`.
+ *
+ * Квадратичная кривая здесь допустима, хотя оператора `q` в PDF нет:
+ * экспортёр переводит её в кубическую — так ближе к тому, что нарисовал бы
+ * canvas, чем ломаная.
+ */
+export interface PathPrimitive {
+  readonly kind: 'path';
+  readonly commands: readonly PathCommand[];
+  readonly fill?: string;
+  readonly stroke?: { readonly color: string; readonly width: number };
+  readonly clip?: ClipRect;
+  readonly alpha?: number;
 }
 
 /** Декорация текста: подчёркивание, зачёркивание, выделение. */
@@ -86,6 +147,8 @@ export interface DecorationPrimitive {
   readonly color: string;
   readonly dashed?: boolean;
   readonly dotted?: boolean;
+  readonly clip?: ClipRect;
+  readonly alpha?: number;
 }
 
 /**
@@ -111,7 +174,8 @@ export type PaintablePrimitive =
   | RectPrimitive
   | LinePrimitive
   | ImagePrimitive
-  | DecorationPrimitive;
+  | DecorationPrimitive
+  | PathPrimitive;
 
 /** Всё, что встречается в display list, включая пока не поддержанное. */
 export type DisplayPrimitive = PaintablePrimitive | TextRunPrimitive | { readonly kind: string };
@@ -121,6 +185,19 @@ export interface HeaderFooterRegion {
   readonly y: number;
   readonly height: number;
   readonly primitives: readonly DisplayPrimitive[];
+}
+
+/**
+ * Матрица содержимого страницы: масштаб и сдвиг.
+ *
+ * Так выражается подгонка книги под страницу (`fitToOnePage`) и её поля:
+ * содержимое сжимается целиком, а не пересчитывается поэлементно. Вектор
+ * от этого не страдает — текст остаётся текстом, меняется только матрица.
+ */
+export interface PageTransform {
+  readonly scale: number;
+  readonly x: number;
+  readonly y: number;
 }
 
 /** Страница display list. */
@@ -133,6 +210,7 @@ export interface DisplayPage {
   readonly background?: string;
   readonly header?: HeaderFooterRegion;
   readonly footer?: HeaderFooterRegion;
+  readonly transform?: PageTransform;
 }
 
 /** Display list целиком. */

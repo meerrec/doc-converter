@@ -107,6 +107,49 @@ describe('импорты контракта в движке', () => {
   });
 });
 
+/**
+ * Файлы, которые грузятся на главный поток, и модули, которых в них быть
+ * не должно.
+ *
+ * Конвейер, разбор документов и книги — это мегабайты wasm; на странице они
+ * обязаны появляться только динамическим импортом из воркера. Статический
+ * импорт утащил бы их в чанк клиента, то есть в загрузку каждого посетителя,
+ * и заметить это по размеру точки входа не всегда возможно: чанк клиента
+ * грузится отдельно.
+ */
+const LIGHT_FILES = [
+  'index.ts',
+  'engine/queue.ts',
+  'engine/load.ts',
+  'engine/client.ts',
+];
+
+const HEAVY_MODULES = ['convert.js', 'document.js', 'xlsx/'];
+
+describe('точка входа не тянет движок статически', () => {
+  it('тяжёлые модули подключаются только динамически', () => {
+    for (const relative of LIGHT_FILES) {
+      const file = path.join(OFFICE_SRC, relative);
+      const source = readFileSync(file, 'utf8');
+
+      for (const { isTypeOnly, module } of importedModules(source)) {
+        // Типы стираются при сборке и в бандл ничего не тянут — проверка
+        // про значения, а не про описания
+        if (isTypeOnly) {
+          continue;
+        }
+
+        const heavy = HEAVY_MODULES.some((name) => module.includes(name));
+
+        expect(
+          heavy,
+          `${relative}: «${module}» обязан подключаться динамическим импортом, иначе движок попадёт на главный поток`
+        ).toBe(false);
+      }
+    }
+  });
+});
+
 describe('изоляция движка от приложения', () => {
   it('движок не импортирует React, серверные пакеты и код приложений', () => {
     for (const file of filesUnder(OFFICE_SRC, '.ts')) {

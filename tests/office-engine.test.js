@@ -189,7 +189,14 @@ describe('содержимое PDF', () => {
     expect(used.filter((cid) => !known.has(cid))).toEqual([]);
   }, 120000);
 
-  it('страница книги приходит непустой картинкой', async () => {
+  /**
+   * Книга рисуется вектором, а не картинкой: текст в PDF обязан быть текстом.
+   *
+   * Проверка идёт по потоку страницы и по `ToUnicode`: одного `Tj`
+   * недостаточно — нарисованные глифы без таблицы соответствия видны,
+   * но не ищутся и не копируются, а это и было причиной отказа от растра.
+   */
+  it('страница книги рисует текст глифами, а не картинкой', async () => {
     const bytes = await buildXlsx({ sheets: 1, rows: 5 });
     const result = await convertDocument({
       bytes: new Uint8Array(bytes),
@@ -197,26 +204,26 @@ describe('содержимое PDF', () => {
       options: OPTIONS,
     });
 
-    // Только цветовой слой: маска прозрачности — тоже картинка, но у плотной
-    // страницы она белая по построению, и проверка на ней ничего не значит
-    const images = readStreams(result.bytes).filter(
-      (stream) => stream.dict.includes('/Subtype /Image') && stream.dict.includes('/DeviceRGB')
-    );
+    const streams = readStreams(result.bytes);
+    const painted = streams
+      .map((stream) => new TextDecoder('latin1').decode(stream.body))
+      .filter((body) => /BT[\s\S]*?Tj/.test(body));
 
-    expect(images.length).toBeGreaterThan(0);
+    expect(painted.length).toBeGreaterThan(0);
 
-    for (const image of images) {
-      const pixels = image.body;
-      let painted = 0;
+    // Текст из фикстуры — «строка N»: буква «с» (U+0441) должна найтись
+    // в таблице копирования, иначе выделить и найти её будет нельзя
+    const cmaps = streams
+      .map((stream) => new TextDecoder('latin1').decode(stream.body))
+      .filter((body) => body.includes('beginbfchar'));
 
-      for (let at = 0; at + 2 < pixels.length; at += 3) {
-        if (pixels[at] !== 255 || pixels[at + 1] !== 255 || pixels[at + 2] !== 255) {
-          painted += 1;
-        }
-      }
+    expect(cmaps.some((body) => body.includes('<0441>'))).toBe(true);
 
-      expect(painted).toBeGreaterThan(0);
-    }
+    // Растровых страниц больше нет: картинка в книжном PDF остаётся только
+    // у изображений самой книги, а их в фикстуре нет
+    const images = streams.filter((stream) => stream.dict.includes('/Subtype /Image'));
+
+    expect(images).toEqual([]);
   }, 120000);
 });
 

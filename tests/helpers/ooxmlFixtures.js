@@ -7,7 +7,102 @@
  * yazl — на диск ничего не пишется.
  */
 
+import { deflateSync } from 'node:zlib';
 import yazl from 'yazl';
+
+/** Таблица CRC32: её требует каждый блок PNG. */
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+
+    table[index] = value >>> 0;
+  }
+
+  return table;
+})();
+
+/**
+ * Считает CRC32 блока PNG.
+ *
+ * @param bytes - байты блока
+ * @returns контрольная сумма
+ */
+function crc32(bytes) {
+  let crc = 0xffffffff;
+
+  for (const byte of bytes) {
+    crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * Собирает блок PNG: длина, тип, данные, контрольная сумма.
+ *
+ * @param type - тип блока
+ * @param data - данные блока
+ * @returns байты блока
+ */
+function pngChunk(type, data) {
+  const length = Buffer.alloc(4);
+  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4);
+
+  length.writeUInt32BE(data.length);
+  crc.writeUInt32BE(crc32(body));
+
+  return Buffer.concat([length, body, crc]);
+}
+
+/**
+ * Собирает настоящий PNG с заливкой — картинку для фикстур.
+ *
+ * Кодировщик написан здесь, а не взят из зависимости: тесты не должны
+ * тянуть пакет движка ради одного изображения, а формат в этой части прост —
+ * заголовок, один блок данных и конец файла.
+ *
+ * @param options - размеры и цвет заливки
+ * @param options.width - ширина в пикселях
+ * @param options.height - высота в пикселях
+ * @param options.color - цвет заливки, по умолчанию синий
+ * @returns байты PNG
+ */
+export function buildPng({ width = 4, height = 4, color = [0, 0, 255] } = {}) {
+  const header = Buffer.alloc(13);
+
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8; // бит на канал
+  header[9] = 2; // truecolor: RGB без прозрачности
+  const rows = [];
+
+  for (let y = 0; y < height; y += 1) {
+    // Первый байт строки — фильтр: 0 означает «без фильтрации»
+    const row = Buffer.alloc(1 + width * 3);
+
+    for (let x = 0; x < width; x += 1) {
+      row[1 + x * 3] = color[0];
+      row[2 + x * 3] = color[1];
+      row[3 + x * 3] = color[2];
+    }
+
+    rows.push(row);
+  }
+
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', header),
+    pngChunk('IDAT', deflateSync(Buffer.concat(rows))),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
 
 /**
  * Собирает zip-архив из набора записей.
@@ -139,6 +234,90 @@ export async function buildXlsx({ sheets = 1, rows = 5 } = {}) {
  */
 function escapeXml(text) {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * Собирает книгу с картинкой на листе.
+ *
+ * Картинка нужна там, где проверяется её встраивание: печатный display list
+ * изображений не содержит, и в PDF они попадают отдельным путём — через
+ * объекты листа и часть `xl/media`. Фикстура повторяет ту же структуру,
+ * что делает Excel: лист ссылается на drawing, drawing — на медиа.
+ *
+ * @param options - параметры книги
+ * @param options.rows - число строк на листе
+ * @returns буфер архива
+ */
+export async function buildXlsxWithPicture({ rows = 3 } = {}) {
+  const { workbook, workbookRels } = buildWorkbook(1);
+  const cells = [];
+
+  for (let row = 1; row <= rows; row += 1) {
+    cells.push(
+      `<row r="${row}"><c r="A${row}" t="n"><v>${row}</v></c><c r="B${row}" t="inlineStr"><is><t>строка ${row}</t></is></c></row>`
+    );
+  }
+
+  const sheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheetData>${cells.join('')}</sheetData>
+  <drawing r:id="rId1"/>
+</worksheet>`;
+
+  const sheetRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>
+</Relationships>`;
+
+  // Якорь на две ячейки: картинка растянута от B1 до D4
+  const drawing = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <xdr:twoCellAnchor>
+    <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+    <xdr:pic>
+      <xdr:nvPicPr>
+        <xdr:cNvPr id="1" name="Картинка 1"/>
+        <xdr:cNvPicPr/>
+      </xdr:nvPicPr>
+      <xdr:blipFill>
+        <a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="rId1"/>
+        <a:stretch><a:fillRect/></a:stretch>
+      </xdr:blipFill>
+      <xdr:spPr>
+        <a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm>
+        <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+      </xdr:spPr>
+    </xdr:pic>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>`;
+
+  const drawingRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+</Relationships>`;
+
+  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="png" ContentType="image/png"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
+</Types>`;
+
+  return buildZip([
+    ['[Content_Types].xml', contentTypes],
+    ['_rels/.rels', ROOT_RELS],
+    ['xl/workbook.xml', workbook],
+    ['xl/_rels/workbook.xml.rels', workbookRels],
+    ['xl/worksheets/sheet1.xml', sheet],
+    ['xl/worksheets/_rels/sheet1.xml.rels', sheetRels],
+    ['xl/drawings/drawing1.xml', drawing],
+    ['xl/drawings/_rels/drawing1.xml.rels', drawingRels],
+    ['xl/media/image1.png', buildPng()],
+  ]);
 }
 
 /**
