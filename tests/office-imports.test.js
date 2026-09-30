@@ -124,7 +124,16 @@ const LIGHT_FILES = [
   'engine/client.ts',
 ];
 
-const HEAVY_MODULES = ['convert.js', 'document.js', 'xlsx/'];
+const HEAVY_MODULES = [
+  'convert.js',
+  'document.js',
+  'xlsx/',
+  // Сессия предпросмотра тянет движок целиком: вёрстку Word, разбор книги
+  // и canvas-рендерер. Из точки входа её подключают только динамически
+  'preview.js',
+  'raster.js',
+  'canvas-fonts.js',
+];
 
 describe('точка входа не тянет движок статически', () => {
   it('тяжёлые модули подключаются только динамически', () => {

@@ -30,6 +30,7 @@ import type { ConversionOptions } from '@doc-converter/contract';
 import type { ConvertedDocument, ConvertInput } from './convert.js';
 import { EngineError } from './errors.js';
 import { loadEngine } from './load.js';
+import type { PreviewSession } from './preview.js';
 
 /** Что происходит с задачей внутри очереди. */
 export type OfficePhase = 'waiting' | 'loading-office' | 'converting' | 'previewing';
@@ -39,14 +40,14 @@ export type OfficeOutcome =
   | { readonly kind: 'converted'; readonly bytes: Uint8Array }
   | {
       readonly kind: 'previewed';
-      readonly sheets: number | null;
       /**
-       * Готовый PDF предпросмотра.
+       * Открытый документ.
        *
-       * У своего движка нет окна: он рисует не документ на canvas, а страницы,
-       * и показать их можно только тем же экспортёром, что собирает результат.
+       * У движка нет окна редактора: он раскладывает документ и отдаёт
+       * страницы по одной, а рисует их canvas-рендерер. Сессия — это и есть
+       * открытый документ; закрывает её очередь, а не панель.
        */
-      readonly pdf?: Uint8Array;
+      readonly session: PreviewSession;
     };
 
 /** Общее у задач очереди. */
@@ -105,6 +106,9 @@ export interface OfficeQueue {
 /** Чем очередь выполняет задачу: в бою — конвейер, в тестах — подмена. */
 export type EngineConverter = (input: ConvertInput) => Promise<ConvertedDocument>;
 
+/** Чем очередь открывает документ для предпросмотра. */
+export type PreviewOpener = (input: ConvertInput) => Promise<PreviewSession>;
+
 /** Что нужно очереди, чтобы работать. */
 export interface LocalQueueOptions {
   /**
@@ -112,6 +116,12 @@ export interface LocalQueueOptions {
    * подмена нужна тестам, у которых нет ни wasm, ни шрифтов.
    */
   readonly convert?: EngineConverter;
+  /**
+   * Открывает документ для предпросмотра. По умолчанию — клиент движка,
+   * загружаемый лениво; подмена нужна тестам, у которых нет ни wasm,
+   * ни canvas.
+   */
+  readonly openPreview?: PreviewOpener;
   /** Куда сообщать о ходе работы. */
   readonly events: OfficeQueueEvents;
 }
@@ -141,6 +151,26 @@ export function createLocalQueue(options: LocalQueueOptions): OfficeQueue {
 
   const convert: EngineConverter =
     options.convert ?? (async (input) => (await loadEngine()).convert(input));
+
+  const openPreview: PreviewOpener =
+    options.openPreview ?? (async (input) => (await loadEngine()).openPreview(input));
+
+  /**
+   * Показанный документ.
+   *
+   * Владелец сессии — очередь, а не панель: документ открыт, пока его
+   * показывают, и закрыть его нужно и при закрытии панели, и при замене
+   * другим, и при уборке строки из списка.
+   */
+  let shown: PreviewSession | null = null;
+
+  /**
+   * Закрывает показанный документ, если он есть.
+   */
+  function closeShown(): void {
+    shown?.close();
+    shown = null;
+  }
 
   /**
    * Запускает следующую задачу.
@@ -207,22 +237,29 @@ export function createLocalQueue(options: LocalQueueOptions): OfficeQueue {
 
       events.onPhase(job.itemId, job.kind === 'preview' ? 'previewing' : 'converting');
 
-      const result = await convert({
+      const input = {
         bytes: await job.readBytes(),
         fileName: job.fileName,
         options: job.options,
-      });
+      };
 
       if (job.kind === 'preview') {
+        const session = await openPreview(input);
+
+        // Прежний документ закрывается только после того, как открылся новый:
+        // иначе неудачный предпросмотр гасил бы показанный
+        closeShown();
+        shown = session;
+
+        // Событие идёт раньше исхода: панель не должна показать документ,
+        // которого в движке уже нет (см. `office-local.test.js`)
         events.onDocumentChanged(job.itemId);
-        events.onDone(job.itemId, {
-          kind: 'previewed',
-          sheets: result.sheets,
-          pdf: result.bytes,
-        });
+        events.onDone(job.itemId, { kind: 'previewed', session });
 
         return;
       }
+
+      const result = await convert(input);
 
       if (result.bytes.byteLength < MIN_OUTPUT_BYTES) {
         throw new EngineError('engine_convert_failed', 'экспортёр вернул пустой файл');
@@ -265,8 +302,9 @@ export function createLocalQueue(options: LocalQueueOptions): OfficeQueue {
     },
 
     async closeDocument(): Promise<void> {
-      // Закрывать нечего: документ живёт только внутри задачи, а показанный
-      // предпросмотр — это PDF в памяти страницы, и освобождает его она сама
+      // Документ — это сессия движка: вёрстка Word или открытая книга.
+      // Держать её после закрытия панели незачем, и освобождает её очередь
+      closeShown();
       events.onDocumentChanged(null);
     },
   };

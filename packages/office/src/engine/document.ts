@@ -17,7 +17,9 @@ import { configureDefaultFonts, getRustTextEngine, type ResidentMeasurementConfi
 import { buildRustDisplayList } from '@betteroffice/docx/layout/render';
 import * as bundledFonts from '@betteroffice/fonts';
 import { createYrsSession } from '@betteroffice/docx/yrs';
+import type { CanvasFonts } from './canvas-fonts.js';
 import { registerFonts, type FontProvider, type FontRequirement } from './fonts.js';
+import { shapeTextRuns } from './textRuns.js';
 import type { DisplayList, FontResource } from '../pdf/types.js';
 
 /** Результат прогона: то, из чего собирается PDF. */
@@ -47,13 +49,30 @@ function configureOnce(): void {
   configured = true;
 }
 
+/** Что нужно прогону, кроме самого файла. */
+export interface RenderDocxOptions {
+  /**
+   * Реестр шрифтов canvas.
+   *
+   * Нужен предпросмотру: номера пунктов списка и всё, что не удалось
+   * разложить на глифы, рисуется строкой, а для этого начертание должно быть
+   * зарегистрировано в окружении. Экспортёру PDF он не нужен — тот рисует
+   * глифами.
+   */
+  readonly canvasFonts?: CanvasFonts;
+}
+
 /**
  * Раскладывает документ Word и отдаёт примитивы отрисовки.
  *
  * @param bytes - байты файла DOCX
+ * @param options - шрифты canvas, если документ готовится к предпросмотру
  * @returns вёрстка и шрифты
  */
-export async function renderDocx(bytes: Uint8Array): Promise<RenderedDocument> {
+export async function renderDocx(
+  bytes: Uint8Array,
+  options: RenderDocxOptions = {}
+): Promise<RenderedDocument> {
   configureOnce();
 
   const provider = bundledFonts.createFontProvider() as FontProvider;
@@ -72,11 +91,16 @@ export async function renderDocx(bytes: Uint8Array): Promise<RenderedDocument> {
     session.layoutFontRequirementsJson(JSON.stringify(request))
   ) as FontRequirement[];
 
+  // Одни и те же байты ложатся в два хранилища: сессии — для раскладки строк,
+  // движка отрисовки — для глифов. Нумерация у них своя, и подмена одной
+  // другой работает лишь до второго документа: у него номера расходятся,
+  // и вёрстка теряет переносы (проверено на документе с таблицами)
   const engine = await getRustTextEngine();
-  const { files, chains } = await registerFonts(engine, provider, requirements);
+  const registry = await registerFonts({ layout: session, render: engine }, provider, requirements);
+  const { chains, layoutChains } = registry;
 
   const measurement: ResidentMeasurementConfig = {
-    fontChains: chains,
+    fontChains: layoutChains,
     defaults: { fontSize: 11, fontFamily: 'Calibri' },
     compat: {
       noLeading: document?.package?.settings?.compatibilityFlags?.noLeading ?? false,
@@ -102,7 +126,12 @@ export async function renderDocx(bytes: Uint8Array): Promise<RenderedDocument> {
 
   // Присваивание с явным типом — это и есть проверка стыка: если движок
   // переименует поле в примитивах, ошибка будет здесь, а не в пустом PDF
-  const displayList: DisplayList = built;
+  const engineList: DisplayList = built;
 
-  return { displayList, fonts: files, pageCount: displayList.pages.length };
+  // Номера пунктов списка движок отдаёт строкой: он не разложил их сам,
+  // а в PDF текст уходит глифами. Раскладка идёт до экспортёра и до
+  // предпросмотра — оба должны видеть одну и ту же вёрстку
+  const displayList = await shapeTextRuns(engineList, registry, options.canvasFonts);
+
+  return { displayList, fonts: registry.files, pageCount: displayList.pages.length };
 }

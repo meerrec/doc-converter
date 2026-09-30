@@ -17,6 +17,7 @@ import { describe, it, expect } from 'vitest';
 import { inflateSync } from 'node:zlib';
 import { buildDocx, buildXlsx } from './helpers/ooxmlFixtures.js';
 import { convertDocument } from '../packages/office/src/engine/convert.js';
+import { renderDocx } from '../packages/office/src/engine/document.js';
 import { readGlyphToCid } from '../packages/office/src/pdf/cff.js';
 
 /** Параметры конвертации по умолчанию — те же значения, что в контракте. */
@@ -100,6 +101,71 @@ describe('документ Word', () => {
     expect(result.pageCount).toBeGreaterThan(0);
     expect(pageCountOf(result.bytes)).toBe(result.pageCount);
     expect(result.sheets).toBeNull();
+  }, 120000);
+});
+
+/**
+ * Номера пунктов списка.
+ *
+ * Движок отдаёт их прогоном `kind: 'text'` — строкой и CSS-шорткатом шрифта, —
+ * а экспортёр PDF текстом не рисует: в файл уходит номер глифа. Пока такие
+ * прогоны пропускались, нумерованный список выходил без номеров, и заметить
+ * это можно было только глазами в скачанном файле.
+ */
+describe('список', () => {
+  it('номер пункта доезжает до PDF глифами', async () => {
+    const bytes = await buildDocx({ paragraphs: 0, numbered: 2 });
+    const rendered = await renderDocx(new Uint8Array(bytes));
+    const markers = rendered.displayList.pages[0].primitives.filter(
+      (primitive) => primitive.listMarker === true
+    );
+
+    expect(markers).toHaveLength(2);
+    expect(markers.map((marker) => marker.kind)).toEqual(['glyphRun', 'glyphRun']);
+    expect(markers.every((marker) => marker.glyphs.length > 0)).toBe(true);
+
+    const result = await convertDocument({
+      bytes: new Uint8Array(bytes),
+      fileName: 'список.docx',
+      options: OPTIONS,
+    });
+
+    // Пропущенного нет: будь прогоны не разобраны, они остались бы в вёрстке
+    // как `text`, и счётчик это назвал бы
+    expect(result.skipped).toEqual({});
+
+    // Точка из «1.» — единственная в этом документе: её появление в таблице
+    // копирования и есть след номера, нарисованного глифами
+    const cmaps = readStreams(result.bytes)
+      .map((stream) => new TextDecoder('latin1').decode(stream.body))
+      .filter((body) => body.includes('beginbfchar'));
+
+    expect(cmaps.some((body) => body.includes('<002E>'))).toBe(true);
+  }, 120000);
+});
+
+/**
+ * Перенос строк внутри абзаца.
+ *
+ * Проверка стоит на вёрстке, а не на PDF: именно здесь видно, разбит абзац
+ * на строки или лёг одной длинной. Без разбивки текст уходил за поля
+ * и налезал на соседние колонки — так и было, пока шрифты регистрировались
+ * только в движке измерения и вёрстка оставалась без них.
+ */
+describe('вёрстка документа', () => {
+  it('длинный абзац переносится по строкам', async () => {
+    const long =
+      'Длинный абзац, который заведомо не помещается в полосу набора страницы и обязан быть разбит на несколько строк при вёрстке документа, иначе он вылезет за поля.';
+    const bytes = await buildDocx({ lines: [long] });
+    const rendered = await renderDocx(new Uint8Array(bytes));
+    const primitives = rendered.displayList.pages[0].primitives;
+    const runs = primitives.filter((primitive) => primitive.kind === 'glyphRun' || primitive.kind === 'text');
+    const baselines = new Set(
+      runs.map((run) => Math.round(run.glyphs?.[0]?.y ?? run.baselineY ?? 0))
+    );
+
+    expect(runs.length).toBeGreaterThan(1);
+    expect(baselines.size).toBeGreaterThan(1);
   }, 120000);
 });
 

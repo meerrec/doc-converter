@@ -29,5 +29,8 @@ export {
   type OfficePreviewJob,
   type OfficeQueue,
   type OfficeQueueEvents,
+  type PreviewOpener,
 } from './engine/queue.js';
 export type { ConvertInput, ConvertedDocument } from './engine/convert.js';
+export type { PreviewPageSize, PreviewSession } from './engine/preview.js';
+export type { SkippedPrimitives } from './pdf/support.js';

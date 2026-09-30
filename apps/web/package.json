@@ -13,7 +13,6 @@
   "dependencies": {
     "@doc-converter/contract": "workspace:*",
     "@doc-converter/office": "workspace:*",
-    "pdfjs-dist": "4.10.38",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },

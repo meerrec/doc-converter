@@ -20,7 +20,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@betteroffice/docx": "0.3.0",
+    "@betteroffice/docx": "catalog:",
     "@betteroffice/fonts": "0.3.0",
     "@betteroffice/fonts-cjk": "0.3.0",
     "@betteroffice/xlsx": "0.3.0",

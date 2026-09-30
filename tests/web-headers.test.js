@@ -151,4 +151,27 @@ describe('страница не грузит чужое', () => {
       ).toEqual([]);
     }
   });
+
+  /**
+   * Второго рендерера страниц в сборке быть не должно.
+   *
+   * Раньше предпросмотр собирал PDF и разбирал его pdf.js. Теперь страницы
+   * рисует canvas-рендерер самого движка из той же вёрстки, и возврат pdf.js
+   * означал бы второй рендерер, отдельный воркер и лишние сотни килобайт
+   * в загрузке — при том, что предпросмотр и так рисуется движком.
+   */
+  it('предпросмотр не тянет pdf.js', () => {
+    const manifest = JSON.parse(readFileSync(path.join(WEB, 'package.json'), 'utf8'));
+
+    expect(Object.keys(manifest.dependencies ?? {})).not.toContain('pdfjs-dist');
+
+    for (const file of filesUnder(path.join(WEB, 'src'), ['.ts', '.tsx'])) {
+      const relative = path.relative(ROOT, file);
+
+      expect(
+        readFileSync(file, 'utf8').includes('pdfjs'),
+        `${relative}: страницы предпросмотра рисует движок, а не pdf.js`
+      ).toBe(false);
+    }
+  });
 });

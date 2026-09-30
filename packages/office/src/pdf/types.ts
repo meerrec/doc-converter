@@ -12,6 +12,12 @@
  * Координаты — пиксели CSS (96 dpi), начало в левом верхнем углу страницы,
  * ось Y вниз. В PDF система другая, и пересчёт делает экспортёр.
  *
+ * **Имена полей — движка, а не свои.** Здесь стояло `alpha` там, где движок
+ * шлёт `opacity`: поле необязательное, поэтому расхождение не ловилось типами,
+ * а прозрачность документов Word не доезжала до PDF вовсе — водяные знаки
+ * и полупрозрачные заливки выходили плотными. Описывая движок, называйте его
+ * словами: единственная защита здесь — структурная типизация на стыке.
+ *
  * Все комментарии на русском языке.
  */
 
@@ -58,7 +64,14 @@ export interface GlyphRunPrimitive {
   /** Обрезка по ячейке; у документа Word её нет. */
   readonly clip?: ClipRect;
   /** Прозрачность: `1` — непрозрачный, поле отсутствует. */
-  readonly alpha?: number;
+  readonly opacity?: number;
+  /**
+   * Поворот в градусах по часовой стрелке вокруг центра прямоугольника
+   * прогона (`pdf/geometry.ts`). Отсутствует — поворота нет.
+   */
+  readonly rotationDeg?: number;
+  /** Горизонтальный масштаб в процентах: `100` — обычный, отсутствует — он же. */
+  readonly horizontalScale?: number;
 }
 
 /** Прямоугольник: заливка фона, граница таблицы, плашка. */
@@ -70,7 +83,7 @@ export interface RectPrimitive {
   readonly h: number;
   readonly fill: string;
   readonly clip?: ClipRect;
-  readonly alpha?: number;
+  readonly opacity?: number;
 }
 
 /** Отрезок: граница, разделитель, подчёркивание таблицы. */
@@ -84,7 +97,7 @@ export interface LinePrimitive {
   readonly color: string;
   readonly dash?: readonly number[];
   readonly clip?: ClipRect;
-  readonly alpha?: number;
+  readonly opacity?: number;
 }
 
 /** Картинка: байты лежат в `relId` как `data:`-ссылка. */
@@ -95,6 +108,8 @@ export interface ImagePrimitive {
   readonly y: number;
   readonly w: number;
   readonly h: number;
+  /** Прозрачность: `1` — непрозрачный, поле отсутствует. */
+  readonly opacity?: number;
   readonly clip?: ClipRect;
 }
 
@@ -133,7 +148,7 @@ export interface PathPrimitive {
   readonly fill?: string;
   readonly stroke?: { readonly color: string; readonly width: number };
   readonly clip?: ClipRect;
-  readonly alpha?: number;
+  readonly opacity?: number;
 }
 
 /** Декорация текста: подчёркивание, зачёркивание, выделение. */
@@ -148,7 +163,7 @@ export interface DecorationPrimitive {
   readonly dashed?: boolean;
   readonly dotted?: boolean;
   readonly clip?: ClipRect;
-  readonly alpha?: number;
+  readonly opacity?: number;
 }
 
 /**

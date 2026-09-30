@@ -162,8 +162,7 @@ export function App() {
 
         <PreviewPanel
           fileName={previewed?.file.name ?? null}
-          sheets={preview?.sheets ?? null}
-          url={preview?.url ?? null}
+          session={preview?.session ?? null}
           onClose={queue.closePreview}
         />
 

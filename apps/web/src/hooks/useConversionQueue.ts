@@ -27,6 +27,7 @@ import {
   EngineError,
   MAX_FILE_BYTES,
   type OfficePhase,
+  type PreviewSession,
 } from '@doc-converter/office';
 import { fetchStatus, submitConversion } from '../api/conversion';
 import { ApiError, downloadFromUrl } from '../api/client';
@@ -307,18 +308,14 @@ export interface ConversionQueue {
    */
   now: number;
   /**
-   * Документ, показанный в панели предпросмотра (браузерный маршрут).
+   * Документ, показанный в панели предпросмотра.
    *
-   * `null` — показывать нечего: документ ещё не собирали, движок заменил его
-   * другим или предпросмотр закрыли.
+   * `null` — показывать нечего: документ ещё не открывали, движок заменил его
+   * другим или предпросмотр закрыли. Сессией владеет очередь, а не панель:
+   * закрывает её `closePreview` (и уборка строки из списка), поэтому панели
+   * достаточно показывать страницы.
    */
-  /**
-   * Документ, показанный в предпросмотре.
-   *
-   * `url` — blob-адрес готового PDF: он уже в памяти вкладки, и живёт
-   * до закрытия предпросмотра, замены документа или ухода со страницы.
-   */
-  preview: { itemId: string; sheets: number | null; url: string } | null;
+  preview: { itemId: string; session: PreviewSession } | null;
   /** Движок браузерной конвертации не загрузился: браузерные действия недоступны. */
   engineFailed: boolean;
   /** Добавляет файлы в очередь. Возвращает отклонённые файлы с причинами. */
@@ -399,14 +396,12 @@ export function useConversionQueue({
    *
    * Состояние интерфейса, а не задачи: предпросмотр не занимает маршрут
    * строки — он лишь показывает страницы. Пусто (`null`) означает, что
-   * документа нет: движок его ещё не собрал, закрыл (собрав на его месте
+   * документа нет: движок его ещё не открыл, закрыл (открыв на его месте
    * другой) или закрыли мы.
    */
   const [preview, setPreview] = useState<{
     itemId: string;
-    sheets: number | null;
-    /** Адрес готового PDF предпросмотра; живёт до закрытия или замены. */
-    url: string;
+    session: PreviewSession;
   } | null>(null);
 
   /**
@@ -418,38 +413,19 @@ export function useConversionQueue({
    */
   const [engineFailed, setEngineFailed] = useState(false);
 
-  /**
-   * Заменяет адрес предпросмотра, освобождая прежний.
-   *
-   * Blob-адрес держит PDF в памяти вкладки, пока его не отзовут: при каждом
-   * новом предпросмотре освобождается предыдущий, иначе файлы копились бы
-   * до перезагрузки страницы.
-   *
-   * @param next - новое состояние предпросмотра
-   */
-  const replacePreview = useCallback(
-    (next: { itemId: string; sheets: number | null; url: string } | null) => {
-      setPreview((current) => {
-        if (current !== null && current.url !== next?.url) {
-          URL.revokeObjectURL(current.url);
-        }
 
-        return next;
-      });
-    },
-    []
-  );
 
   /**
-   * Текущий адрес предпросмотра для очистки при уходе со страницы.
+   * Текущий предпросмотр для обработчиков и очистки при уходе со страницы.
    *
    * Зеркало состояния в ссылке: эффект очистки подписывается один раз
-   * и состояния на тот момент ещё не видит.
+   * и состояния на тот момент ещё не видит, а уборка строки — колбэк,
+   * который не должен пересоздаваться на каждом обновлении списка.
    */
-  const previewUrlRef = useRef<string | null>(null);
+  const previewRef = useRef<{ itemId: string; session: PreviewSession } | null>(null);
 
   useLayoutEffect(() => {
-    previewUrlRef.current = preview?.url ?? null;
+    previewRef.current = preview;
   });
 
   /**
@@ -469,26 +445,15 @@ export function useConversionQueue({
 
         onDone: (itemId, outcome) => {
           if (outcome.kind === 'previewed') {
-            // Предпросмотр своего движка — готовый PDF: у него нет окна
-            // офиса, и страницы показывает тот же экспортёр, что собирает
-            // результат
-            replacePreview(
-              outcome.pdf === undefined
-                ? null
-                : {
-                    itemId,
-                    sheets: outcome.sheets,
-                    url: URL.createObjectURL(
-                      new Blob([outcome.pdf as Uint8Array<ArrayBuffer>], { type: 'application/pdf' })
-                    ),
-                  }
-            );
+            // Предпросмотр открывает документ в движке и держит его, пока
+            // панель открыта: страницы берутся по одной, по мере надобности
+            setPreview({ itemId, session: outcome.session });
 
             // Документ показан, но не конвертирован: задача снова ждёт запуска
             dispatch({
               type: 'patch',
               id: itemId,
-              patch: { status: 'pending', sheets: outcome.sheets },
+              patch: { status: 'pending', sheets: outcome.session.sheets },
             });
             return;
           }
@@ -524,10 +489,28 @@ export function useConversionQueue({
         // Показанного ранее файла больше нет: движок открывает документ
         // на месте прежнего, и держать на экране его страницы нельзя
         onDocumentChanged: () => {
-          replacePreview(null);
+          setPreview(null);
         },
       },
     })
+  );
+
+  /**
+   * Закрывает показанный документ, если он принадлежит этой строке.
+   *
+   * Документ — сессия движка: вёрстка Word или открытая книга, и держать её
+   * после того, как строка убрана из списка, незачем. Закрывает его очередь,
+   * а состояние панели приходит в порядок событием `onDocumentChanged`.
+   *
+   * @param id - идентификатор убираемой строки
+   */
+  const closePreviewFor = useCallback(
+    (id: string) => {
+      if (previewRef.current?.itemId === id) {
+        void officeQueue.closeDocument();
+      }
+    },
+    [officeQueue]
   );
 
   // Таймеры отложенных скачиваний: их нужно снимать при размонтировании
@@ -583,12 +566,9 @@ export function useConversionQueue({
         revokeResult(item.result);
       }
 
-      // Предпросмотр — тот же ресурс вкладки: его адрес тоже нужно отозвать
-      const previewUrl = previewUrlRef.current;
-
-      if (previewUrl !== null) {
-        URL.revokeObjectURL(previewUrl);
-      }
+      // Открытый документ держит память воркера — вёрстку или книгу целиком,
+      // и уход со страницы её не освобождает: закрыть сессию нужно явно
+      previewRef.current?.session.close();
     };
   }, []);
 
@@ -907,9 +887,8 @@ export function useConversionQueue({
 
   /** Закрывает предпросмотр, освобождая память вкладки. */
   const closePreview = useCallback(() => {
-    replacePreview(null);
     void officeQueue.closeDocument();
-  }, [officeQueue, replacePreview]);
+  }, [officeQueue]);
 
   /**
    * Скачивает все готовые результаты по очереди.
@@ -980,13 +959,17 @@ export function useConversionQueue({
       // разберёт файл, которого в списке уже нет
       officeQueue.cancelPending(id);
 
+      // Показанный документ этой строки закрывается вместе с ней: держать
+      // открытую книгу для файла, которого в списке нет, незачем
+      closePreviewFor(id);
+
       // Адрес результата читается до удаления строки: после dispatch его
       // взять будет неоткуда, и blob остался бы в памяти вкладки навсегда
       revokeResult(item?.result);
 
       dispatch({ type: 'remove', id });
     },
-    [cancelDownload, officeQueue]
+    [cancelDownload, officeQueue, closePreviewFor]
   );
 
   /** Убирает завершённые задачи, отменяя их отложенные скачивания. */
@@ -995,11 +978,12 @@ export function useConversionQueue({
       if (isFinishedStatus(item.status)) {
         cancelDownload(item.id);
         revokeResult(item.result);
+        closePreviewFor(item.id);
       }
     }
 
     dispatch({ type: 'clearFinished' });
-  }, [cancelDownload]);
+  }, [cancelDownload, closePreviewFor]);
 
   // Счётчики состояний.
   //

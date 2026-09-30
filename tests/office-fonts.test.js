@@ -13,8 +13,12 @@
 import { describe, it, expect } from 'vitest';
 import { registerFonts } from '../packages/office/src/engine/fonts.js';
 
-/** Движок-заглушка: выдаёт номера шрифтов. */
-function fakeEngine() {
+/**
+ * Хранилище-заглушка: выдаёт номера шрифтов.
+ *
+ * @returns хранилище с растущей нумерацией
+ */
+function fakeStore() {
   let next = 0;
 
   return {
@@ -24,6 +28,15 @@ function fakeEngine() {
       return next;
     },
   };
+}
+
+/**
+ * Пара хранилищ — как в конвейере: сессия вёрстки и движок отрисовки.
+ *
+ * @returns хранилища для `registerFonts`
+ */
+function fakeStores() {
+  return { layout: fakeStore(), render: fakeStore() };
 }
 
 /**
@@ -80,7 +93,7 @@ function namesOf(registry) {
 describe('регистрация шрифтов', () => {
   it('не грузит скриптовые fallback\'и, если движок их не назвал', async () => {
     const provider = fakeProvider();
-    const registry = await registerFonts(fakeEngine(), provider, [CALIBRI]);
+    const registry = await registerFonts(fakeStores(), provider, [CALIBRI]);
 
     expect(provider.asked.filter((call) => call.startsWith('script:'))).toEqual([]);
     expect(namesOf(registry).filter((name) => name.startsWith('script:'))).toEqual([]);
@@ -89,7 +102,7 @@ describe('регистрация шрифтов', () => {
 
   it('грузит только названный скрипт', async () => {
     const provider = fakeProvider();
-    const registry = await registerFonts(fakeEngine(), provider, [
+    const registry = await registerFonts(fakeStores(), provider, [
       { ...CALIBRI, scripts: ['cjk-jp'] },
     ]);
     const scripts = namesOf(registry).filter((name) => name.startsWith('script:'));
@@ -100,7 +113,7 @@ describe('регистрация шрифтов', () => {
 
   it('замыкает цепочку каждого требования общим набором скриптов', async () => {
     const provider = fakeProvider();
-    const registry = await registerFonts(fakeEngine(), provider, [
+    const registry = await registerFonts(fakeStores(), provider, [
       { ...CALIBRI, scripts: ['arabic'] },
       { key: 'georgia|0|0', family: 'Georgia', bold: false, italic: false, scripts: ['hebrew'] },
     ]);
@@ -127,7 +140,7 @@ describe('регистрация шрифтов', () => {
   it('подставляет last resort вместо ненайденного семейства', async () => {
     const provider = fakeProvider();
     const unknown = { key: 'загадочный|0|0', family: 'Загадочный', bold: false, italic: false };
-    const registry = await registerFonts(fakeEngine(), provider, [unknown]);
+    const registry = await registerFonts(fakeStores(), provider, [unknown]);
 
     expect(provider.asked).toContain('last:Загадочный');
     expect(namesOf(registry)).toContain('загадочный|0|0');

@@ -18,8 +18,17 @@
  * Все комментарии на русском языке.
  */
 
-import type { PrintMetrics } from '@betteroffice/xlsx';
+import type { PrintMetrics as EnginePrintMetrics } from '@betteroffice/xlsx';
 import { EXCEL_DEFAULT_ROW_HEIGHT_PT, PRINT_DPI } from '../../constants.js';
+
+/**
+ * Метрики печати — тип движка под нашим именем.
+ *
+ * Он нужен в плане страницы (`render.ts`), а план читает и предпросмотр:
+ * псевдоним избавляет от импорта движка там, где он ни к чему, и заодно
+ * называет величину по-русски.
+ */
+export type PrintMetrics = EnginePrintMetrics;
 import type { BookDefaults } from './bookXml.js';
 import type { BookFont } from './fonts.js';
 

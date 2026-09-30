@@ -24,16 +24,17 @@
  *
  * Чего экспортёр пока не делает (сознательно, а не по недосмотру):
  *
- * - **прогоны `kind: 'text'` пропускаются.** Так приходят номера пунктов
- *   списка у документов Word: движок не разложил их на глифы, отдав строку
- *   и CSS-шорткат шрифта. Книги приходят теми же строками, но их раскладывает
- *   наш шейпинг (`shape/`) до экспортёра, поэтому сюда такие прогоны
- *   не доходят;
- * - **повороты и масштаб текста** (`rotationDeg`, `horizontalScale`)
- *   игнорируются: текст рисуется по своим координатам глифов, и для
- *   неповёрнутого листа это верно;
+ * - **фигуры и надписи** (`kind: 'shape'`), **рамки страниц** (`pageBorders`)
+ *   и **сноски** (`noteAreas`) — каждая из них отдельная подсистема рисования,
+ *   и ни одна в файл не попадает;
+ * - **часть оформления текста**: капс, скрытый текст, эффекты, лидеры
+ *   табуляции;
  * - **параметры экспорта** (PDF/A, водяной знак, сжатие, версия) — предмет
  *   следующего шага; сейчас файл всегда PDF 1.7 без метаданных.
+ *
+ * Пропущенное не исчезает бесследно: виды примитивов перечислены
+ * в `support.ts`, счётчик возвращается вместе с файлом, а предпросмотр
+ * называет потери пользователю.
  *
  * Все комментарии на русском языке.
  */
@@ -42,8 +43,10 @@ import { PdfBuilder } from './builder.js';
 import { readGlyphToCid } from './cff.js';
 import { toUnicodeCMap } from './cmap.js';
 import { parseColor } from './color.js';
+import { glyphRunRect } from './geometry.js';
 import { decodeImage } from './image.js';
 import { loadSubsetter } from './subset.js';
+import { pagePrimitives, type SkippedPrimitives } from './support.js';
 import type {
   ClipRect,
   DecorationPrimitive,
@@ -81,6 +84,20 @@ export interface PdfExportOptions {
   readonly fonts: ReadonlyMap<number, FontResource>;
 }
 
+/** Что получилось из вёрстки. */
+export interface PdfExportResult {
+  /** Готовый файл. */
+  readonly bytes: Uint8Array;
+  /**
+   * Что в файл не попало: вид примитива → сколько раз встретился.
+   *
+   * Пустой объект — обычное дело: вёрстка целиком поддержана. Непустой —
+   * повод сказать пользователю, что предпросмотр показывает больше, чем
+   * скачается (см. `support.ts`).
+   */
+  readonly skipped: SkippedPrimitives;
+}
+
 /** Собранные по шрифту данные: что субсеттить, что писать в `ToUnicode`. */
 interface FontUsage {
   /** Символы, начертанные этим шрифтом: из них собирается субсет. */
@@ -96,9 +113,12 @@ interface FontUsage {
  *
  * @param displayList - вёрстка документа
  * @param options - шрифты по номерам
- * @returns байты PDF
+ * @returns байты PDF и перечень пропущенного
  */
-export async function buildPdf(displayList: DisplayList, options: PdfExportOptions): Promise<Uint8Array> {
+export async function buildPdf(
+  displayList: DisplayList,
+  options: PdfExportOptions
+): Promise<PdfExportResult> {
   const pages = displayList.pages;
   const usage = collectFontUsage(pages);
 
@@ -111,10 +131,13 @@ export async function buildPdf(displayList: DisplayList, options: PdfExportOptio
   const images = emitImages(pdf, pages);
   const alphas = emitAlphaStates(pdf, pages);
 
+  // Счётчик общий на файл: пропущенное приходит из разных страниц, а показать
+  // его нужно одной строкой
+  const skipped = new Map<string, number>();
   const pageRefs: number[] = [];
 
   for (const page of pages) {
-    pageRefs.push(emitPage(pdf, pagesRef, page, fonts, images, alphas));
+    pageRefs.push(emitPage(pdf, pagesRef, page, fonts, images, alphas, skipped));
   }
 
   pdf.replace(
@@ -122,21 +145,10 @@ export async function buildPdf(displayList: DisplayList, options: PdfExportOptio
     `<< /Type /Pages /Kids [${pageRefs.map((ref) => `${ref} 0 R`).join(' ')}] /Count ${pageRefs.length} >>`
   );
 
-  return pdf.build(pdf.add(`<< /Type /Catalog /Pages ${pagesRef} 0 R >>`));
-}
-
-/**
- * Обходит примитивы страницы, включая колонтитулы.
- *
- * Колонтитулы лежат отдельными полосами (`page.header`/`page.footer`),
- * но рисуются тем же кодом и по тем же координатам — поэтому собирать
- * их нужно вместе с телом, иначе шрифт колонтитула не попадёт в файл.
- *
- * @param page - страница
- * @returns примитивы в порядке отрисовки
- */
-function pagePrimitives(page: DisplayPage): readonly DisplayPrimitive[] {
-  return [...(page.header?.primitives ?? []), ...page.primitives, ...(page.footer?.primitives ?? [])];
+  return {
+    bytes: pdf.build(pdf.add(`<< /Type /Catalog /Pages ${pagesRef} 0 R >>`)),
+    skipped: Object.fromEntries(skipped),
+  };
 }
 
 /**
@@ -462,7 +474,8 @@ function emitPage(
   page: DisplayPage,
   fonts: ReadonlyMap<number, EmbeddedFont>,
   images: ReadonlyMap<string, EmittedImage>,
-  alphas: ReadonlyMap<number, EmittedAlpha>
+  alphas: ReadonlyMap<number, EmittedAlpha>,
+  skipped: Map<string, number>
 ): number {
   const height = page.height * PX_TO_PT;
 
@@ -502,6 +515,7 @@ function emitPage(
       usedAlphas,
       fonts,
       alphas,
+      skipped,
     });
   }
 
@@ -547,6 +561,8 @@ interface DrawContext {
   readonly usedAlphas: Set<number>;
   readonly fonts: ReadonlyMap<number, EmbeddedFont>;
   readonly alphas: ReadonlyMap<number, EmittedAlpha>;
+  /** Счётчик пропущенного, общий на собираемый файл. */
+  readonly skipped: Map<string, number>;
 }
 
 /** Состояние прозрачности, заведённое в файле. */
@@ -571,10 +587,10 @@ function emitAlphaStates(pdf: PdfBuilder, pages: readonly DisplayPage[]): Map<nu
 
   for (const page of pages) {
     for (const primitive of pagePrimitives(page)) {
-      const alpha = (primitive as { alpha?: number }).alpha;
+      const opacity = (primitive as { opacity?: number }).opacity;
 
-      if (alpha !== undefined && alpha < 1) {
-        values.add(roundAlpha(alpha));
+      if (opacity !== undefined && opacity < 1) {
+        values.add(roundAlpha(opacity));
       }
     }
   }
@@ -596,17 +612,17 @@ function emitAlphaStates(pdf: PdfBuilder, pages: readonly DisplayPage[]): Map<nu
 /**
  * Открывает графическое состояние примитива: прозрачность и обрезку.
  *
- * @param primitive - примитив с необязательными `alpha` и `clip`
+ * @param primitive - примитив с необязательными `opacity` и `clip`
  * @param context - поток страницы
  * @returns число открытых состояний, которые нужно закрыть
  */
 function beginPrimitive(
-  primitive: { readonly alpha?: number; readonly clip?: ClipRect },
+  primitive: { readonly opacity?: number; readonly clip?: ClipRect },
   context: DrawContext
 ): number {
   const clip = primitive.clip;
-  const alpha = primitive.alpha;
-  const state = alpha !== undefined && alpha < 1 ? context.alphas.get(roundAlpha(alpha)) : undefined;
+  const opacity = primitive.opacity;
+  const state = opacity !== undefined && opacity < 1 ? context.alphas.get(roundAlpha(opacity)) : undefined;
   const alphaRef = state === undefined ? null : state;
 
   if (clip === undefined && alphaRef === null) {
@@ -616,7 +632,7 @@ function beginPrimitive(
   context.content.push('q');
 
   if (alphaRef !== null) {
-    context.usedAlphas.add(roundAlpha(alpha ?? 1));
+    context.usedAlphas.add(roundAlpha(opacity ?? 1));
     context.content.push(`/${alphaRef.name} gs`);
   }
 
@@ -681,7 +697,15 @@ function drawPrimitive(primitive: DisplayPrimitive, context: DrawContext): void 
       drawPath(primitive as PathPrimitive, context);
       return;
     default:
-      // `text` движка пока не поддержан — см. шапку файла
+      // Всё, чего нет в `SUPPORTED_KINDS`, со страницы исчезает: `text`
+      // документов Word (номера пунктов списка — их раскладывает `document.ts`),
+      // `shape` (надписи и автофигуры) и любой вид, который движок добавит
+      // в следующей версии. Молчать об этом нельзя — предпросмотр рисует
+      // страницы рендерером движка и показывает то, чего в файле не будет
+      context.skipped.set(
+        primitive.kind,
+        (context.skipped.get(primitive.kind) ?? 0) + 1
+      );
       return;
   }
 }
@@ -723,7 +747,7 @@ function drawLine(primitive: LinePrimitive, context: DrawContext): void {
   const depth = beginPrimitive(primitive, context);
 
   context.content.push(
-    `${strokeColor(primitive.color)} RG`,
+    strokeColor(primitive.color),
     `${pt(width)} w`,
     dashPattern(primitive.dash),
     `${pt(primitive.x1)} ${pt(context.flip(primitive.y1))} m ${pt(primitive.x2)} ${pt(context.flip(primitive.y2))} l S`
@@ -806,6 +830,7 @@ function drawGlyphRun(primitive: GlyphRunPrimitive, context: DrawContext): void 
   }
 
   const depth = beginPrimitive(primitive, context);
+  const transformed = beginRunTransform(primitive, context);
 
   context.usedFonts.add(primitive.fontId);
   context.content.push('BT', fillColor(primitive.color), `/${font.name} ${pt(primitive.size)} Tf`);
@@ -826,7 +851,72 @@ function drawGlyphRun(primitive: GlyphRunPrimitive, context: DrawContext): void 
 
   context.content.push('ET');
 
+  if (transformed) {
+    context.content.push('Q');
+  }
+
   endPrimitive(depth, context);
+}
+
+/**
+ * Открывает преобразование прогона: поворот и горизонтальный масштаб.
+ *
+ * Оба берутся из примитива и оба считаются вокруг **центра прямоугольника
+ * прогона** — так же, как их применяет рендерер движка, рисующий предпросмотр
+ * (см. `pdf/geometry.ts`). Расхождение здесь было бы незаметным: повёрнутый
+ * текст встречается редко, а «повёрнут вокруг другой точки» замечают уже
+ * в скачанном файле.
+ *
+ * Порядок операторов обратен порядку вызовов у canvas: последний вызов там
+ * применяется к точке первым, а `cm` домножает матрицу справа. Поэтому
+ * поворот идёт в поток раньше масштаба.
+ *
+ * @param primitive - прогон текста
+ * @param context - поток страницы
+ * @returns 1, если преобразование открыто и его нужно закрыть
+ */
+function beginRunTransform(primitive: GlyphRunPrimitive, context: DrawContext): number {
+  const rotation = primitive.rotationDeg ?? 0;
+  const scale = primitive.horizontalScale ?? 100;
+
+  if (rotation === 0 && scale === 100) {
+    return 0;
+  }
+
+  const rect = glyphRunRect(primitive.glyphs, primitive.size);
+
+  context.content.push('q');
+
+  if (rotation !== 0) {
+    // Градусы движка отсчитаны по часовой стрелке в системе страницы, где
+    // ось Y смотрит вниз. В PDF ось Y смотрит вверх, поэтому тот же поворот
+    // выражается матрицей со сменой знака у синуса: `[[cos, sin], [-sin, cos]]`
+    const angle = (rotation * Math.PI) / 180;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    // Прямоугольник посчитан в пикселях CSS, а матрица — в пунктах PDF:
+    // углы безразмерны, а сдвиг — нет, поэтому центр переводится заранее
+    const centerX = (rect.x + rect.w / 2) * PX_TO_PT;
+    const centerY = context.flip(rect.y + rect.h / 2);
+    const x = centerX - (cos * centerX + sin * centerY);
+    const y = centerY - (-sin * centerX + cos * centerY);
+
+    context.content.push(
+      `${cos.toFixed(4)} ${(-sin).toFixed(4)} ${sin.toFixed(4)} ${cos.toFixed(4)} ${fixed(x)} ${fixed(y)} cm`
+    );
+  }
+
+  if (scale !== 100) {
+    // Масштаб — вокруг левого края и середины высоты прогона. По вертикали
+    // он ничего не меняет, поэтому в PDF от него остаётся сдвиг по X
+    const factor = scale / 100;
+
+    context.content.push(
+      `${factor.toFixed(4)} 0 0 1 ${fixed(rect.x * PX_TO_PT * (1 - factor))} 0 cm`
+    );
+  }
+
+  return 1;
 }
 
 /**
@@ -894,7 +984,7 @@ function drawPath(primitive: PathPrimitive, context: DrawContext): void {
 
   if (stroke !== undefined) {
     context.content.push(
-      `${strokeColor(stroke.color)} RG`,
+      strokeColor(stroke.color),
       `${pt(stroke.width > 0 ? stroke.width : MIN_DECORATION_PT)} w`
     );
   }

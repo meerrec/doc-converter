@@ -156,7 +156,7 @@ function rectPrimitive(command: FillRectCommand): RectPrimitive {
     h: command.h,
     fill: command.color,
     clip: command.clip,
-    alpha: color.alpha,
+    opacity: color.alpha,
   };
 }
 
@@ -177,7 +177,7 @@ function linePrimitives(command: LineCommand): readonly LinePrimitive[] {
     strokeWidth: command.width,
     color: command.color,
     clip: command.clip,
-    alpha: color.alpha,
+    opacity: color.alpha,
   };
 
   if (command.style === 'dashed') {
@@ -214,7 +214,7 @@ function linePrimitives(command: LineCommand): readonly LinePrimitive[] {
 function pathPrimitive(command: PathShapeCommand): PathPrimitive {
   const fill = command.fill === '' ? undefined : command.fill;
   const stroke = command.stroke === undefined ? undefined : { color: command.stroke.color, width: command.stroke.width };
-  const alpha = parseColor(fill ?? stroke?.color ?? '#000000').alpha;
+  const opacity = parseColor(fill ?? stroke?.color ?? '#000000').alpha;
 
   return {
     kind: 'path',
@@ -222,7 +222,7 @@ function pathPrimitive(command: PathShapeCommand): PathPrimitive {
     fill,
     stroke,
     clip: command.clip,
-    alpha,
+    opacity,
   };
 }
 
@@ -281,6 +281,7 @@ async function textPrimitives(
       w: run.width + 4,
       h: ascent + descent + 2,
       fill: command.highlight,
+      opacity: parseColor(command.highlight).alpha,
       clip: command.clip,
     });
   }
@@ -292,6 +293,9 @@ async function textPrimitives(
     color: command.color,
     text: command.text,
     glyphs,
+    // Цвет приходит от движка строкой, и альфа в ней — часть цвета: canvas
+    // красит такой текст полупрозрачным, и PDF обязан так же
+    opacity: parseColor(command.color).alpha,
     clip: command.clip,
   });
 

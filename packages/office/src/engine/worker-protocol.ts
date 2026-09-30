@@ -13,6 +13,7 @@
  */
 
 import type { ConversionOptions } from '@doc-converter/contract';
+import type { SkippedPrimitives } from '../pdf/support.js';
 import type { EngineErrorCode } from './errors.js';
 
 /** Запрос страницы воркеру. */
@@ -28,6 +29,34 @@ export type WorkerRequest =
       readonly bytes: Uint8Array;
       readonly fileName: string;
       readonly options: ConversionOptions;
+    }
+  | {
+      /** Открыть документ для предпросмотра — вёрстка без сборки PDF. */
+      readonly kind: 'preview-open';
+      readonly id: number;
+      readonly bytes: Uint8Array;
+      readonly fileName: string;
+      readonly options: ConversionOptions;
+    }
+  | {
+      /**
+       * Нарисовать страницу открытого документа.
+       *
+       * `session` — номер открытой сессии: пока запрос шёл, её могли закрыть
+       * и открыть другую, и рисовать страницу чужого документа нельзя.
+       */
+      readonly kind: 'preview-page';
+      readonly id: number;
+      readonly session: number;
+      readonly pageIndex: number;
+      /** Во сколько раз увеличить страницу: dpr × зум панели. */
+      readonly scale: number;
+    }
+  | {
+      /** Закрыть открытый документ, освободив его в движке. */
+      readonly kind: 'preview-close';
+      readonly id: number;
+      readonly session: number;
     };
 
 /**
@@ -51,7 +80,26 @@ export type WorkerResponse =
       readonly bytes: Uint8Array;
       readonly pageCount: number;
       readonly sheets: number | null;
+      /** Что не доехало до PDF: вид примитива → сколько раз встретился. */
+      readonly skipped: SkippedPrimitives;
     }
+  | {
+      readonly kind: 'opened';
+      readonly id: number;
+      /** Номер сессии: им адресуются её страницы и её закрытие. */
+      readonly session: number;
+      readonly pages: readonly { readonly width: number; readonly height: number }[];
+      readonly sheets: number | null;
+      readonly skipped: SkippedPrimitives;
+    }
+  | {
+      readonly kind: 'page';
+      readonly id: number;
+      readonly pageIndex: number;
+      /** Растр страницы: переносится, а не копируется. */
+      readonly bitmap: ImageBitmap;
+    }
+  | { readonly kind: 'closed'; readonly id: number; readonly session: number }
   | {
       readonly kind: 'failed';
       readonly id: number;

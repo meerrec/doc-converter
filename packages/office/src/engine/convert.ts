@@ -18,6 +18,7 @@
 import type { ConversionOptions } from '@doc-converter/contract';
 import { browserFormatOf } from '../filters.js';
 import { buildPdf } from '../pdf/export.js';
+import type { SkippedPrimitives } from '../pdf/support.js';
 import { renderDocx } from './document.js';
 import { EngineError } from './errors.js';
 import { renderXlsx } from './xlsx/render.js';
@@ -30,6 +31,14 @@ export interface ConvertedDocument {
   readonly pageCount: number;
   /** Число листов книги; у документа Word — null. */
   readonly sheets: number | null;
+  /**
+   * Что не доехало до PDF: вид примитива → сколько раз встретился.
+   *
+   * Пусто у книги и у простого документа. Непусто там, где движок нарисовал
+   * бы больше, чем умеет экспортёр (надписи, фигуры) — вызывающий решает,
+   * сказать об этом пользователю или нет.
+   */
+  readonly skipped: SkippedPrimitives;
 }
 
 /** Задание конвейеру. */
@@ -51,7 +60,7 @@ export interface ConvertInput {
  *
  * @param options - параметры конвертации
  */
-function assertSupported(options: ConversionOptions): void {
+export function assertSupported(options: ConversionOptions): void {
   if (options.pdfVersion !== 'default') {
     throw new EngineError(
       'engine_unsupported',
@@ -106,13 +115,13 @@ export async function convertDocument(input: ConvertInput): Promise<ConvertedDoc
   try {
     if (format === 'docx') {
       const rendered = await renderDocx(input.bytes);
+      const pdf = await buildPdf(rendered.displayList, { fonts: rendered.fonts });
 
       return {
-        bytes: await buildPdf(rendered.displayList, {
-          fonts: rendered.fonts,
-        }),
+        bytes: pdf.bytes,
         pageCount: rendered.pageCount,
         sheets: null,
+        skipped: pdf.skipped,
       };
     }
 
@@ -124,6 +133,7 @@ export async function convertDocument(input: ConvertInput): Promise<ConvertedDoc
       bytes: rendered.pdf,
       pageCount: rendered.pageCount,
       sheets: rendered.sheets,
+      skipped: rendered.skipped,
     };
   } catch (error) {
     // Отказ движка — свой код: сообщения wasm-модуля английские и говорят

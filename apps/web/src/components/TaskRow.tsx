@@ -186,7 +186,7 @@ export const TaskRow = memo(function TaskRow({
           className="button button--ghost"
           onClick={() => onPreview(item.id)}
           disabled={!canUseBrowser}
-          title={browserReason ?? 'Показать документ в окне офиса'}
+          title={browserReason ?? 'Показать страницы документа'}
           aria-label={`Показать ${item.file.name} в предпросмотре`}
         >
           Предпросмотр

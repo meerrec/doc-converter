@@ -6,8 +6,9 @@
  * без остановки остальных, отмена ожидающих, — но конвертер подменён: живой
  * движок тянет wasm и шрифты, а проверяются решения очереди, а не его работа.
  *
- * Отдельно проверяется то, чего у сборки нет: предпросмотр — это готовый PDF,
- * и он приходит из той же функции, что и результат.
+ * Отдельно проверяется то, чего у сборки нет: предпросмотр открывает документ
+ * и оставляет его открытым, а владеет им очередь — она закрывает сессию
+ * и при закрытии панели, и при замене документа другим.
  *
  * Все комментарии на русском языке.
  */
@@ -65,16 +66,61 @@ function createConverter({ failOn = null, delayMs = 0 } = {}) {
 }
 
 /**
+ * Собирает открыватель предпросмотра — двойник сессии движка.
+ *
+ * Сессия настоящая настолько, насколько её видит очередь: страницы, их
+ * размеры и признак закрытия. Растр здесь не нужен — его рисует canvas,
+ * которого в Node нет.
+ *
+ * @param options - что должно сломаться: `null` — ничего
+ * @returns открыватель и журнал открытых сессий
+ */
+function createOpener({ failOn = null } = {}) {
+  const opened = [];
+
+  return {
+    opened,
+
+    async open(input) {
+      if (input.fileName === failOn) {
+        throw new Error('движок не осилил документ');
+      }
+
+      const session = {
+        pageCount: 2,
+        sheets: input.fileName.endsWith('.xlsx') ? 2 : null,
+        pages: [
+          { width: 794, height: 1123 },
+          { width: 794, height: 1123 },
+        ],
+        skipped: {},
+        closed: false,
+        render: async () => null,
+        close() {
+          this.closed = true;
+        },
+      };
+
+      opened.push(session);
+
+      return session;
+    },
+  };
+}
+
+/**
  * Создаёт очередь с записью событий.
  *
  * @param converter - конвертер-двойник
+ * @param opener - открыватель предпросмотра; по умолчанию свой
  * @returns очередь и журнал событий
  */
-function createQueue(converter) {
+function createQueue(converter, opener = createOpener()) {
   const events = [];
 
   const queue = createLocalQueue({
     convert: (input) => converter.convert(input),
+    openPreview: (input) => opener.open(input),
     events: {
       onPhase: (itemId, phase) => events.push(['phase', itemId, phase]),
       onDone: (itemId, outcome) => events.push(['done', itemId, outcome]),
@@ -83,7 +129,7 @@ function createQueue(converter) {
     },
   });
 
-  return { queue, events };
+  return { queue, events, opener };
 }
 
 /** Задача конвертации. */
@@ -218,9 +264,9 @@ describe('отмена', () => {
 });
 
 describe('предпросмотр', () => {
-  it('отдаёт готовый PDF и число листов', async () => {
+  it('открывает документ и отдаёт его сессию', async () => {
     const converter = createConverter();
-    const { queue, events } = createQueue(converter);
+    const { queue, events, opener } = createQueue(converter);
 
     queue.enqueue(previewJob('a', 'книга.xlsx'));
 
@@ -228,8 +274,11 @@ describe('предпросмотр', () => {
 
     const done = events.find(([kind]) => kind === 'done');
 
-    expect(done?.[2]).toMatchObject({ kind: 'previewed', sheets: 2 });
-    expect(done?.[2].pdf.byteLength).toBe(PDF_BYTES);
+    expect(done?.[2]).toMatchObject({ kind: 'previewed' });
+    expect(done?.[2].session).toBe(opener.opened[0]);
+    expect(done?.[2].session.sheets).toBe(2);
+    // Конвертации не было: предпросмотр — это вёрстка, а не сборка PDF
+    expect(converter.calls).toEqual([]);
 
     // Документ помечен открытым до того, как пришёл исход: иначе панель
     // показала бы файл, которого в движке уже нет
@@ -240,9 +289,9 @@ describe('предпросмотр', () => {
     expect(document).toBeLessThan(finished);
   });
 
-  it('закрытие документа очищает показанное', async () => {
+  it('закрытие документа очищает показанное и освобождает сессию', async () => {
     const converter = createConverter();
-    const { queue, events } = createQueue(converter);
+    const { queue, events, opener } = createQueue(converter);
 
     queue.enqueue(previewJob('a'));
     await settle(events, 1);
@@ -250,5 +299,38 @@ describe('предпросмотр', () => {
     await queue.closeDocument();
 
     expect(events.at(-1)).toEqual(['document', null]);
+    expect(opener.opened[0].closed).toBe(true);
+  });
+
+  it('второй документ закрывает первый', async () => {
+    const converter = createConverter();
+    const { queue, events, opener } = createQueue(converter);
+
+    queue.enqueue(previewJob('a'));
+    await settle(events, 1);
+
+    queue.enqueue(previewJob('b'));
+    await settle(events, 2);
+
+    // Движок один: держать два открытых документа нечем
+    expect(opener.opened).toHaveLength(2);
+    expect(opener.opened[0].closed).toBe(true);
+    expect(opener.opened[1].closed).toBe(false);
+  });
+
+  it('отказ открытия не гасит показанный документ', async () => {
+    const converter = createConverter();
+    const { queue, events, opener } = createQueue(converter, createOpener({ failOn: 'плохой.docx' }));
+
+    queue.enqueue(previewJob('a'));
+    await settle(events, 1);
+
+    queue.enqueue(previewJob('b', 'плохой.docx'));
+    await settle(events, 2);
+
+    const failed = events.find(([kind]) => kind === 'failed');
+
+    expect(failed?.[2]).toContain('не осилил');
+    expect(opener.opened[0].closed).toBe(false);
   });
 });

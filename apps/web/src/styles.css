@@ -476,13 +476,18 @@ select {
    ========================================================================== */
 
 /*
- * Страницы рисует pdf.js в canvas'ы: панель показывает их столбиком,
- * как настоящий PDF, а не окно редактора. Каждая страница — отдельный
- * canvas, поэтому размер задан здесь, а не внутри рендера.
+ * Страницы рисует движок, а панель показывает их столбиком — как настоящий
+ * PDF, а не окно редактора.
+ *
+ * Плейсхолдер страницы (`preview__sheet`) — белая бумага нужного размера:
+ * растр приходит с прозрачным фоном (движок не заливает бумагу), и белым его
+ * делает именно это правило. Размер ставится из размеров страницы и масштаба,
+ * поэтому до готовности растра место уже занято и прокрутка не дёргается.
  */
 .preview__pages {
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: 1rem;
   max-height: 70vh;
   overflow: auto;
@@ -493,12 +498,58 @@ select {
   background: var(--surface);
 }
 
+.preview__sheet {
+  position: relative;
+  flex: none;
+  background: #fff;
+  border-radius: var(--radius);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 12%);
+}
+
 .preview__page {
   display: block;
   width: 100%;
-  height: auto;
+  height: 100%;
   border-radius: var(--radius);
-  box-shadow: 0 1px 4px rgb(0 0 0 / 12%);
+}
+
+/* Отказ одной страницы: плашка внутри неё, остальные страницы живут */
+.preview__error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 1rem;
+  text-align: center;
+}
+
+/* Панель инструментов: подпись документа и масштаб */
+.preview__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: 0 0 1rem;
+}
+
+.preview__toolbar .field__hint {
+  margin: 0;
+}
+
+.preview__zoom {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.preview__zoom-value {
+  min-width: 3.5ch;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Подпись вместо пустого окна: без неё панель выглядит сломанной */

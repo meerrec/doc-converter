@@ -86,6 +86,178 @@ async function waitForSend(worker, index = 0) {
   throw new Error('воркер не получил запрос');
 }
 
+/**
+ * Отвечает на отправленный запрос.
+ *
+ * Номер берётся из самого запроса: клиент присваивает его сам, и подставлять
+ * своё число значило бы проверять не тот договор.
+ *
+ * @param worker - подставной воркер
+ * @param index - номер запроса
+ * @param response - ответ без номера
+ */
+function respond(worker, index, response) {
+  worker.respond({ ...response, id: worker.sent[index].message.id });
+}
+
+/** Подставной растр: клиенту от него нужен только признак освобождения. */
+function fakeBitmap() {
+  return { closed: false, close() { this.closed = true; } };
+}
+
+describe('предпросмотр', () => {
+  it('открывает сессию и переносит буфер файла', async () => {
+    const worker = fakeWorker();
+    const client = createOfficeClient({ spawn: () => worker });
+    const bytes = new Uint8Array([1, 2, 3]);
+    const opened = client.openPreview(input(bytes));
+    const sent = await waitForSend(worker);
+
+    expect(sent.message).toMatchObject({ kind: 'preview-open', fileName: 'книга.xlsx' });
+    expect(sent.transfer).toEqual([bytes.buffer]);
+
+    respond(worker, 0, {
+      kind: 'opened',
+      session: 7,
+      pages: [{ width: 794, height: 1123 }],
+      sheets: 2,
+      skipped: { shape: 1 },
+    });
+
+    const session = await opened;
+
+    expect(session.pageCount).toBe(1);
+    expect(session.sheets).toBe(2);
+    expect(session.skipped).toEqual({ shape: 1 });
+  });
+
+  it('просит страницу и отдаёт растр', async () => {
+    const worker = fakeWorker();
+    const client = createOfficeClient({ spawn: () => worker });
+    const opened = client.openPreview(input());
+
+    await waitForSend(worker);
+    respond(worker, 0, { kind: 'opened', session: 7, pages: [{ width: 10, height: 10 }], sheets: null, skipped: {} });
+
+    const session = await opened;
+    const bitmap = fakeBitmap();
+    const rendered = session.render(0, 2);
+
+    const sent = await waitForSend(worker, 1);
+
+    expect(sent.message).toMatchObject({ kind: 'preview-page', session: 7, pageIndex: 0, scale: 2 });
+
+    respond(worker, 1, { kind: 'page', pageIndex: 0, bitmap });
+
+    await expect(rendered).resolves.toBe(bitmap);
+    expect(bitmap.closed).toBe(false);
+  });
+
+  /**
+   * Зум и прокрутка рождают гонку: страницу спрашивают заново, пока ответ
+   * на прежний запрос ещё в пути. Запросы идут по одному — wasm не потокобезопасен, —
+   * поэтому старый ответ приходит уже после того, как спросили новый масштаб,
+   * и показывать его нельзя.
+   */
+  it('устаревший растр освобождается, а не показывается', async () => {
+    const worker = fakeWorker();
+    const client = createOfficeClient({ spawn: () => worker });
+    const opened = client.openPreview(input());
+
+    await waitForSend(worker);
+    respond(worker, 0, { kind: 'opened', session: 7, pages: [{ width: 10, height: 10 }], sheets: null, skipped: {} });
+
+    const session = await opened;
+    const first = fakeBitmap();
+    const second = fakeBitmap();
+    const old = session.render(0, 1);
+    const fresh = session.render(0, 2);
+
+    // Первым уходит старый запрос: очередь пропускает по одному
+    await waitForSend(worker, 1);
+    respond(worker, 1, { kind: 'page', pageIndex: 0, bitmap: first });
+
+    await expect(old).resolves.toBeNull();
+    expect(first.closed).toBe(true);
+
+    // …и только теперь воркер получает свежий
+    await waitForSend(worker, 2);
+    respond(worker, 2, { kind: 'page', pageIndex: 0, bitmap: second });
+
+    await expect(fresh).resolves.toBe(second);
+    expect(second.closed).toBe(false);
+  });
+
+  it('закрытие не ждёт воркера и гасит страницы', async () => {
+    const worker = fakeWorker();
+    const client = createOfficeClient({ spawn: () => worker });
+    const opened = client.openPreview(input());
+
+    await waitForSend(worker);
+    respond(worker, 0, { kind: 'opened', session: 7, pages: [{ width: 10, height: 10 }], sheets: null, skipped: {} });
+
+    const session = await opened;
+
+    session.close();
+    session.close();
+
+    // Признак закрытия ставится сразу: растр больше не спрашивают
+    await expect(session.render(0, 1)).resolves.toBeNull();
+
+    const sent = await waitForSend(worker, 1);
+
+    expect(sent.message).toMatchObject({ kind: 'preview-close', session: 7 });
+    expect(worker.sent.filter((entry) => entry.message.kind === 'preview-close')).toHaveLength(1);
+  });
+
+  /**
+   * Сессию мог закрыть воркер — например, её вытеснил новый документ.
+   * Для панели это не отказ: страницу уже некому показывать.
+   */
+  it('отказ по закрытой сессии не поднимается наверх', async () => {
+    const worker = fakeWorker();
+    const client = createOfficeClient({ spawn: () => worker });
+    const opened = client.openPreview(input());
+
+    await waitForSend(worker);
+    respond(worker, 0, { kind: 'opened', session: 7, pages: [{ width: 10, height: 10 }], sheets: null, skipped: {} });
+
+    const session = await opened;
+    const rendered = session.render(0, 1);
+
+    await waitForSend(worker, 1);
+    respond(worker, 1, { kind: 'failed', code: 'engine_preview_stale', message: 'сессия закрыта' });
+
+    await expect(rendered).resolves.toBeNull();
+  });
+
+  it('второй документ закрывает первый', async () => {
+    const worker = fakeWorker();
+    const client = createOfficeClient({ spawn: () => worker });
+    const first = client.openPreview(input());
+
+    await waitForSend(worker);
+    respond(worker, 0, { kind: 'opened', session: 1, pages: [{ width: 10, height: 10 }], sheets: null, skipped: {} });
+
+    const session = await first;
+    const second = client.openPreview(input());
+
+    // Закрытие прежней сессии уходит в воркер перед открытием новой
+    const closed = await waitForSend(worker, 1);
+
+    expect(closed.message).toMatchObject({ kind: 'preview-close', session: 1 });
+
+    const opened = await waitForSend(worker, 2);
+
+    expect(opened.message).toMatchObject({ kind: 'preview-open' });
+
+    respond(worker, 2, { kind: 'opened', session: 2, pages: [{ width: 10, height: 10 }], sheets: null, skipped: {} });
+
+    await second;
+    await expect(session.render(0, 1)).resolves.toBeNull();
+  });
+});
+
 describe('клиент движка', () => {
   it('прогревается отдельным запросом', async () => {
     const worker = fakeWorker();

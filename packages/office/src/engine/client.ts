@@ -16,6 +16,7 @@
 
 import type { ConvertedDocument, ConvertInput } from './convert.js';
 import { EngineError } from './errors.js';
+import type { PreviewSession } from './preview.js';
 import type {
   WorkerLike,
   WorkerRequest,
@@ -23,7 +24,7 @@ import type {
   WorkerResponse,
 } from './worker-protocol.js';
 
-/** Чем страница пользуется: прогрев и конвертация. */
+/** Чем страница пользуется: прогрев, конвертация и предпросмотр. */
 export interface OfficeClient {
   /**
    * Поднимает движок, ничего не конвертируя.
@@ -38,7 +39,35 @@ export interface OfficeClient {
    * @returns PDF, число страниц и число листов (для книги)
    */
   convert(input: ConvertInput): Promise<ConvertedDocument>;
+  /**
+   * Открывает документ для предпросмотра.
+   *
+   * @param input - байты файла, его имя и параметры
+   * @returns сессию предпросмотра
+   */
+  openPreview(input: ConvertInput): Promise<PreviewSession>;
 }
+
+/**
+ * Открытая сессия на стороне клиента.
+ *
+ * Кроме полей сессии здесь живёт то, что нужно только транспорту: номер
+ * сессии в воркере, признак закрытия и метки запросов страниц.
+ */
+interface ClientSession {
+  readonly id: number;
+  readonly preview: PreviewSession;
+  closed: boolean;
+}
+
+/**
+ * Сколько запросов страницы успело уйти по каждому номеру.
+ *
+ * Метка нужна, когда один и тот же масштаб спрашивают дважды: ответ на
+ * устаревший запрос приходит позже свежего, и нарисовать по нему страницу
+ * значит показать картинку не того масштаба.
+ */
+type PageTokens = Map<number, number>;
 
 /** Что можно подменить в клиенте: воркер нужен тестам. */
 export interface OfficeClientOptions {
@@ -87,7 +116,18 @@ export function createOfficeClient(options: OfficeClientOptions = {}): OfficeCli
     created.addEventListener('message', (event: never) => {
       const response = (event as unknown as { readonly data: WorkerResponse }).data;
 
-      if (response.kind === 'ready' || response.kind === 'done' || response.kind === 'failed') {
+      // Виды ответов перечислены, а не проверены на «есть номер»: ответ без
+      // номера (или ставший таким после правки протокола) не должен будить
+      // чужой запрос — `pending.get(undefined)` вернул бы не того ожидающего
+      const known =
+        response.kind === 'ready' ||
+        response.kind === 'done' ||
+        response.kind === 'failed' ||
+        response.kind === 'opened' ||
+        response.kind === 'page' ||
+        response.kind === 'closed';
+
+      if (known) {
         const waiting = pending.get(response.id);
 
         pending.delete(response.id);
@@ -164,6 +204,166 @@ export function createOfficeClient(options: OfficeClientOptions = {}): OfficeCli
     return run;
   };
 
+  /** Открытая сессия предпросмотра: движок один, и сессия одна. */
+  let active: ClientSession | null = null;
+
+  /** Метки запросов страниц по номерам сессий. */
+  const tokens = new Map<number, PageTokens>();
+
+  /**
+   * Закрывает сессию.
+   *
+   * Признак закрытия ставится сразу, а сообщение воркеру уходит в очередь:
+   * панель должна освободиться мгновенно, даже если воркер занят растеризацией
+   * страницы, которую уже некому показать.
+   *
+   * @param session - закрываемая сессия
+   */
+  const closeSession = (session: ClientSession): void => {
+    if (session.closed) {
+      return;
+    }
+
+    session.closed = true;
+    tokens.delete(session.id);
+
+    if (active === session) {
+      active = null;
+    }
+
+    // Сообщение уходит **мимо очереди**: `close` зовут из обработчика события,
+    // а очередь задач не должна ждать закрытия — иначе открытие следующего
+    // документа встало бы за ним, и порядок сообщений стал бы обратным.
+    //
+    // Обгонять запрос страницы закрытию не страшно: воркер разбирает
+    // сообщения по порядку, а закрытая сессия сама отвергает рисование
+    void send({ kind: 'preview-close', session: session.id }).catch(() => undefined);
+  };
+
+  /**
+   * Рисует страницу открытой сессии.
+   *
+   * @param session - сессия
+   * @param pageIndex - номер страницы
+   * @param scale - масштаб растра
+   * @returns растр или `null`, если он больше не нужен
+   */
+  const renderPage = async (
+    session: ClientSession,
+    pageIndex: number,
+    scale: number
+  ): Promise<ImageBitmap | null> => {
+    if (session.closed) {
+      return null;
+    }
+
+    const pageTokens = tokens.get(session.id) ?? new Map<number, number>();
+    const token = (pageTokens.get(pageIndex) ?? 0) + 1;
+
+    pageTokens.set(pageIndex, token);
+    tokens.set(session.id, pageTokens);
+
+    try {
+      return await serialized(async () => {
+        // Пока запрос стоял в очереди, сессию могли закрыть
+        if (session.closed) {
+          return null;
+        }
+
+        const response = await send({
+          kind: 'preview-page',
+          session: session.id,
+          pageIndex,
+          scale,
+        });
+
+        if (response.kind === 'failed') {
+          // Сессия закрыта или заменена, пока запрос шёл: страницу уже некому
+          // показывать, и отказ здесь — не отказ
+          if (response.code === 'engine_preview_stale') {
+            return null;
+          }
+
+          broken = response.code === 'engine_load_failed';
+
+          throw new EngineError(response.code, response.message);
+        }
+
+        if (response.kind !== 'page') {
+          throw new EngineError('engine_convert_failed', 'воркер ответил не на запрос страницы');
+        }
+
+        // Ответ на устаревший запрос: метка сменилась, пока он шёл, — значит,
+        // спрашивали другой масштаб. Растр освобождается здесь же: получил его
+        // клиент, ему и закрывать
+        if (session.closed || pageTokens.get(pageIndex) !== token) {
+          response.bitmap.close();
+
+          return null;
+        }
+
+        return response.bitmap;
+      });
+    } catch (error) {
+      // Закрытая сессия гасит и отказ транспорта: спрашивать было нечего
+      if (session.closed) {
+        return null;
+      }
+
+      throw error;
+    }
+  };
+
+  /**
+   * Открывает сессию предпросмотра в воркере.
+   *
+   * @param input - байты файла, имя и параметры
+   * @returns сессия
+   */
+  const openPreviewInWorker = (input: ConvertInput): Promise<PreviewSession> =>
+    serialized(async () => {
+      // Движок один: открытие нового документа закрывает прежний
+      if (active !== null) {
+        closeSession(active);
+      }
+
+      // Буфер передаётся без копии — по той же причине, что и в конвертации
+      const whole =
+        input.bytes.byteOffset === 0 && input.bytes.byteLength === input.bytes.buffer.byteLength;
+      const bytes = whole ? input.bytes : input.bytes.slice();
+      const response = await send(
+        { kind: 'preview-open', bytes, fileName: input.fileName, options: input.options },
+        [bytes.buffer as ArrayBuffer]
+      );
+
+      if (response.kind === 'failed') {
+        broken = response.code === 'engine_load_failed';
+
+        throw new EngineError(response.code, response.message);
+      }
+
+      if (response.kind !== 'opened') {
+        throw new EngineError('engine_convert_failed', 'воркер ответил не на запрос предпросмотра');
+      }
+
+      const session: ClientSession = {
+        id: response.session,
+        closed: false,
+        preview: {
+          pageCount: response.pages.length,
+          sheets: response.sheets,
+          pages: response.pages,
+          skipped: response.skipped,
+          render: (pageIndex: number, scale: number) => renderPage(session, pageIndex, scale),
+          close: () => closeSession(session),
+        },
+      };
+
+      active = session;
+
+      return session.preview;
+    });
+
   return {
     warmup(): Promise<void> {
       // В Node воркера нет: «прогрев» — это загрузка модуля конвейера
@@ -210,8 +410,22 @@ export function createOfficeClient(options: OfficeClientOptions = {}): OfficeCli
           throw new EngineError('engine_convert_failed', 'воркер ответил не на запрос конвертации');
         }
 
-        return { bytes: response.bytes, pageCount: response.pageCount, sheets: response.sheets };
+        return {
+          bytes: response.bytes,
+          pageCount: response.pageCount,
+          sheets: response.sheets,
+          skipped: response.skipped,
+        };
       });
+    },
+
+    openPreview(input: ConvertInput): Promise<PreviewSession> {
+      // В Node воркера нет: сессию открывает сам конвейер, и она настоящая
+      if (spawn === undefined && typeof Worker === 'undefined') {
+        return import('./preview.js').then((module) => module.openPreview(input));
+      }
+
+      return openPreviewInWorker(input);
     },
   };
 }

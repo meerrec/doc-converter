@@ -143,20 +143,53 @@ const ROOT_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
 </Relationships>`;
 
-/** Типы содержимого пакета текстового документа. */
-const CONTENT_TYPES_DOCX = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+/**
+ * Типы содержимого пакета текстового документа.
+ *
+ * @param withNumbering - объявлять ли часть нумерации (нужна спискам)
+ * @returns разметка `[Content_Types].xml`
+ */
+function contentTypesDocx(withNumbering) {
+  const numbering = withNumbering
+    ? '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>'
+    : '';
+
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-  ${''}
+  ${numbering}
 </Types>`;
+}
 
 /** Корневые связи пакета текстового документа. */
 const ROOT_RELS_DOCX = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>`;
+
+/** Связи документа: нужны спискам — без них номер пункта не с чем связать. */
+const DOCUMENT_RELS_DOCX = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
+</Relationships>`;
+
+/** Определение нумерации: один уровень, десятичные номера вида «1.». */
+const NUMBERING_DOCX = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+      <w:lvlJc w:val="left"/>
+      <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+      <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/></w:rPr>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+</w:numbering>`;
 
 /**
  * Описание книги: листы и их связи.
@@ -335,6 +368,7 @@ export async function buildDocx({
   pages = 1,
   paragraphs = 5,
   lines = null,
+  numbered = 0,
   withAppXml = true,
   withMacros = false,
 } = {}) {
@@ -350,9 +384,23 @@ export async function buildDocx({
     }
   }
 
+  // Нумерованный список: номер пункта движок не раскладывает на глифы, а отдаёт
+  // строкой — на ней и проверяется, что номер доезжает до PDF
+  for (let i = 0; i < numbered; i += 1) {
+    body.push(
+      `<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>` +
+        `<w:r><w:t>Пункт ${i + 1}</w:t></w:r></w:p>`
+    );
+  }
+
+  // Свойства страницы обязательны: без них вёрстке неизвестна ширина полосы
+  // набора, и абзац не разбивается на строки. Настоящие документы их всегда
+  // несут, поэтому фикстура повторяет A4 с полями по умолчанию
+  const section = `<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="851" w:bottom="851" w:left="1418"/></w:sectPr>`;
+
   const document = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:body>${body.join('')}</w:body>
+  <w:body>${body.join('')}${section}</w:body>
 </w:document>`;
 
   const appXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -361,10 +409,15 @@ export async function buildDocx({
 </Properties>`;
 
   const entries = [
-    ['[Content_Types].xml', CONTENT_TYPES_DOCX],
+    ['[Content_Types].xml', contentTypesDocx(numbered > 0)],
     ['_rels/.rels', ROOT_RELS_DOCX],
     ['word/document.xml', document],
   ];
+
+  if (numbered > 0) {
+    entries.push(['word/numbering.xml', NUMBERING_DOCX]);
+    entries.push(['word/_rels/document.xml.rels', DOCUMENT_RELS_DOCX]);
+  }
 
   if (withAppXml) {
     entries.push(['docProps/app.xml', appXml]);
